@@ -197,6 +197,39 @@ def _build_synthetic_project(tmp_path, name="proj"):
     resolution and was observed to pick up the system Python instead
     (which lacks pytest), turning the baseline red.
 
+    COST, on macOS: writing a fresh unsigned executable at a path never
+    seen before makes Gatekeeper run a synchronous `GK performScan` on the
+    first exec, and that scan includes a network lookup against Apple's
+    notarization service. Every test that calls this helper gets a new
+    tmp_path, so every test pays for a new scan. With the service
+    reachable that is ~0.12s; with it unreachable the lookup runs to its
+    own timeout and the exec stalls for 40-60 seconds instead.
+
+    That was measured here, not guessed: a run of this file took 220-350s
+    with four tests landing at 38-61s, against 6s for the same file an
+    hour later. The wrapper mtimes across that run were exactly ~60s
+    apart, the kernel log named this exact path
+    ("ASP: Security policy would not allow process: .../proj/.venv/bin/python"),
+    and syspolicyd's own network flows in the same window were
+    disconnecting with "Operation timed out" at 60s intervals over a link
+    marked `expensive, constrained`.
+
+    Nothing in this repo is wrong when that happens, and it cannot happen
+    on CI, which is Linux. It matters here only because it looks exactly
+    like a test regression: the failure surfaces as a bare
+    `subprocess.TimeoutExpired` on whichever call site has the tightest
+    budget, which reads as "the tool got slower" rather than "this machine
+    could not reach Apple". If a future run of this file is inexplicably
+    slow on a Mac, check the network before reading the diff.
+
+    Giving every synthetic project a symlink to one already-scanned shim
+    would avoid the repeat scans (measured: 0.021s and no scan, against
+    0.14s and a scan per copy). That is a symlink to the WRAPPER, which
+    the paragraph above does not forbid -- its hazard is symlinking to the
+    interpreter. It is left undone deliberately: the cost is invisible
+    with a working network, and the shared shim would have to outlive
+    tmp_path to pay off.
+
     Returns (proj_path, wrapper_path, original_m_source).
     """
     real_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -844,6 +877,14 @@ def test_mutation_check_default_tests_path_is_used_when_tests_is_omitted(tmp_pat
         cwd=str(proj),
         capture_output=True,
         text=True,
+        # The five other call sites in this file all pass timeout=60; this
+        # one was the only one without it, which meant a wedged child hung
+        # the whole suite forever instead of failing one test. That is not
+        # hypothetical: see `_build_synthetic_project`'s note on Gatekeeper
+        # for a measured condition under which this exact subprocess takes
+        # ~60s, and every other call site here turns that into a red test
+        # while this one would have waited indefinitely.
+        timeout=60,
     )
     out = proc.stdout + proc.stderr
 

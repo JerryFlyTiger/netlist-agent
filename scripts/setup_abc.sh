@@ -85,9 +85,54 @@ rm -rf "$ABC_SRC_ROOT/lib"
 rm -f "$ABC_SRC_ROOT"/abcexe.dsp "$ABC_SRC_ROOT"/abclib.dsp "$ABC_SRC_ROOT"/abcspace.dsw
 rm -rf "$ABC_SRC_ROOT/.github"
 
+# ABC links libreadline for line editing at its own interactive `abc>` prompt,
+# and its Makefile assumes the header is simply there: no configure step, no
+# fallback. On a machine without the development headers (a stock GitHub
+# ubuntu runner, for one) the build dies at
+# `src/base/main/mainUtils.c:32: fatal error: readline/readline.h`.
+#
+# Nothing in this project needs it. The engine drives ABC non-interactively
+# (`abc -c "..."`), so readline only matters when a human types at the prompt
+# by hand. Probe for the header and, if it's missing, build without it --
+# ABC guards every use behind `#ifdef ABC_USE_READLINE`, so this costs the
+# interactive line editor and nothing else.
+#
+# The probe compiles rather than looking in a fixed list of directories:
+# readline lives in different places on macOS (SDK/libedit, or Homebrew's
+# prefix) than on Linux, and the compiler already knows its own search path.
+#
+# A plain string, not an array: this script runs under `set -u`, and macOS
+# ships bash 3.2, where expanding an EMPTY array as "${arr[@]}" is an
+# "unbound variable" error rather than zero arguments -- which would fire on
+# exactly the common path here (readline present, so nothing to add).
+# The value below has no spaces or glob characters, so the deliberately
+# unquoted expansion at the `make` call is safe and yields no argument when
+# it's empty.
+MAKE_READLINE_VAR=""
+_probe_dir="$(mktemp -d)"
+if printf '#include <readline/readline.h>\nint main(void){return 0;}\n' \
+     > "$_probe_dir/probe.c" \
+   && "${CC:-cc}" -c "$_probe_dir/probe.c" -o "$_probe_dir/probe.o" 2>/dev/null; then
+  echo "-- libreadline headers found: building WITH readline" >&2
+else
+  echo "-- libreadline headers not found: building with ABC_USE_NO_READLINE=1" >&2
+  echo "   (interactive 'abc>' line editing only; nothing this project uses)" >&2
+  MAKE_READLINE_VAR="ABC_USE_NO_READLINE=1"
+fi
+rm -rf "$_probe_dir"
+
+# Clear intermediates left behind by an earlier FAILED build before starting.
+# The success path below deletes them, so anything still here came from a
+# build that died partway -- and if it died at the readline header, its .o
+# files were compiled with the opposite -DABC_USE_READLINE setting from the
+# one we just chose. Linking those together is the kind of mismatch that
+# produces a binary rather than an error.
+find "$ABC_SRC_ROOT" -name "*.o" -delete
+find "$ABC_SRC_ROOT" -name "*.d" -delete
+
 echo "-- building (make)" >&2
 NPROC="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
-make -C "$ABC_SRC_ROOT" -j"$NPROC"
+make -C "$ABC_SRC_ROOT" -j"$NPROC" $MAKE_READLINE_VAR
 
 if [[ ! -x "$ABC_SRC_ROOT/abc" ]]; then
   echo "error: build finished but $ABC_SRC_ROOT/abc was not produced" >&2

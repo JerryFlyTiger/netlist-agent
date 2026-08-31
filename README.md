@@ -115,6 +115,14 @@ artifact, and git history is forever. Instead:
 - `scripts/setup_abc.sh` builds the pinned commit into a shared location outside
   this repo (`~/opt/eda/abc/<commit>/<platform>/bin/abc` by default), so several
   projects on one machine reuse a single build.
+- ABC's Makefile links libreadline unconditionally — no configure step, no
+  fallback — so on a machine without the development headers the build dies
+  at `mainUtils.c:32: fatal error: readline/readline.h`. `setup_abc.sh`
+  compiles a one-line probe for the header and passes
+  `ABC_USE_NO_READLINE=1` when it is missing, so the build works on a bare
+  machine with no extra packages. Nothing here needs readline: the engine
+  drives ABC as `abc -c "..."`, and readline only serves a human typing at
+  ABC's own `abc>` prompt.
 - `scripts/find_abc.sh` resolves which binary to use, in order: `$ABC_BIN` →
   `vendor/<platform>/abc` → the shared install → `abc` on `$PATH`. It fails
   loudly if none exist rather than silently doing something else.

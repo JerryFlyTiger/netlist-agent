@@ -7,8 +7,15 @@ on:
 jobs:
   build-abc-and-test:
     runs-on: ubuntu-latest
+    # A hang guard, not a performance assertion: every ABC call is a
+    # subprocess, and a wedged child would otherwise sit here until the
+    # 6-hour default.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # v7/v6 rather than v4: v4 of these actions targets Node 20, which
+      # the runners now force onto Node 24 with a deprecation warning and
+      # will eventually stop carrying.
+      - uses: actions/checkout@v7
 
       - name: Read pinned ABC commit
         id: abclock
@@ -18,7 +25,7 @@ jobs:
 
       - name: Cache ABC build
         id: cache-abc
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/opt/eda
           key: abc-${{ runner.os }}-${{ steps.abclock.outputs.commit }}
@@ -34,7 +41,7 @@ jobs:
           "$bin" -c "version; quit"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 

@@ -1,0 +1,9 @@
+# Pinned ABC (Berkeley Logic Synthesis and Verification System) build.
+#
+# ABC has no release tags; behavior tracks upstream commits directly, so the
+# commit below is the single source of truth for which ABC this project uses.
+# scripts/setup_abc.sh reads this file to know exactly what to build.
+
+repo=https://github.com/berkeley-abc/abc.git
+commit=c1f9a942cab161425be1f35aa9b51c592c933364
+commit_date=2026-07-25

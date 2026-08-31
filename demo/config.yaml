@@ -1,0 +1,18 @@
+# The problem statement's Section 6.2 config, verbatim in shape (Figure 6).
+# The evaluation environment supplies this file; the demo supplies its own so
+# you can run without one.
+#
+# `api_key: env:VARNAME` reads the key from the environment instead of storing
+# it here. This public build has no rule-based router, so EVERY request goes
+# to the LLM -- you must set OPENAI_API_KEY or ANTHROPIC_API_KEY for this demo
+# to answer anything.
+provider: "openai"
+openai:
+  api_key: "env:OPENAI_API_KEY"
+  model: "gpt-4o-mini"
+anthropic:
+  api_key: "env:ANTHROPIC_API_KEY"
+  model: "claude-haiku-4-5"
+generation:
+  temperature: 0.2
+  max_output_tokens: 4096

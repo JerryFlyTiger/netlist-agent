@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-abc-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned ABC commit
+        id: abclock
+        run: |
+          commit=$(grep -E '^commit=' abc.lock | cut -d= -f2-)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ABC build
+        id: cache-abc
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/eda
+          key: abc-${{ runner.os }}-${{ steps.abclock.outputs.commit }}
+
+      - name: Build ABC (scripts/setup_abc.sh)
+        run: ./scripts/setup_abc.sh
+
+      - name: Resolve ABC binary
+        id: resolve
+        run: |
+          bin=$(./scripts/find_abc.sh)
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+          "$bin" -c "version; quit"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package + test deps
+        run: pip install -e '.[test]'
+
+      - name: Run tests
+        run: pytest -q

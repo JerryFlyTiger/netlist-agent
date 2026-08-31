@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netlist-agent"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["pyyaml", "openai", "anthropic"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["netlist_agent", "netlist_agent.llm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -rs prints the REASON for every skip. Without it a skipped gate shows up
+# as a bare "s" in -q output, which is indistinguishable at a glance from a
+# pass -- and the one skippable gate here (SKIP_CORPUS_BASELINE) is the
+# corpus response-text check, exactly the thing you must not silently lose.
+addopts = ["-rs"]

@@ -1,0 +1,17 @@
+# Config for running the LLM fallback against Google Gemini's OpenAI-compatible
+# endpoint. Contains no key material -- `api_key` indirects through the
+# GEMINI_API_KEY environment variable (see `_resolve_api_key` in
+# netlist_agent/cli.py); set that variable in your shell before running
+# scripts/replay_fallback.py, never here.
+provider: openai
+openai:
+  api_key: "env:GEMINI_API_KEY"
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  # New free-tier accounts only have quota on the `-latest` aliases
+  # (gemini-2.0-flash reports quota limit 0; pinned 2.5 names 404).
+  # Free-tier daily quota is per model (flash-latest: 20 req/day), so
+  # flash-lite-latest doubles as a separate bucket when flash runs dry.
+  model: "gemini-flash-lite-latest"
+generation:
+  temperature: 0.2
+  max_output_tokens: 4096

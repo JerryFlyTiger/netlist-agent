@@ -1,0 +1,43 @@
+.DS_Store
+
+# ABC binaries are never committed — they live in the shared install at
+# ~/opt/eda (see abc.lock / scripts/setup_abc.sh) or, if a project ever
+# bundles one, under vendor/.
+vendor/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# scratch / editor
+*.swp
+
+# ABC drops this in the cwd whenever it's run interactively
+abc.history
+
+# scripts/run_corpus.py output (per-case logs, output netlists, summary.json)
+corpus_results/
+
+# ...and the same artifacts where run_corpus.py actually produces them. It
+# chdir's into Alpha_Testcase/ and writes each case's log, path-enumeration
+# side files and output netlist next to the corpus, then sweeps them into
+# corpus_results/ "so the git-tracked corpus stays pristine". A run that dies
+# partway never reaches the sweep, so it strands untracked files right beside
+# the real testcases, where they are easy to commit by accident. These
+# patterns are depth-limited on purpose: the corpus's own prompt.txt and
+# golden files live one level further down, under testcase/<name>/.
+Alpha_Testcase/*.log
+Alpha_Testcase/*_*.txt
+Alpha_Testcase/testcase/*/*_out.v
+
+# Claude Code session lock (per-machine, never useful to share)
+.claude/
+
+# Contest leaderboard export — someone else's data, not this project's source
+alpha test result/
+
+# demo/run_demo.sh scratch working directories (copied inputs + run artifacts)
+demo/runs/

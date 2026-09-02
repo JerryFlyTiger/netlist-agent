@@ -271,10 +271,43 @@ def write_design(session: Session, filename: str) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+# Two conditional keys, carrying the same information `get_last_operation_summary`
+# holds, attached to the tool a model was MEASURED to reach for instead of it.
+#
+# 2026-09-02, experiments/present_state_inference_2026-09-02: asked "How many
+# NOR gates were added by replacing the XNOR gates?" (recorded answer: 6192),
+# the model called count_gates_by_type, read NOR=11790 off the present design,
+# and replied "there are 11,790 NOR gates in the design, and 0 XNOR gates
+# remaining" -- every word true, none of it the answer. It never called
+# get_last_operation_summary. Batch 41 closed the other wrong route (re-running
+# the mutating tool) the same way this does: not by refusing anything, but by
+# putting the right number where the model was already going to look
+# (`_rerun_conflict_fields` below). Batch 42 then went further and made the
+# rerun REFUSE to run (`_refuse_rerun`) -- an earlier version of this comment
+# credited batch 42 with the reveal-only move, which is the opposite of what
+# that batch did, and it matters here because the precedent being claimed is
+# specifically "adding a field changed nothing else", not "refusing worked".
+#
+# The key NAMES do the work, because a model reads keys. They are absent when
+# no count-tracked transform has run this session, so their presence is itself
+# the signal that a "how many did it change" question has a recorded answer.
+_CURRENT_TOTALS_NOT_A_CHANGE_KEY = "these_are_current_totals_not_how_many_an_operation_changed"
+_RECORDED_CHANGE_KEY = "how_many_the_last_operation_changed"
+
+
 def count_gates_by_type(session: Session) -> dict[str, Any]:
     counts = gate_count_by_type(_design(session))
     by_type = {gt.name: n for gt, n in counts.items()}
-    return {"total": sum(counts.values()), "by_type": by_type}
+    result: dict[str, Any] = {"total": sum(counts.values()), "by_type": by_type}
+    # `last_op_kind is None` alongside `last_op_count is None` is session.py's
+    # documented meaning of "no count-tracked transform has run yet".
+    if session.last_op_kind is not None:
+        result[_CURRENT_TOTALS_NOT_A_CHANGE_KEY] = True
+        result[_RECORDED_CHANGE_KEY] = {
+            "last_op_count": session.last_op_count,
+            "last_gate_delta": {gt.name: n for gt, n in session.last_gate_delta.items() if n},
+        }
+    return result
 
 
 def count_primary_ports(session: Session) -> dict[str, Any]:
@@ -1597,7 +1630,16 @@ TOOL_SCHEMA: list[ToolSpec] = [
     ),
     ToolSpec(
         "count_gates_by_type",
-        "Get the total gate count and a breakdown by gate type (AND/OR/NAND/NOR/XOR/XNOR/NOT/BUF/DFF).",
+        "Get the total gate count and a breakdown by gate type "
+        "(AND/OR/NAND/NOR/XOR/XNOR/NOT/BUF/DFF). These are counts of what is in "
+        "the design NOW. They are not the answer to 'how many gates did that "
+        "operation add/remove/merge/eliminate' -- a count of NOR gates now is "
+        "not the number of NOR gates an earlier request added. When a "
+        f"count-tracked operation has run, the result also carries "
+        f"'{_CURRENT_TOTALS_NOT_A_CHANGE_KEY}' and "
+        f"'{_RECORDED_CHANGE_KEY}', which holds the recorded per-type change; "
+        "use that, or get_last_operation_summary, for any question about what "
+        "an operation changed.",
         _schema({}),
     ),
     ToolSpec(

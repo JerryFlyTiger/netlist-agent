@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import pathlib
 import re
 import typing
 from typing import Any
@@ -19,6 +20,7 @@ from netlist_agent.abc_bridge import are_equivalent, check_symmetry, is_constant
 from netlist_agent.analysis import find_floating_signals
 from netlist_agent.graph import NetlistGraph
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, Port, Signal, design_fingerprint
+from netlist_agent.llm import tools_schema
 from netlist_agent.llm.tools_schema import (
     TOOL_REGISTRY,
     TOOL_SCHEMA,
@@ -433,6 +435,118 @@ def test_count_gates_by_type(tmp_path) -> None:
     assert result["total"] == len(session.current_design.gates)
     assert result["by_type"]["AND"] == 3
     assert result["by_type"]["DFF"] == 1
+
+
+# The present-state route (experiments/present_state_inference_2026-09-02)
+# ----------------------------------------------------------------------
+# A model asked "how many NOR gates were ADDED by replacing the XNOR gates"
+# called count_gates_by_type, read the current NOR total, and answered with
+# that. Nothing was wrong with any individual statement it made and nothing in
+# the system noticed. The fix is batch 42's: put the recorded number where the
+# model was measured to look. These pin that it is actually there, that it
+# agrees with the other surface that reports it, and that the description
+# cannot drift away from the key names it promises.
+
+
+def test_count_gates_by_type_stays_lean_before_any_operation(tmp_path) -> None:
+    """The keys are absent when nothing was recorded, so their presence is
+    itself the signal that a 'how many did it change' question has an answer."""
+    session = _new_session(tmp_path)
+    assert session.last_op_kind is None
+    assert set(TOOL_REGISTRY["count_gates_by_type"](session)) == {"total", "by_type"}
+
+
+def test_count_gates_by_type_carries_the_recorded_change_after_an_operation(tmp_path) -> None:
+    """Subject is the tool's reporting, so the recorded state is set directly.
+
+    Driving it through `router.handle_request` was the first version and it
+    fails in the public export, where router.py is a stub and the request falls
+    through to the LLM -- caught by running the exported suite. Setting the
+    fields is also the tighter test: this is about what the tool does with
+    them, and which handler wrote them is covered where that belongs
+    (tests/test_depth_balance.py).
+    """
+    session = _new_session(tmp_path)
+    session.last_op_count = 2
+    session.last_op_kind = "remove_dangling_gates"
+    session.last_gate_delta = {GateType.AND: -1, GateType.NAND: -1, GateType.NOT: 0}
+    result = TOOL_REGISTRY["count_gates_by_type"](session)
+
+    assert result[tools_schema._CURRENT_TOTALS_NOT_A_CHANGE_KEY] is True
+    recorded = result[tools_schema._RECORDED_CHANGE_KEY]
+    assert recorded["last_op_count"] == session.last_op_count
+    assert recorded["last_gate_delta"] == {
+        gt.name: n for gt, n in session.last_gate_delta.items() if n
+    }
+    # The point of the fix: the present totals and the recorded change are
+    # different numbers, side by side, and only one of them answers "how many
+    # did that operation remove".
+    assert recorded["last_op_count"] != result["total"]
+
+
+def test_the_two_surfaces_reporting_the_recorded_change_agree(tmp_path) -> None:
+    """`get_last_operation_summary` and `count_gates_by_type` now both report
+    it. Two surfaces reading one field is fine; two surfaces that can disagree
+    is a new way to be confidently wrong."""
+    session = _new_session(tmp_path)
+    session.last_op_count = 2
+    session.last_op_kind = "remove_dangling_gates"
+    session.last_gate_delta = {GateType.AND: -1, GateType.NAND: -1, GateType.NOT: 0}
+    summary = TOOL_REGISTRY["get_last_operation_summary"](session)
+    recorded = TOOL_REGISTRY["count_gates_by_type"](session)[tools_schema._RECORDED_CHANGE_KEY]
+
+    assert recorded["last_op_count"] == summary["last_op_count"]
+    # count_gates_by_type drops the zero entries the summary spells out in
+    # full; every non-zero entry must match.
+    assert recorded["last_gate_delta"] == {
+        k: v for k, v in summary["last_gate_delta"].items() if v
+    }
+
+
+def test_the_count_tool_description_names_the_keys_it_adds() -> None:
+    """The description must name the keys, and must keep GENERATING the names
+    rather than spelling them out.
+
+    A first version of this test asserted only `key in spec.description`. A
+    knife that renamed the constant left it green -- the description
+    interpolates the constants, so the two cannot drift while that holds, and
+    the assertion could not fail. Rather than call that unreachable, here is
+    the input that reaches it: a description that hard-codes the key text.
+    That is exactly the defect the hand-written `Returns {...}` clauses were
+    pinned for, so the check is on the source, where it can actually fail.
+    """
+    # The names are the mechanism, not decoration: a model reads keys, and
+    # these were chosen so that reading the key is reading the warning.
+    # Pinned as exact strings so a rename is a decision somebody makes on
+    # purpose rather than a tidy-up.
+    assert (
+        tools_schema._CURRENT_TOTALS_NOT_A_CHANGE_KEY
+        == "these_are_current_totals_not_how_many_an_operation_changed"
+    )
+    assert tools_schema._RECORDED_CHANGE_KEY == "how_many_the_last_operation_changed"
+
+    spec = next(t for t in TOOL_SCHEMA if t.name == "count_gates_by_type")
+    source = pathlib.Path(tools_schema.__file__).read_text()
+    for key in (tools_schema._CURRENT_TOTALS_NOT_A_CHANGE_KEY,
+                tools_schema._RECORDED_CHANGE_KEY):
+        assert key in spec.description, f"the description does not name {key!r}"
+        # Counted as raw text, not as `"key"`: the first version of this
+        # check looked for the double-quoted form, and a knife that spelled
+        # the key out inside a single-quoted phrase slipped past it.
+        occurrences = source.count(key)
+        assert occurrences == 1, (
+            f"{key!r} is written out {occurrences} times in tools_schema.py; it "
+            "should appear once, at its constant definition, and reach the "
+            "description by interpolation -- a hand-written copy is free to "
+            "drift away from the key the tool actually returns"
+        )
+    # And it must still say the plain thing it always said, plus the warning
+    # that is the whole point of the change. Pinned by one short anchor: a
+    # reword goes red and whoever rewords it has to confirm the warning
+    # survived, which is the intent -- the keys alone do not steer a model
+    # that never reads them.
+    assert "breakdown by gate type" in spec.description
+    assert "not the answer to" in spec.description
 
 
 def test_count_primary_ports(tmp_path) -> None:

@@ -54,6 +54,30 @@ OUTPUT_PIN: dict[GateType, str] = {gt: "O" for gt in POSITIONAL_PIN_ORDER}
 OUTPUT_PIN[GateType.DFF] = "Q"
 
 
+class GateTypeError(ValueError):
+    """A gate-type token given in a request cannot be resolved to a
+    `GateType` on this netlist: the token the user (or model) wrote is not
+    one of the fixed primitive names this tool understands. Always a
+    single-line, actionable message -- callers surface `str(exc)` directly
+    to the user/model rather than letting a traceback through."""
+
+
+def parse_gate_type(token: str) -> GateType:
+    """Parse a gate-type token like "and" or "NAND" into a GateType.
+
+    Raises GateTypeError (rather than letting ValueError propagate) with a
+    message listing the valid gate type names, generated from GateType
+    itself so it can't go stale as gate types are added.
+    """
+    try:
+        return GateType(token.lower())
+    except ValueError:
+        valid = ", ".join(t.name for t in GateType)
+        raise GateTypeError(
+            f"{token!r} is not a gate type in this netlist; expected one of {valid}"
+        ) from None
+
+
 @dataclass(frozen=True)
 class NetBit:
     name: str

@@ -981,7 +981,7 @@ def rename_gate(session: Session, old_name: str, new_name: str) -> dict[str, Any
     design = _design(session)
     try:
         _rename_gate_instance(design, old_name, new_name)
-    except KeyError as exc:
+    except (KeyError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
     return {"renamed": True, "old_name": old_name, "new_name": new_name}
 

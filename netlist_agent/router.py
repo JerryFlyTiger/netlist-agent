@@ -106,10 +106,22 @@ def _rename_gate_instance(design: Design, old_name: str, new_name: str) -> None:
     length, so the lazily-built `_gate_index` cache (keyed by the OLD name)
     would otherwise go stale without ever being rebuilt (its only staleness
     signal is a length mismatch) -- clearing it forces a rebuild on next use.
+
+    The duplicate-name guard below lives here rather than in the router
+    handler because this function has two callers with independent handler
+    layers -- `_h_rename_gate` in this module and the LLM tool registry
+    (`llm/tools_schema.py`) -- and both had the same measured bug: renaming
+    a gate to an inst_name that already exists silently produced two gates
+    sharing one `inst_name` (confirmed via `Counter` showing a count of 2),
+    corrupting the design without any error surfacing. Guarding here fixes
+    both call sites at once, mirroring `Design.rename_signal`'s own
+    same-shaped guard for signals (ir.py).
     """
     gate = next((g for g in design.gates if g.inst_name == old_name), None)
     if gate is None:
         raise KeyError(f"no such gate: {old_name!r}")
+    if new_name != old_name and any(g.inst_name == new_name for g in design.gates):
+        raise ValueError(f"gate name already in use: {new_name!r}")
     gate.inst_name = new_name
     design._gate_index = {}
 

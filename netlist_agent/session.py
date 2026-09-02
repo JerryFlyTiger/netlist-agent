@@ -194,6 +194,81 @@ class Session:
     # history, not "history since the summary was last printed".
     _write_failure_summary_warned: bool = False
 
+    def mirror_rename(self, kind: str, old_name: str, new_name: str) -> None:
+        """Mirror a successful rename in `current_design` onto
+        `original_snapshot`, so a later "is this design still equivalent to
+        the pre-transformation netlist" request can answer the real
+        question instead of raising.
+
+        A rename is a pure re-labeling -- it doesn't change what the
+        circuit computes -- but `verify_equivalence` (see its two call
+        sites, `router.py`'s `_h_equiv_to_snapshot` and
+        `llm/tools_schema.py`'s equivalence tool -- the only two readers of
+        `original_snapshot`'s contents anywhere in this codebase) compares
+        the two designs' PI/PO name SETS. Renaming only `current_design`
+        leaves `original_snapshot` holding the old name, so those sets stop
+        matching and the ABC bridge raises instead of answering "yes,
+        still equivalent" -- measured on test21/test23/test30, for
+        signals, primary inputs/outputs, and (via the DFF-boundary PO
+        names, which embed the gate's instance name) gates too. Mirroring
+        the same rename onto the snapshot keeps its labels in sync so the
+        equivalence check sees matching name sets again.
+
+        `kind` is `"signal"` or `"gate"`.
+
+        Deliberately a no-op (not an error) in two cases:
+
+        - `original_snapshot` is `None` (no snapshot was ever loaded --
+          nothing to mirror onto).
+        - `old_name` does not exist in the snapshot. This is NOT defensive
+          padding: a transform (e.g. `remap_to_basis`) can create a brand
+          new net in `current_design` that was never part of the
+          originally parsed netlist, and the user can go on to rename that
+          new net. The snapshot has nothing by that name to relabel --
+          that isn't a bug, it's simply nothing to do.
+        - `new_name` already exists in the snapshot. This should not
+          happen in ordinary use (both designs are renamed together, so
+          the snapshot should never already hold the target name), but if
+          it ever does, raising here would turn the user's already-
+          successful rename of `current_design` into a reported error for
+          a problem confined entirely to the snapshot's own bookkeeping --
+          worse than leaving the snapshot's label stale.
+        """
+        if self.original_snapshot is None:
+            return
+        if kind == "signal":
+            if old_name not in self.original_snapshot.signals:
+                return
+            if new_name != old_name and new_name in self.original_snapshot.signals:
+                return
+            self.original_snapshot.rename_signal(old_name, new_name)
+        elif kind == "gate":
+            # Inlined rather than calling `router._rename_gate_instance`:
+            # `router.py` does `from netlist_agent.session import Session`,
+            # so `session.py` importing back from `router` would be a cycle
+            # (confirmed: grep of both files' top-level imports).
+            #
+            # ⚠ That argument justifies "do not import router here". It does
+            # NOT justify the duplication, and a cold read was right to say so:
+            # `ir.py` imports neither module and this file already imports from
+            # it, so MOVING `_rename_gate_instance` into `ir.py` next to its
+            # exact sibling `Design.rename_signal` has no import obstacle at
+            # all. That is the better shape -- batch 51 found those two guards
+            # had drifted (one had a duplicate-name check, the other did not)
+            # precisely because they live apart -- and it was left undone for
+            # scope, not for a technical reason.
+            #
+            # Until then the two copies are kept honest by
+            # tests/test_rename_then_equivalence.py's drift tests rather than
+            # by this comment.
+            gate = next((g for g in self.original_snapshot.gates if g.inst_name == old_name), None)
+            if gate is None:
+                return
+            if new_name != old_name and any(g.inst_name == new_name for g in self.original_snapshot.gates):
+                return
+            gate.inst_name = new_name
+            self.original_snapshot._gate_index = {}
+
     def start(self, case_name: str, log_filename: Optional[str] = None) -> None:
         """Initialize a fresh testcase: record its name and open the log
         file for writing (truncating any prior contents) -- `log_filename`

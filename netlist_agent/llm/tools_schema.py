@@ -983,6 +983,7 @@ def rename_gate(session: Session, old_name: str, new_name: str) -> dict[str, Any
         _rename_gate_instance(design, old_name, new_name)
     except (KeyError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
+    session.mirror_rename("gate", old_name, new_name)
     return {"renamed": True, "old_name": old_name, "new_name": new_name}
 
 
@@ -992,6 +993,7 @@ def rename_signal(session: Session, old_name: str, new_name: str) -> dict[str, A
         design.rename_signal(old_name, new_name)
     except (KeyError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
+    session.mirror_rename("signal", old_name, new_name)
     return {"renamed": True, "old_name": old_name, "new_name": new_name}
 
 

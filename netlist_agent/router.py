@@ -116,6 +116,22 @@ def _rename_gate_instance(design: Design, old_name: str, new_name: str) -> None:
     corrupting the design without any error surfacing. Guarding here fixes
     both call sites at once, mirroring `Design.rename_signal`'s own
     same-shaped guard for signals (ir.py).
+
+    `Session.mirror_rename`'s `"gate"` branch (session.py) reimplements
+    this same four-line rename-and-reindex logic inline, rather than
+    calling this function, to avoid a circular import (`session.py` cannot
+    `from netlist_agent.router import ...` -- this module already does
+    `from netlist_agent.session import Session`).
+
+    That reason justifies "session.py does not import router"; it does NOT
+    justify the duplication, and the better shape is to move this function
+    into `ir.py` beside `Design.rename_signal`, which has no import
+    obstacle (`ir.py` imports neither module). Batch 51 found those two
+    guards had drifted -- one had a duplicate-name check and the other did
+    not -- precisely because they live apart. Left undone for scope; see
+    the same note on `Session.mirror_rename`. The two copies are held
+    together by the drift tests in
+    tests/test_rename_then_equivalence.py, not by this comment.
     """
     gate = next((g for g in design.gates if g.inst_name == old_name), None)
     if gate is None:

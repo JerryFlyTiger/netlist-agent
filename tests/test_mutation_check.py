@@ -892,3 +892,126 @@ def test_mutation_check_default_tests_path_is_used_when_tests_is_omitted(tmp_pat
     assert "[baseline] 1 passed" in out, out
     assert "red: tests/test_router.py::test_zero_is_nonpos_via_default_path" in out, out
     assert "1/2 killed" in out, out
+
+
+def _write_misfire_project(tmp_path):
+    """A two-test module where one test asserts a guard REJECTS something and
+    the other asserts it ACCEPTS something -- the minimum needed to tell a
+    knife that hit its target apart from one that broke the code outright.
+    Both tests pass against the unmutated source."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "m.py").write_text(
+        "import re\n"
+        'GUARDED = re.compile(r"count (?:the )?gates in the (?:design|netlist)")\n'
+        "\n"
+        "def claims(text):\n"
+        "    return GUARDED.search(text) is not None\n"
+    )
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_m.py").write_text(
+        "import sys, os\n"
+        "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+        "from pkg.m import claims\n"
+        "\n"
+        "def test_guard_accepts_the_real_thing():\n"
+        '    assert claims("count the gates in the design")\n'
+        "\n"
+        "def test_guard_rejects_a_different_object():\n"
+        '    assert not claims("count the gates in the module")\n'
+    )
+
+
+def _run_tool(tmp_path, knives):
+    """The tool resolves `knife["file"]` against the directory ABOVE its own
+    location, so it has to be copied into the synthetic project rather than
+    invoked from the real repo -- same arrangement the .pyc tests above use."""
+    (tmp_path / "scripts").mkdir(exist_ok=True)
+    shutil.copy2(mutation_check.__file__, tmp_path / "scripts" / "mutation_check.py")
+    # The tool shells out to `.venv/bin/python` by name, so the synthetic
+    # project needs one -- same shim the .pyc tests above build.
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    wrapper = venv_bin / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    (tmp_path / "knives.json").write_text(json.dumps(knives))
+    proc = subprocess.run(
+        [sys.executable, "scripts/mutation_check.py", "knives.json", "--tests", "tests/test_m.py"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return proc.stdout + proc.stderr
+
+
+def test_a_knife_that_reddens_the_wrong_tests_is_MISFIRED_not_KILLED(tmp_path):
+    """The regression this feature exists for, reproduced end to end.
+
+    The knife below aims at the guard's object binding: it should make
+    `claims("...in the module")` true, reddening the "rejects" test. Instead
+    the replacement leaves a regex that matches nothing -- the shape a
+    mis-escaped `\\\\w` produces when a knife is hand-typed into JSON. The
+    suite DOES go red, but on the "accepts" test, the opposite direction.
+
+    Without `expect_red` the tool prints KILLED and the run reads as proof
+    the guard is covered, which is exactly what happened on 2026-09-01 and
+    cost two review rounds to unwind.
+    """
+    _write_misfire_project(tmp_path)
+    out = _run_tool(
+        tmp_path,
+        [
+            {
+                "name": "mis-escaped wildcard",
+                "file": "pkg/m.py",
+                "old": "(?:design|netlist)",
+                "new": "(?:\\\\w+)",
+                "expect_red": ["test_guard_rejects_a_different_object"],
+            }
+        ],
+    )
+    assert "MISFIRED" in out, out
+    assert "0/1 killed" in out, out
+    # The unmet expectation is named, not just counted -- the reader has to be
+    # able to see WHICH aim was missed.
+    assert "expected red, but nothing matched: test_guard_rejects_a_different_object" in out, out
+    # And the test that did go red is still printed, so the mis-escape is
+    # diagnosable from this output alone.
+    assert "test_guard_accepts_the_real_thing" in out, out
+
+
+def test_a_knife_that_reddens_its_intended_test_is_still_KILLED(tmp_path):
+    """The control. Same guard, same expectation, a knife that actually lands:
+    without it, `expect_red` could be satisfied by reporting MISFIRED for
+    everything and this file would not notice."""
+    _write_misfire_project(tmp_path)
+    out = _run_tool(
+        tmp_path,
+        [
+            {
+                "name": "object binding -> wildcard",
+                "file": "pkg/m.py",
+                "old": "(?:design|netlist)",
+                "new": "\\w+",
+                "expect_red": ["test_guard_rejects_a_different_object"],
+            }
+        ],
+    )
+    assert "KILLED" in out, out
+    assert "MISFIRED" not in out, out
+    assert "1/1 killed" in out, out
+
+
+def test_a_knife_without_expect_red_keeps_the_old_behaviour(tmp_path):
+    """`expect_red` is optional: every knives.json written before this feature
+    existed must keep working unchanged, or adding it silently invalidates the
+    project's existing mutation records."""
+    _write_misfire_project(tmp_path)
+    out = _run_tool(
+        tmp_path,
+        [{"name": "no expectation", "file": "pkg/m.py", "old": "(?:design|netlist)", "new": "(?:\\\\w+)"}],
+    )
+    assert "KILLED" in out, out
+    assert "MISFIRED" not in out, out

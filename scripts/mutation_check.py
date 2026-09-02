@@ -15,8 +15,28 @@ A "knife" is a single textual substitution that should break behaviour:
       {"name": "drop the 'zero' spelling from the length",
        "file": "netlist_agent/router.py",
        "old": "(?:0|zero))",
-       "new": "(?:0))"}
+       "new": "(?:0))",
+       "expect_red": ["test_length_accepts_the_word_zero"]}
     ]
+
+`expect_red` is optional but strongly recommended: a list of substrings, each
+of which must appear in the name of at least one test that went red. If the
+suite goes red but an expectation matches nothing, the verdict is MISFIRED
+rather than KILLED.
+
+Why it is worth the extra line: KILLED only says "something broke". It does
+not say the guard under test caught anything. On 2026-09-01 a knife aimed at
+an overreach guard was written with the wrong escaping; the substitution left
+a regex that matched nothing, three tests went red, and the run printed
+KILLED. The three that reddened were the ones asserting the pattern still
+matches -- the opposite direction from the guard the knife was aimed at, which
+was never exercised at all. Nothing in the output distinguished that from a
+real kill. `expect_red` makes the comparison the tool's job instead of the
+reader's.
+
+Write `expect_red` from the intent, before running: name the test that SHOULD
+notice this defect. If you cannot name one, that is the finding -- the defect
+has no observer -- and it is worth knowing before the run rather than after.
 
 Each knife is applied alone, the tests are run, and the file is restored --
 including on exit, so an interrupted run does not leave a mutated tree behind.
@@ -272,6 +292,27 @@ def main() -> int:
             shutil.copy2(backups[path], path)
             _invalidate_bytecode(path)
             verdict = "KILLED" if code != 0 else "SURVIVED"
+            # `expect_red` turns "which tests went red" from something a human
+            # is trusted to eyeball into something this tool checks. Measured
+            # cost of not having it (2026-09-01): a knife aimed at an
+            # overreach guard was written with the wrong escaping, so the
+            # mutated regex matched nothing at all. Three tests went red and
+            # the run printed KILLED -- but they were the three asserting the
+            # pattern still MATCHES, not the three asserting it does not
+            # over-claim. The guard under test was never exercised, and the
+            # report read as reassurance. A knife that breaks the code
+            # outright is indistinguishable from a knife its target caught,
+            # unless someone compares the red list against the intent, and
+            # the whole reason this file exists is that "someone will
+            # remember to compare" is not a control.
+            unmet: list[str] = []
+            if verdict == "KILLED" and knife.get("expect_red"):
+                unmet = [
+                    want for want in knife["expect_red"]
+                    if not any(want in failed for failed in failures)
+                ]
+                if unmet:
+                    verdict = "MISFIRED"
             print(f"{verdict:9s} {knife['name']}   [{tail}]")
             # Every red test is printed, not just the first -- this is the
             # whole point of dropping -x above. Deliberately not truncated,
@@ -280,6 +321,11 @@ def main() -> int:
             # target" apart from "the knife broke something else entirely".
             for failed in failures:
                 print(f"    red: {failed}")
+            for want in unmet:
+                print(f"    ⚠ expected red, but nothing matched: {want}")
+            if unmet:
+                print("      -- tests DID go red, but not the ones this knife was aimed at.")
+                print("      -- treat this as the knife missing, not as coverage.")
             results.append((knife["name"], verdict))
     finally:
         for path, backup in backups.items():
@@ -304,9 +350,18 @@ def main() -> int:
     survivors = [(name, verdict) for name, verdict in results if verdict != "KILLED"]
     for name, verdict in survivors:
         print(f"  {verdict}: {name}")
-    if survivors:
+    misfired = [name for name, verdict in results if verdict == "MISFIRED"]
+    if misfired:
+        print("\nMISFIRED is not a weaker KILLED. The mutation broke something, but not the")
+        print("thing the knife was aimed at -- most often the edit made the code invalid")
+        print("rather than merely wrong. Fix the knife and re-cut; nothing has been")
+        print("learned about the guard it was meant to test.")
+    plain_survivors = [(n, v) for n, v in survivors if v == "SURVIVED"]
+    if plain_survivors:
         print("\nEach survivor is either a coverage gap or a structurally unreachable change.")
         print("Decide which, and record the reason -- they look identical from here.")
+        print("Before writing \"unreachable\": write down one input that WOULD reach it, and")
+        print("run that input. If you cannot produce one, say what shapes you tried.")
     return 0
 
 

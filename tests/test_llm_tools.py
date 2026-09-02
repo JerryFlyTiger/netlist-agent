@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import typing
 from typing import Any
 
@@ -1983,3 +1984,70 @@ def test_remap_to_basis_accepts_the_long_form_basis_names(tmp_path) -> None:
     # and_or_not is real, but only for the do_optimize_* family -- the error
     # has to point at that rather than just listing three words.
     assert "and_or_not" in str(exc.value) and "do_optimize" in str(exc.value)
+
+
+# ----------------------------------------------------------------------
+# Hand-written "Returns {...}" key names in tool descriptions
+# ----------------------------------------------------------------------
+# Four descriptions spell out the keys their tool returns, so the model can
+# read a result without guessing. Nothing watched them: renaming a key in the
+# implementation leaves the description promising a key that no longer
+# exists, and a description is not executable, so no test goes red. Measured
+# when this was written -- all four currently match, so this pins a correct
+# state rather than fixing a broken one.
+#
+# The direction that matters is claimed-must-exist. A key the tool returns
+# without documenting is an incomplete description; a key the description
+# promises and the tool does not return is a lie the model acts on. Only the
+# second can be checked without also forbidding the conditional keys the
+# rerun-refusal path adds (see
+# test_rerun_conflict_descriptions_render_the_keys_correctly).
+
+_RETURNS_CLAUSE_RE = re.compile(r"Returns \{([^}]*)\}")
+
+# A call that makes each tool actually produce its result dict. Kept beside
+# the test rather than derived, because a meaningful call needs real
+# identifiers from the fixture design.
+_RETURN_KEY_CALLS: dict[str, dict[str, Any]] = {
+    "check_floating_signals": {},
+    "get_cone_gate_type_breakdown": {"net": "n20"},
+    "do_replace_buf_with_and": {"gate_names": ["g4"], "ctrl_net": "n0[0]"},
+    "do_remap_to_basis": {"basis": "and_not"},
+}
+
+
+def _tools_with_hand_written_return_keys() -> dict[str, set[str]]:
+    claims: dict[str, set[str]] = {}
+    for spec in TOOL_SCHEMA:
+        m = _RETURNS_CLAUSE_RE.search(spec.description)
+        if m:
+            claims[spec.name] = set(re.findall(r"'([A-Za-z0-9_]+)'", m.group(1)))
+    return claims
+
+
+def test_every_hand_written_returns_clause_is_covered_by_this_file() -> None:
+    """The forcing half. Without it, a fifth tool gaining a hand-written
+    `Returns {...}` clause would simply not be checked, and the coverage
+    gap would be invisible -- the same shape as pinning only the probes
+    that happen to exist today."""
+    assert set(_tools_with_hand_written_return_keys()) == set(_RETURN_KEY_CALLS), (
+        "a tool description gained or lost a hand-written 'Returns {...}' clause; "
+        "add or remove its entry in _RETURN_KEY_CALLS so the keys stay checked"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(_RETURN_KEY_CALLS))
+def test_hand_written_return_keys_still_exist(name: str, tmp_path) -> None:
+    claimed = _tools_with_hand_written_return_keys()[name]
+    # A key name with a digit or a capital would have been silently dropped by
+    # a lowercase-only character class, turning a broken promise into a
+    # narrower check that still passes -- flagged by a cold read, widened
+    # before it could bite.
+    assert claimed, f"{name}: the Returns clause named no keys -- the regex or the wording moved"
+    result = TOOL_REGISTRY[name](_new_session(tmp_path), **_RETURN_KEY_CALLS[name])
+    assert isinstance(result, dict), f"{name} returned {type(result).__name__}, not a dict"
+    missing = sorted(claimed - set(result))
+    assert not missing, (
+        f"{name}'s description promises key(s) {missing} that the tool does not return; "
+        f"it actually returns {sorted(result)}"
+    )

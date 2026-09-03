@@ -226,13 +226,39 @@ class Session:
           originally parsed netlist, and the user can go on to rename that
           new net. The snapshot has nothing by that name to relabel --
           that isn't a bug, it's simply nothing to do.
-        - `new_name` already exists in the snapshot. This should not
-          happen in ordinary use (both designs are renamed together, so
-          the snapshot should never already hold the target name), but if
-          it ever does, raising here would turn the user's already-
-          successful rename of `current_design` into a reported error for
-          a problem confined entirely to the snapshot's own bookkeeping --
-          worse than leaving the snapshot's label stale.
+        - `new_name` already exists in the snapshot, for `kind == "signal"`.
+          The docstring used to claim this "should not happen in ordinary
+          use" because "both designs are renamed together" -- that is FALSE
+          and was never actually measured: `Design.signals`' only deletion
+          site is `Design.rename_signal` itself (`ir.py`), and both of its
+          call sites in this codebase (`router.py`, `llm/tools_schema.py`)
+          rename `current_design` and immediately call this method, so no
+          path exists (checked 2026-09-03) that frees a signal name in
+          `current_design` without also freeing it in the snapshot. Kept as
+          a no-op anyway: raising here would turn the user's already-
+          successful rename of `current_design` into a reported error for a
+          problem confined entirely to the snapshot's own bookkeeping,
+          worse than leaving the snapshot's label stale. If a future
+          transform ever frees a signal name only in `current_design`, this
+          branch would silently start masking that the same way the "gate"
+          branch used to (see below) -- watch for it the same way.
+
+        For `kind == "gate"`, the equivalent collision is NOT hypothetical:
+        `deduplicate_gates`/`collapse_double_inverters` (`transform.py`,
+        reached via `router._run_and_track`) remove gate instances from
+        `current_design` ONLY -- they never touch `original_snapshot` --
+        so a later rename onto a name one of them just freed collides with
+        the STALE gate still sitting in the snapshot under that name.
+        Measured (`experiments/snapshot_collision_2026-09-03/`, arm A):
+        silently skipping the mirror here, as this branch used to
+        unconditionally do, leaves the snapshot's copy of the renamed gate
+        under its old label while `current_design`'s copy has the new one
+        -- and when the renamed gate is a DFF, that divergence surfaces as
+        `ABCBridgeError` leaking to the user out of `verify_equivalence`
+        (the `__dff_D__<instance name>` PO boundary, keyed on instance
+        name -- see `abc_bridge.extract_combinational_view`), because the
+        two designs' PO name sets no longer match. See the branch below
+        for how this is now handled instead of skipped.
         """
         if self.original_snapshot is None:
             return
@@ -264,8 +290,76 @@ class Session:
             gate = next((g for g in self.original_snapshot.gates if g.inst_name == old_name), None)
             if gate is None:
                 return
-            if new_name != old_name and any(g.inst_name == new_name for g in self.original_snapshot.gates):
-                return
+            if new_name != old_name:
+                collision = next(
+                    (g for g in self.original_snapshot.gates if g.inst_name == new_name), None
+                )
+                if collision is not None:
+                    if collision.gate_type == GateType.DFF:
+                        # A stale DFF sitting under `new_name`. Moving it
+                        # aside (the non-DFF branch below) is NOT safe here:
+                        # a DFF's inst_name is embedded in its
+                        # `__dff_D__<instance name>` equivalence-check PO
+                        # boundary (`abc_bridge.extract_combinational_view`),
+                        # so renaming `collision` would change the
+                        # snapshot's OWN PO name set out from under it,
+                        # trading today's mismatch for a different one.
+                        # Skip the mirror instead, same as before this batch.
+                        #
+                        # Note this skips the whole mirror, so the gate the
+                        # user actually renamed keeps its OLD label in the
+                        # snapshot too -- i.e. reaching this branch would
+                        # reproduce the very leak batch 55 closed. It is
+                        # load-bearing that it stays unreachable.
+                        #
+                        # Today it is: `transform.py`'s six removal-capable
+                        # transforms (`collapse_double_inverters`,
+                        # `collapse_inverter_buffer_chains`,
+                        # `remove_dangling_gates`, `deduplicate_gates`,
+                        # `simplify_constant_inputs`, `remap_to_basis` --
+                        # enumerated by grepping every `.remove_gate(` call
+                        # site, not from memory) all skip DFFs, which
+                        # `tests/test_snapshot_rename_collision.py` asserts
+                        # by running each of them rather than by asserting
+                        # it here in prose. So the first rename onto a freed
+                        # name always collides with a non-DFF stale gate
+                        # (handled below), never a DFF one -- and once that
+                        # non-DFF collision is moved aside, no DFF-named
+                        # collision is manufactured either. A second guard
+                        # stands behind that one: `_rename_gate_instance`
+                        # raises before this method is ever called if
+                        # `new_name` still labels a live gate in
+                        # `current_design`, and `_h_rename_gate` returns on
+                        # that error without mirroring.
+                        #
+                        # "Not reachable" here means "no path found by
+                        # checking every removal site in this codebase
+                        # today", not a proof that no future transform could
+                        # open one -- a transform that removed a DFF
+                        # outright would, and the test named above is what
+                        # would go red when one appears.
+                        return
+                    # Stale non-DFF gate left behind by a removal transform
+                    # that only touched `current_design` (see this method's
+                    # docstring). It is safe to relabel `collision` out of
+                    # the way rather than skip the mirror: `current_design`
+                    # just accepted `new_name` for a *different* gate, which
+                    # means `current_design` held no gate named `new_name`
+                    # before this rename -- so the snapshot's `collision`
+                    # was already labeled out of sync with `current_design`
+                    # before this call, and non-DFF inst_names play no part
+                    # in `verify_equivalence`'s PI/PO name-set comparison
+                    # (only DFF instance names do, via the `__dff_D__`
+                    # boundary) -- measured directly, arm C of the same
+                    # experiment cited above. Relabeling it to a name
+                    # guaranteed unused in the snapshot preserves that
+                    # snapshot's own internal consistency while freeing
+                    # `new_name` for the real mirror below.
+                    existing = {g.inst_name for g in self.original_snapshot.gates}
+                    k = 0
+                    while f"{new_name}__snapshot_stale_{k}" in existing:
+                        k += 1
+                    collision.inst_name = f"{new_name}__snapshot_stale_{k}"
             gate.inst_name = new_name
             self.original_snapshot._gate_index = {}
 

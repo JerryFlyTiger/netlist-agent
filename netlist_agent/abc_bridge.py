@@ -208,16 +208,38 @@ def extract_combinational_view(
     (uniformity: `is_constant`'s cone-restriction step discards whichever POs
     it doesn't need anyway), via a BUF tap driving a canonical fresh output
     net named `__dff_D__<dff instance name>` -- NOT under the D net's own
-    name. Keying the boundary on the DFF *instance* (which no transform in
-    this codebase renames or replaces) instead of the *net* makes
-    before/after-transform equivalence checks robust to rewires that change
-    which net feeds a D pin (buffer insertion, double-inverter collapse):
+    name. Keying the boundary on the DFF *instance* instead of the *net*
+    makes before/after-transform equivalence checks robust to rewires that
+    change which net feeds a D pin (buffer insertion, double-inverter
+    collapse):
+
     with net-name keying those produced spurious "PO name sets differ"
-    errors on designs that were in fact equivalent. Residual limitations,
-    accepted: renaming a DFF instance itself, or a transform removing a
-    dangling DFF outright, still changes the boundary set and fails the
-    name-set pre-check in `verify_equivalence` (honestly, as an error -- not
-    as a wrong verdict). The Q side stays keyed by net name: Q nets are
+    errors on designs that were in fact equivalent.
+
+    Correctness here does NOT come from "no transform renames a DFF
+    instance" -- that claim is false: `router._h_rename_gate` /
+    `llm/tools_schema.rename_gate` rename gate instances generically, DFFs
+    included, and nothing stops a request from targeting one. What
+    actually keeps `verify_equivalence`'s two designs' PO name sets in
+    sync across such a rename is `Session.mirror_rename` (`session.py`),
+    called from every rename call site immediately after a successful
+    rename, which relabels `original_snapshot`'s copy of the same
+    instance the same way `current_design`'s was just relabeled -- see
+    that method's docstring, and `experiments/snapshot_collision_2026-09-03/`,
+    for the collision case this has to handle when the freed name was
+    already stale in the snapshot. One exception to that sync, spelled out
+    there and repeated here so this file is not read as an unconditional
+    guarantee: when the name being renamed onto already labels a DFF in the
+    snapshot, `mirror_rename` skips rather than relabels, and the PO name
+    sets would then diverge exactly as described above. That case is
+    argued -- and, via `tests/test_snapshot_rename_collision.py`, executed
+    -- to be unreachable today, not proven impossible.
+
+    Residual limitation, accepted: a transform removing a dangling DFF
+    outright still changes the boundary set and fails the name-set
+    pre-check in `verify_equivalence` (honestly, as an error -- not as a
+    wrong verdict) -- there is no rename to mirror in that case, only a
+    disappearance. The Q side stays keyed by net name: Q nets are
     driver-side and none of the existing transforms rewire or rename them.
     """
     new_design = Design(module_name=design.module_name)

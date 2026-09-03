@@ -235,11 +235,14 @@ def extract_combinational_view(
     argued -- and, via `tests/test_snapshot_rename_collision.py`, executed
     -- to be unreachable today, not proven impossible.
 
-    Residual limitation, accepted: a transform removing a dangling DFF
-    outright still changes the boundary set and fails the name-set
-    pre-check in `verify_equivalence` (honestly, as an error -- not as a
-    wrong verdict) -- there is no rename to mirror in that case, only a
-    disappearance. The Q side stays keyed by net name: Q nets are
+    Residual limitation, accepted: a transform that removed a DFF outright
+    would change the boundary set and fail the name-set pre-check in
+    `verify_equivalence` (honestly, as an error -- not as a wrong verdict),
+    because there is no rename to mirror in that case, only a
+    disappearance. Stated in the conditional because no transform in this
+    codebase does that today -- all six gate-removal sites exempt DFFs, and
+    `tests/test_snapshot_rename_collision.py` runs them to say so rather
+    than asserting it in prose. The Q side stays keyed by net name: Q nets are
     driver-side and none of the existing transforms rewire or rename them.
     """
     new_design = Design(module_name=design.module_name)

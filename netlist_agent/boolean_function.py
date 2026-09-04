@@ -676,6 +676,15 @@ def derive_boolean_function(design: Design, target_token: str) -> BooleanFunctio
     else:
         root = target
 
+    # Deliberately `backward_reachable_gates`, NOT `backward_cone_with_boundary_dffs`
+    # (the QA A94 cone that counts a boundary DFF as a gate): `_fanin_support` below
+    # classifies every DFF.Q reached here into `support_dffq` and treats it as a FREE
+    # variable of the combinational function being derived, not a gate the function is
+    # made of. `cone_gate_count` (used in the "X is a combinational function of N
+    # gate(s)" explanation below) answers "how many gates sit between TARGET and its
+    # free variables", a different question from A94's "how many gates are in TARGET's
+    # fanin cone" -- folding a boundary DFF into this count would count a free variable
+    # as part of the combinational logic that consumes it, which is backwards.
     cone = graph.backward_reachable_gates(root)
     support_all, support_pi, support_dffq, support_other = _fanin_support(design, graph, root, cone)
     # F4: this is the support of `root` -- TARGET's D pin when `is_dff_q`, else TARGET itself. It is

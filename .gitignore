@@ -38,6 +38,7 @@ Alpha_Testcase/testcase/*/*_out.v
 
 # Contest leaderboard export — someone else's data, not this project's source
 alpha test result/
+beta test result/
 
 # demo/run_demo.sh scratch working directories (copied inputs + run artifacts)
 demo/runs/

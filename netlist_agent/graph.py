@@ -251,6 +251,39 @@ class NetlistGraph:
                     frontier.append(pred)
         return visited
 
+    def backward_cone_with_boundary_dffs(self, start: NetBit) -> set[str]:
+        """Instance names of `start`'s fanin cone per QA A94: the non-DFF
+        cone (`backward_reachable_gates`) PLUS every boundary DFF -- a DFF
+        whose Q output feeds (directly) a gate already in that non-DFF cone
+        -- PLUS, when `start` itself is a DFF's Q, that DFF (A94's "when X
+        is itself a DFF's Q, the cone is 1: that DFF itself" rule, which the
+        first clause alone would miss since such a DFF has no downstream
+        gate inside the cone to make it a boundary).
+
+        This is a distinct traversal from `backward_reachable_gates`, not a
+        replacement for it: `backward_reachable_gates` still stops AT the
+        DFF boundary (never includes the DFF), which is exactly what the
+        cone-remapping/decomposition transforms in router.py need (they
+        rewrite non-DFF gates only, and A72/A80 say DFFs are cone
+        boundaries -- reached but not traversed past). Only analysis-style
+        "how big/what's in this cone" callers want the DFF counted.
+        """
+        non_dff = self.backward_reachable_gates(start)
+        result: set[str] = set(non_dff)
+        for name in non_dff:
+            gate = self.gate_by_name[name]
+            out_pin = OUTPUT_PIN[gate.gate_type]
+            for k, v in gate.pins.items():
+                if k == out_pin or not isinstance(v, NetBit):
+                    continue
+                driver = self.design.net_driver.get(v)
+                if driver is not None and driver.gate_type == GateType.DFF:
+                    result.add(driver.inst_name)
+        driver = self.design.net_driver.get(start)
+        if driver is not None and driver.gate_type == GateType.DFF:
+            result.add(driver.inst_name)
+        return result
+
     # ------------------------------------------------------------------
     # Global depth aggregates (capabilities 13, 14, 15, 16)
     # ------------------------------------------------------------------
@@ -717,7 +750,12 @@ class NetlistGraph:
         self, source: NetBit, target: Endpoint
     ) -> "CutResult":
         """All net-bits (excluding `source`/`target` themselves) whose removal
-        disconnects `source` from `target` (capability 22).
+        disconnects `source` from `target` (capability 22), alongside the
+        GATE instance driving each such net-bit (`cut_gates` -- per QA A87,
+        "articulation point" means a gate only, not a net; `cut_nets` is kept
+        for the pre-A87 net-level callers -- `analysis`/`llm/tools_schema`'s
+        "cut nets between" tool -- which ask a related but distinct question
+        and were not part of A87's ruling).
 
         O(#candidates * (V+E)) -- one `path_exists` (full BFS) call per
         candidate gate in `fwd & back`; correct for reasonable design sizes,
@@ -727,15 +765,16 @@ class NetlistGraph:
         """
         target_nb = self.resolve_endpoint(target)
         if target_nb is None or not self.path_exists(source, target):
-            return CutResult(path_exists=False, cut_nets=[])
+            return CutResult(path_exists=False, cut_nets=[], cut_gates=[])
         if target_nb == source:
-            return CutResult(path_exists=True, cut_nets=[])
+            return CutResult(path_exists=True, cut_nets=[], cut_gates=[])
 
         fwd = self.forward_reachable_gates(source)
         back = self.backward_reachable_gates(target_nb)
         candidates = fwd & back
 
         cuts: list[NetBit] = []
+        cut_gates: list[str] = []
         for gname in candidates:
             gate = self.gate_by_name[gname]
             out_nb = _gate_output_pin(gate)
@@ -743,7 +782,8 @@ class NetlistGraph:
                 continue
             if not self.path_exists(source, target, avoid=out_nb):
                 cuts.append(out_nb)
-        return CutResult(path_exists=True, cut_nets=cuts)
+                cut_gates.append(gname)
+        return CutResult(path_exists=True, cut_nets=cuts, cut_gates=cut_gates)
 
 
     # ------------------------------------------------------------------
@@ -853,7 +893,14 @@ class CutResult:
     """Result of `NetlistGraph.cut_nets_between`. `path_exists=False`
     distinguishes "no path at all" from "path exists but no cut nets" (an
     empty `cut_nets` list alone would be ambiguous between those two cases).
+
+    `cut_gates` is the same set of cuts, reported as gate instance names
+    instead of net-bits -- per QA A87, "articulation point" means a gate
+    only, not a net, so `_h_articulation_points` (router.py) reads
+    `cut_gates`; `cut_nets` remains for the net-level "cut nets between"
+    query, a related but distinct question A87 did not rule on.
     """
 
     path_exists: bool
     cut_nets: list[NetBit]
+    cut_gates: list[str]

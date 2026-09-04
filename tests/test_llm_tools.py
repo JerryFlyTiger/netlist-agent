@@ -18,6 +18,8 @@ import pytest
 
 from netlist_agent.abc_bridge import are_equivalent, check_symmetry, is_constant
 from netlist_agent.analysis import find_floating_signals
+from dataclasses import replace
+
 from netlist_agent.graph import NetlistGraph
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, Port, Signal, design_fingerprint
 from netlist_agent.llm import tools_schema
@@ -932,9 +934,80 @@ def test_cut_tools(tmp_path) -> None:
     cuts = TOOL_REGISTRY["get_cut_nets_between"](session, source="n0[0]", target="n20")
     assert cuts["path_exists"] is True
     assert "n10" in cuts["cut_nets"]
+    # Per QA A87: "articulation point" is a gate, not a net -- the chain from
+    # n10 (g0's output) through g2/g3 to n20 (g4's output) is all cut points,
+    # so g0/g2/g3 (not their net names) is what the articulation-point
+    # question wants.
+    assert cuts["cut_gates"] == ["g0", "g2", "g3"]
 
     assert TOOL_REGISTRY["check_is_cut_signal"](session, signal="n10")["is_cut"] is True
     assert TOOL_REGISTRY["check_is_cut_signal"](session, signal="n2")["is_cut"] is False
+
+
+def test_cut_tools_no_path_still_carries_both_keys(tmp_path) -> None:
+    """The `path_exists=False` branch must still carry `cut_gates`, not just
+    `cut_nets` -- a caller that reads both keys unconditionally would raise
+    KeyError on "no path" otherwise.
+
+    This branch is not an edge case dredged up for completeness: it is the
+    one the released corpus actually takes. The 0813 release's only
+    articulation-point request (test82 line 6, "Find all articulation points
+    in the combinational graph between n2 and n14") returns path_exists=False,
+    so the success branch above never runs there and this branch is the whole
+    of A87's corpus-level exposure. A knife that dropped `cut_gates` here
+    survived the whole suite on 2026-09-04, which is why this exists.
+    """
+    session = _new_session(tmp_path)
+    cuts = TOOL_REGISTRY["get_cut_nets_between"](session, source="n20", target="n0[0]")
+    assert cuts["path_exists"] is False
+    assert cuts["cut_gates"] == []
+    assert cuts["cut_nets"] == []
+
+
+def test_cut_gates_are_sorted_even_when_the_graph_hands_them_over_unsorted(tmp_path, monkeypatch) -> None:
+    """`cut_gates` is accumulated by iterating a `set` of candidate gate
+    names, so its order is a PYTHONHASHSEED race and the tool sorts it.
+
+    Asserting against a real 3-gate design cannot prove that sort runs: with
+    so few candidates the unsorted order coincides with the sorted one often
+    enough that a knife removing `sorted()` survives about as often as it
+    dies -- measured on 2026-09-04, that knife flipped between KILLED and
+    SURVIVED across two runs of the same suite. So the order is injected
+    here rather than hoped for: the graph is made to hand back a
+    deliberately reversed `cut_gates`, and the tool must still emit it
+    sorted. See the tie-break lesson this repeats.
+    """
+    session = _new_session(tmp_path)
+    real = NetlistGraph.cut_nets_between
+
+    def reversed_cut_gates(self, source, target):
+        result = real(self, source, target)
+        return replace(result, cut_gates=sorted(result.cut_gates, reverse=True))
+
+    monkeypatch.setattr(NetlistGraph, "cut_nets_between", reversed_cut_gates)
+    cuts = TOOL_REGISTRY["get_cut_nets_between"](session, source="n0[0]", target="n20")
+    assert cuts["cut_gates"] == ["g0", "g2", "g3"]
+
+
+def test_get_cut_nets_between_description_names_both_return_keys(tmp_path) -> None:
+    """Same discipline as test_path_tool_descriptions_render_the_example_dicts_correctly:
+    a hand-typed return-key name in a tool description is invisible to
+    `test_schema_entry_well_formed` (it only checks the description is a
+    non-empty string), so it can drift from the actual return dict without
+    any test going red. This pins the description's claimed keys to the
+    dict `get_cut_nets_between` actually returns."""
+    by_name = {spec.name: spec for spec in TOOL_SCHEMA}
+    spec = by_name["get_cut_nets_between"]
+    session = _new_session(tmp_path)
+    result = TOOL_REGISTRY["get_cut_nets_between"](session, source="n0[0]", target="n20")
+    for key in ("cut_nets", "cut_gates"):
+        assert key in spec.description, f"description never names {key!r}"
+        assert key in result, f"{key!r} named in description is not actually returned"
+    # A87: the description must not call a net an articulation point (the
+    # pre-A87 wording called this tool's result "every net ... (articulation
+    # points)" -- that phrasing must not come back).
+    assert "net whose removal" not in spec.description
+    assert "articulation point' is a GATE, not a net" in spec.description
 
 
 def test_direct_pi_po_connections_empty(tmp_path) -> None:
@@ -978,6 +1051,56 @@ def test_cone_gate_type_breakdown_empty_cone_is_not_an_error(tmp_path) -> None:
     assert breakdown["net"] == "n0[0]"
     assert breakdown["cone_gates"] == 0
     assert breakdown["by_type"] == {}
+
+
+def _new_a94_session(tmp_path) -> Session:
+    """QA A94's own minimal example, built fresh here (not shared with
+    tests/test_analysis.py's copy) so the LLM-tool layer's cone functions
+    -- which duplicate router.py's `backward_cone_with_boundary_dffs` call
+    sites rather than sharing them -- have an independent observer for the
+    boundary-DFF rule, per that fix's design note in the task doc."""
+    design = Design(module_name="top")
+    for name in ("d0", "d1", "clk", "rn"):
+        design.signals[name] = Signal(name=name, msb=None, lsb=None, direction=Direction.INPUT)
+        design.ports.append(Port(name=name, direction=Direction.INPUT))
+    design.signals["x"] = Signal(name="x", msb=None, lsb=None, direction=Direction.OUTPUT)
+    design.ports.append(Port(name="x", direction=Direction.OUTPUT))
+    for name in ("q0", "q1"):
+        design.signals[name] = Signal(name=name, msb=None, lsb=None, direction=Direction.INTERNAL)
+    d0, d1, clk, rn = NetBit("d0"), NetBit("d1"), NetBit("clk"), NetBit("rn")
+    q0, q1, x = NetBit("q0"), NetBit("q1"), NetBit("x")
+    design.gates = [
+        Gate("g2", GateType.DFF, {"RN": rn, "SN": Const.ONE, "CK": clk, "D": d0, "Q": q0}),
+        Gate("g3", GateType.DFF, {"RN": rn, "SN": Const.ONE, "CK": clk, "D": d1, "Q": q1}),
+        Gate("g1", GateType.AND, {"O": x, "I0": q0, "I1": q1}),
+    ]
+    design.build_indices()
+    path = str(tmp_path / "a94.v")
+    write_verilog(design, path)
+    session = Session()
+    session.current_design = parse_verilog(path)
+    session.original_snapshot = parse_verilog(path)
+    session.load_dir = str(tmp_path)
+    return session
+
+
+def test_cone_tools_count_boundary_dffs_qa_a94(tmp_path) -> None:
+    """Per QA A94, the LLM-tool cone functions must count boundary DFFs too,
+    not just router.py's handlers."""
+    session = _new_a94_session(tmp_path)
+    assert TOOL_REGISTRY["get_fanin_cone_size"](session, net="x")["size"] == 3
+    gates = TOOL_REGISTRY["get_fanin_cone_gates"](session, net="x")
+    assert set(gates["items"]) == {"g1", "g2", "g3"}
+
+    breakdown = TOOL_REGISTRY["get_cone_gate_type_breakdown"](session, net="x")
+    assert breakdown["cone_gates"] == 3
+    assert breakdown["by_type"] == {"AND": 1, "DFF": 2}
+
+    shared = TOOL_REGISTRY["get_shared_fanin_gates"](session, net_a="x", net_b="q0")
+    assert shared["items"] == ["g2"]
+
+    # A94 point 3: a DFF's own Q has a fanin cone of 1 (that DFF), not 0.
+    assert TOOL_REGISTRY["get_fanin_cone_size"](session, net="q0")["size"] == 1
 
 
 # ----------------------------------------------------------------------

@@ -68,7 +68,8 @@ FIXTURE_PATHS = corpus_netlist_paths()
 #   path_count(a -> y) = 2   (via G2 branch, and via G3/G4/G5 branch)
 #   max_design_depth = 6 (at G7/y); max_reg_to_reg_depth = 2 (G2,G8);
 #   max_pi_to_dff_d_depth = 3 (G1,G2,G8)
-#   fanin_cone_size(y) = 7 gates; fanin_cone_size(n8, DFF.D) = 3 gates
+#   fanin_cone_size(y) = 8 gates (7 non-DFF + boundary DFF Gdff, QA A94);
+#   fanin_cone_size(n8, DFF.D) = 4 gates (likewise)
 #   fanout_cone_size(a) = 10 gates (all non-dff gates)
 #   fanout_count(n1) = 3 (unique max overall); fanout_count(b) = 2 (unique max among PIs)
 #   cut_nets_between(a, y) = {n1, n6}; n2 is NOT a cut for any PI/PO pair
@@ -223,15 +224,121 @@ def test_max_fanout_aggregates(graph: NetlistGraph) -> None:
 
 
 def test_cone_sizes(graph: NetlistGraph) -> None:
-    assert fanin_cone_size(graph, NetBit("y")) == 7
-    assert fanin_cone_size(graph, NetBit("n8")) == 3
-    assert fanin_cone_size(graph, NetBit("z")) == 0  # driven directly by the DFF
+    # Per QA A94, a boundary DFF (one whose Q feeds a gate already in the
+    # cone) counts as a gate in the fanin cone. G2 reads z (Gdff's Q), so
+    # Gdff is a boundary DFF for both y's and n8's cones -- 7+1 and 3+1.
+    assert fanin_cone_size(graph, NetBit("y")) == 8
+    assert fanin_cone_size(graph, NetBit("n8")) == 4
+    # A94's other clause: when the queried net IS itself a DFF's Q, the
+    # cone is 1 (that DFF itself), not 0.
+    assert fanin_cone_size(graph, NetBit("z")) == 1
     assert fanout_cone_size(graph, NetBit("a")) == 10
 
 
 def test_largest_fanin_cone(graph: NetlistGraph) -> None:
     nb, size = largest_fanin_cone(graph)
-    assert (nb, size) == (NetBit("y"), 7)
+    assert (nb, size) == (NetBit("y"), 8)
+
+
+# ----------------------------------------------------------------------
+# QA A94 (2026-08-27): a combinational signal's fanin cone must count the
+# boundary DFF(s) its cone bottoms out at as gates in the cone -- built
+# directly from the QA's own minimal example ("and g1 (X, q0, q1); where
+# q0/q1 are the Q of DFF g2/g3 -> cone of X is 3 gates: AND:1, DFF:2"), not
+# a number we derived ourselves.
+# ----------------------------------------------------------------------
+
+
+def _build_a94_example_design() -> Design:
+    design = Design(module_name="top")
+    for name in ("d0", "d1", "clk", "rn"):
+        design.signals[name] = Signal(name=name, msb=None, lsb=None, direction=Direction.INPUT)
+        design.ports.append(Port(name=name, direction=Direction.INPUT))
+    design.signals["x"] = Signal(name="x", msb=None, lsb=None, direction=Direction.OUTPUT)
+    design.ports.append(Port(name="x", direction=Direction.OUTPUT))
+    for name in ("q0", "q1"):
+        design.signals[name] = Signal(name=name, msb=None, lsb=None, direction=Direction.INTERNAL)
+
+    d0, d1, clk, rn = NetBit("d0"), NetBit("d1"), NetBit("clk"), NetBit("rn")
+    q0, q1, x = NetBit("q0"), NetBit("q1"), NetBit("x")
+
+    design.gates = [
+        Gate("g2", GateType.DFF, {"RN": rn, "SN": Const.ONE, "CK": clk, "D": d0, "Q": q0}),
+        Gate("g3", GateType.DFF, {"RN": rn, "SN": Const.ONE, "CK": clk, "D": d1, "Q": q1}),
+        Gate("g1", GateType.AND, {"O": x, "I0": q0, "I1": q1}),
+    ]
+    design.build_indices()
+    return design
+
+
+def test_a94_fanin_cone_counts_boundary_dffs_qa_example() -> None:
+    graph = NetlistGraph(_build_a94_example_design())
+    assert fanin_cone_size(graph, NetBit("x")) == 3
+    names = graph.backward_cone_with_boundary_dffs(NetBit("x"))
+    assert names == {"g1", "g2", "g3"}
+
+
+def test_a94_gate_type_breakdown_of_cone_qa_example() -> None:
+    """QA A94's own worked example: "AND:1, DFF:2", total 3."""
+    design = _build_a94_example_design()
+    graph = NetlistGraph(design)
+    names = graph.backward_cone_with_boundary_dffs(NetBit("x"))
+    counts: dict[GateType, int] = {}
+    for g in design.gates:
+        if g.inst_name in names:
+            counts[g.gate_type] = counts.get(g.gate_type, 0) + 1
+    assert counts == {GateType.AND: 1, GateType.DFF: 2}
+
+
+def test_a94_dff_q_itself_has_fanin_cone_size_one() -> None:
+    """QA A94 point 3: "when X is itself a DFF's Q, the answer is 1 (that
+    DFF itself), not 0"."""
+    graph = NetlistGraph(_build_a94_example_design())
+    assert fanin_cone_size(graph, NetBit("q0")) == 1
+    assert fanin_cone_size(graph, NetBit("q1")) == 1
+
+
+def _build_a94_shared_boundary_dff_design() -> Design:
+    """One DFF (g2, Q=q0) feeds TWO different gates that are both inside the
+    cone (g1 and g4), unlike `_build_a94_example_design` where every DFF
+    feeds only a single gate. `backward_cone_with_boundary_dffs` collects
+    boundary DFFs into a `set`, so g2 should still be counted once -- but no
+    prior test exercises a DFF reached from more than one place in the cone,
+    so a future change from `set` to an order-preserving `list` (e.g. to
+    make cone contents deterministic) could start double-counting g2
+    without any existing test going red."""
+    design = Design(module_name="top")
+    for name in ("d0", "d1", "d2", "clk", "rn"):
+        design.signals[name] = Signal(name=name, msb=None, lsb=None, direction=Direction.INPUT)
+        design.ports.append(Port(name=name, direction=Direction.INPUT))
+    design.signals["x"] = Signal(name="x", msb=None, lsb=None, direction=Direction.OUTPUT)
+    design.ports.append(Port(name="x", direction=Direction.OUTPUT))
+    for name in ("q0", "n1", "n4"):
+        design.signals[name] = Signal(name=name, msb=None, lsb=None, direction=Direction.INTERNAL)
+
+    d0, d1, d2, clk, rn = NetBit("d0"), NetBit("d1"), NetBit("d2"), NetBit("clk"), NetBit("rn")
+    q0, n1, n4, x = NetBit("q0"), NetBit("n1"), NetBit("n4"), NetBit("x")
+
+    design.gates = [
+        Gate("g2", GateType.DFF, {"RN": rn, "SN": Const.ONE, "CK": clk, "D": d0, "Q": q0}),
+        Gate("g1", GateType.AND, {"O": n1, "I0": q0, "I1": d1}),
+        Gate("g4", GateType.OR, {"O": n4, "I0": q0, "I1": d2}),
+        Gate("g5", GateType.AND, {"O": x, "I0": n1, "I1": n4}),
+    ]
+    design.build_indices()
+    return design
+
+
+def test_a94_shared_boundary_dff_counted_once_not_per_feed() -> None:
+    """g2's Q (q0) feeds both g1 and g4 -- both already inside x's non-DFF
+    cone -- so g2 is a boundary DFF reached twice, and must still appear
+    exactly once in the cone (3 non-DFF gates + 1 DFF = 4), not twice (which
+    a `list`-based, non-deduplicating cone would produce)."""
+    graph = NetlistGraph(_build_a94_shared_boundary_dff_design())
+    names = graph.backward_cone_with_boundary_dffs(NetBit("x"))
+    assert names == {"g1", "g4", "g5", "g2"}
+    assert len(names) == 4
+    assert fanin_cone_size(graph, NetBit("x")) == 4
 
 
 # ---- Depth (capabilities 12-16) ----
@@ -350,12 +457,29 @@ def test_cut_nets_between(graph: NetlistGraph) -> None:
     result = graph.cut_nets_between(NetBit("a"), NetBit("y"))
     assert result.path_exists is True
     assert set(result.cut_nets) == {NetBit("n1"), NetBit("n6")}
+    # Per QA A87 ("articulation point" means a gate only, not a net): the
+    # cone from a to y has a diamond (G2's branch and G3/G4/G5's branch
+    # merging at G6), so most candidate gates in fwd&back (G2,G3,G4,G5,G8)
+    # are NOT true cut points -- only G1 (drives n1) and G6 (drives n6) are.
+    # This is the one assertion that would catch cut_gates being computed
+    # as "every candidate", not "every candidate that IS actually a cut".
+    assert set(result.cut_gates) == {"G1", "G6"}
 
 
 def test_cut_nets_between_no_path(graph: NetlistGraph) -> None:
     result = graph.cut_nets_between(NetBit("clk"), NetBit("y"))
     assert result.path_exists is False
     assert result.cut_nets == []
+    assert result.cut_gates == []
+
+
+def test_cut_nets_between_source_equals_target(graph: NetlistGraph) -> None:
+    """Degenerate case: source and target are the same net-bit -- a path
+    trivially exists (length 0) and there is nothing to cut."""
+    result = graph.cut_nets_between(NetBit("y"), NetBit("y"))
+    assert result.path_exists is True
+    assert result.cut_nets == []
+    assert result.cut_gates == []
 
 
 def test_is_cut_signal_for_some_pi_po_pair(graph: NetlistGraph) -> None:

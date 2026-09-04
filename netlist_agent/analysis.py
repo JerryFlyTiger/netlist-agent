@@ -241,8 +241,13 @@ def max_fanout_pi(graph: NetlistGraph) -> tuple[Optional[NetBit], int]:
 
 
 def fanin_cone_size(graph: NetlistGraph, nb: NetBit) -> int:
-    """Capability 11: gate count of a signal's fanin cone."""
-    return len(graph.backward_reachable_gates(nb))
+    """Capability 11: gate count of a signal's fanin cone.
+
+    Per QA A94, boundary DFFs (a DFF whose Q feeds a gate in the cone, or
+    the DFF driving `nb` itself when `nb` IS a DFF's Q) count as gates in
+    the cone -- see `NetlistGraph.backward_cone_with_boundary_dffs`.
+    """
+    return len(graph.backward_cone_with_boundary_dffs(nb))
 
 
 def fanout_cone_size(graph: NetlistGraph, nb: NetBit) -> int:
@@ -274,6 +279,26 @@ def largest_fanin_cone(graph: NetlistGraph) -> tuple[Optional[NetBit], int]:
         if size > best_size:
             best_nb, best_size = nb, size
     return best_nb, best_size
+
+
+def deepest_fanin_cone(graph: NetlistGraph) -> tuple[Optional[NetBit], int]:
+    """Which output (PO or DFF.D) has the DEEPEST fanin cone -- distinct
+    from `largest_fanin_cone` (gate COUNT). Two different questions the
+    router used to conflate: "deepest"/"biggest" fanin cone all reached
+    `largest_fanin_cone`, but depth and gate count can disagree (a long
+    thin chain can be deeper yet have fewer gates than a short, wide one).
+    Same candidate set and tie-break convention as `largest_fanin_cone`
+    (first-in-sort-order among ties, via strict `>`), driven by
+    `graph.per_output_depths()` instead of `fanin_cone_size`.
+    """
+    depths = graph.per_output_depths()
+    best_nb: Optional[NetBit] = None
+    best_depth = -1
+    for nb in sorted(depths, key=netbit_sort_key):
+        depth = depths[nb]
+        if depth > best_depth:
+            best_nb, best_depth = nb, depth
+    return best_nb, best_depth
 
 
 # ----------------------------------------------------------------------

@@ -692,10 +692,11 @@ def get_cut_nets_between(session: Session, source: str, target: str) -> dict[str
     graph = _graph(session)
     result = graph.cut_nets_between(_resolve_bit(graph.design, source), _resolve_bit(graph.design, target))
     if not result.path_exists:
-        return {"path_exists": False, "cut_nets": []}
+        return {"path_exists": False, "cut_nets": [], "cut_gates": []}
     return {
         "path_exists": True,
         "cut_nets": [netbit_token(nb) for nb in sorted(result.cut_nets, key=netbit_sort_key)],
+        "cut_gates": sorted(result.cut_gates),
     }
 
 
@@ -783,7 +784,7 @@ def get_fanin_cone_size(session: Session, net: str) -> dict[str, Any]:
 
 def get_fanin_cone_gates(session: Session, net: str) -> dict[str, Any]:
     graph = _graph(session)
-    return _cap(sorted(graph.backward_reachable_gates(_resolve_bit(graph.design, net))))
+    return _cap(sorted(graph.backward_cone_with_boundary_dffs(_resolve_bit(graph.design, net))))
 
 
 def get_fanout_cone_gates(session: Session, net: str) -> dict[str, Any]:
@@ -804,7 +805,7 @@ def get_cone_gate_type_breakdown(session: Session, net: str) -> dict[str, Any]:
     that reads the same as "this call failed"."""
     design = _design(session)
     graph = _graph(session)
-    names = graph.backward_reachable_gates(_resolve_bit(design, net))
+    names = graph.backward_cone_with_boundary_dffs(_resolve_bit(design, net))
     counts: dict[str, int] = {}
     for g in design.gates:
         if g.inst_name in names:
@@ -814,9 +815,9 @@ def get_cone_gate_type_breakdown(session: Session, net: str) -> dict[str, Any]:
 
 def get_shared_fanin_gates(session: Session, net_a: str, net_b: str) -> dict[str, Any]:
     graph = _graph(session)
-    shared = graph.backward_reachable_gates(_resolve_bit(graph.design, net_a)) & graph.backward_reachable_gates(
-        _resolve_bit(graph.design, net_b)
-    )
+    shared = graph.backward_cone_with_boundary_dffs(
+        _resolve_bit(graph.design, net_a)
+    ) & graph.backward_cone_with_boundary_dffs(_resolve_bit(graph.design, net_b))
     return _cap(sorted(shared))
 
 
@@ -1852,7 +1853,10 @@ TOOL_SCHEMA: list[ToolSpec] = [
     ),
     ToolSpec(
         "get_cut_nets_between",
-        "Find every net whose removal would disconnect a source net from a target net (articulation points).",
+        "Find every gate whose removal would disconnect a source net from a target net. Per QA A87, an "
+        "'articulation point' is a GATE, not a net, so for that question read 'cut_gates' (the cut gates' "
+        "instance names) -- 'cut_nets' (the same cut points, reported as the net driven by each cut gate's "
+        "output instead) answers a related but distinct net-level question A87 did not rule on.",
         _schema({"source": _s(_NET_DESC), "target": _s(_NET_DESC)}, ["source", "target"]),
     ),
     ToolSpec(

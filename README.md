@@ -109,9 +109,8 @@ engine; the layout above is just what the corpus-backed tests look for.
 
 ## ABC dependency
 
-This project uses [ABC](https://github.com/berkeley-abc/abc) (Berkeley Logic
-Synthesis and Verification System) for netlist reading, logic optimization, and
-combinational equivalence checking.
+This project uses ABC (Berkeley Logic Synthesis and Verification System) for
+netlist reading, logic optimization, and combinational equivalence checking.
 
 ABC has no release tags — its behavior tracks upstream commits directly — so the
 exact commit this project builds against is pinned in [`abc.lock`](abc.lock),

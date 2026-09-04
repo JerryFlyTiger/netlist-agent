@@ -634,9 +634,10 @@ def _balance_one_net(design: Design, graph: NetlistGraph, nb: NetBit, max_fanout
 
 
 def limit_fanout(design: Design, max_fanout: int) -> int:
-    """Insert buffers wherever needed so that no net drives more than
-    `max_fanout` loads, preserving connectivity/functionality exactly.
-    Returns the number of BUF gates added.
+    """Rebalance every net whose load count exceeds `max_fanout` by hanging a
+    tree of BUF gates off it, so no net drives more than `max_fanout` loads
+    while connectivity/functionality is preserved exactly. Returns the
+    number of BUF gates added.
 
     A net that also drives a primary output reserves one unit of its own
     fanout budget for that PO connection (which can't be routed through a

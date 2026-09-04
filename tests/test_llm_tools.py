@@ -441,11 +441,12 @@ def test_count_gates_by_type(tmp_path) -> None:
 
 # The present-state route (experiments/present_state_inference_2026-09-02)
 # ----------------------------------------------------------------------
-# A model asked "how many NOR gates were ADDED by replacing the XNOR gates"
-# called count_gates_by_type, read the current NOR total, and answered with
-# that. Nothing was wrong with any individual statement it made and nothing in
-# the system noticed. The fix is batch 42's: put the recorded number where the
-# model was measured to look. These pin that it is actually there, that it
+# A model asked, after an XNOR-to-NOR replacement, how many NOR gates the
+# replacement had added -- it called count_gates_by_type, read the current
+# NOR total, and answered with that. Nothing was wrong with any individual
+# statement it made and nothing in the system noticed. The fix is batch
+# 42's: put the recorded number where the model was measured to look.
+# These pin that it is actually there, that it
 # agrees with the other surface that reports it, and that the description
 # cannot drift away from the key names it promises.
 

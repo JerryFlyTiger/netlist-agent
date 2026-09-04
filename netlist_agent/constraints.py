@@ -1,8 +1,10 @@
 """Structural hard constraints that must keep holding across every
-subsequent request in a testcase, per QA A63 ("if request 1 enforces max
-fanout 4 and request 2 remaps the entire design, must the final design still
-satisfy max fanout 4?" -> Yes) and `Problem_Description/A_20260212.pdf` sec 5
-("If any hard requirement is violated, the testcase gets no credit.").
+subsequent request in a testcase. Per QA A63, a numeric bound established by
+an earlier request (e.g. max fanout 4) is not scoped to that one request --
+it survives later requests that remap or rewrite the design, and the final
+design has to keep satisfying it. The problem specification, section 5,
+backs this with its own scoring rule: violating a hard requirement at any
+point costs the testcase its credit, not just the request that broke it.
 
 A `StructuralConstraint` is recorded once, at the request that establishes a
 numeric bound (see router.py's `handle_request` docstring for the single

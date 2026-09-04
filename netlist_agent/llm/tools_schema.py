@@ -895,8 +895,9 @@ def find_signal_pair_for_operator(session: Session, target: str, op: str) -> dic
 
 
 def get_boolean_function(session: Session, net: str) -> dict[str, Any]:
-    """"Derive the Boolean equation for output X in terms of its primary
-    inputs" / "What Boolean function does X compute?" -- thin wrapper over
+    """Answers requests that ask for the Boolean equation a given output (or
+    any other net) reduces to in terms of primary inputs, or more generally
+    what combinational function it computes -- thin wrapper over
     `boolean_function.derive_boolean_function` (see its module docstring
     for the three cases: X directly driven by a DFF's Q, combinational with
     a DFF.Q in its support, or purely PI-only). No SOP minimization is

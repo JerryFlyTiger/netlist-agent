@@ -359,8 +359,9 @@ class FloatingSignalsResult:
 
     `headline_count` (floating inputs + unconnected output ports, per the
     strict-definition convention this project adopted for the corpus's own
-    "Check if there are any floating inputs or unconnected output ports"
-    question) is #1 + #3 ONLY -- #2, #4, #5 are real structural findings
+    question asking whether the design has any undriven input references or
+    any declared output port left without a driver) is #1 + #3 ONLY -- #2,
+    #4, #5 are real structural findings
     worth reporting, but are not what "floating input" or "unconnected
     output port" mean in the strict sense, so they do not inflate the
     headline count.

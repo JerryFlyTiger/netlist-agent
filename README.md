@@ -84,6 +84,57 @@ A structural bound stated by one request keeps being enforced against every late
 one, so "cap fanout at 4" is not undone by a remap three requests later. Six of
 eight transforms break such a bound if nothing re-enforces it.
 
+## Results
+
+Two released testcase sets exist for this problem: an earlier one of 40 designs
+carrying 459 request lines, and a later one of 91 designs carrying 680. Both were
+replayed end to end through the real request loop — the same `stdin` → `#RESPONSE n`
+path an evaluation run takes, with only the LLM swapped for a recorder so the run
+costs no quota.
+
+| | earlier set | later set |
+|---|---|---|
+| designs / request lines | 40 / 459 | 91 / 680 |
+| crashed | 0 | 0 |
+| requests left unanswered | 0 | 0 |
+| written netlists that re-parse | all | all |
+| outputs equivalent to their input | all | all |
+| requests the rule router did not recognize | **0** | **8** (1.2%) |
+
+The later set matters more than the first, because 51 of its 91 designs had never
+been seen when the router's patterns were written, and the request wording is the
+organizers' rather than ours. Recognizing 672 of 680 lines is therefore a
+held-out number, not a number about the corpus the patterns were fitted to.
+
+The eight misses are phrasing, not missing capability. Each one has a minimal pair
+that routes: insert one adjective, name the subject differently, or use a synonym
+for the verb, and the same handler answers it. Nothing about those eight requests
+is beyond the engine.
+
+The organizers also published a Q&A after this work was largely done. Eleven of its
+entries settle semantics rather than clarify logistics — what counts as inside a
+cone, what a register-to-register path is, when a structure is an enable. Checking
+the implementation against all eleven: **eight already agreed**, **two disagreed and
+were fixed**, and one names a runtime budget for which there is no mechanism here at
+all, which is recorded rather than papered over. One of the eleven is externally
+checkable: asked which of two ways to count a register-to-register path is correct —
+one of them arrives at 107 for a particular released design, the other at 36 — the
+organizers ruled for the first. The engine arrives at 107. It is the only figure in
+this project whose expected value was published by someone else before we looked at
+it, which makes it the one number here that cannot be a case of the implementation
+grading its own homework.
+
+**What is deliberately not claimed: any accuracy rate, and any rank.** The
+organizers were asked twice for reference answers and declined both times, so no
+ground truth exists outside their own grader. Everything above says the system does
+not fall over, answers every line, and preserves function — necessary conditions,
+not sufficient ones. A number for "how often is the answer right" would have to be
+graded by the thing being graded, which is worth less than no number.
+
+The corpus figures cannot be reproduced from this repository: the corpora are the
+organizers' and are not redistributed here, and the harness that replays them lives
+in the private half. What *can* be run here is the test suite below.
+
 ## Bring your own testcases
 
 Some tests exercise the engine against real gate-level designs rather than

@@ -22,7 +22,7 @@ def test_roundtrip(path: str, tmp_path) -> None:
     assert_structurally_equal(design, design2)
 
 
-@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
+@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- the 2026 CAD Contest at ICCAD publishes them with Problem A; put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
 def test_test39_performance(tmp_path) -> None:
     path = os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase", "test39", "test39.v")
     out_path = tmp_path / "test39_out.v"

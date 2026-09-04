@@ -249,7 +249,7 @@ def test_ordering_unconnected_output_ports_undriven_numeric() -> None:
     assert res.unconnected_output_ports_undriven == [NetBit("po17", b) for b in _ORDER_BITS]
 
 
-@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
+@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- the 2026 CAD Contest at ICCAD publishes them with Problem A; put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
 def test_floating_signals_test37_corpus() -> None:
     design = parse_verilog(os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase", "test37", "test37.v"))
     graph = NetlistGraph(design)

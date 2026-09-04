@@ -21,8 +21,9 @@ from tests.helpers import corpus_available
 
 pytestmark = pytest.mark.skipif(
     not corpus_available(),
-    reason="Alpha_Testcase corpus not present -- put the released testcases "
-    "under Alpha_Testcase/testcase/testNN/ to enable this module",
+    reason="Alpha_Testcase corpus not present -- "
+    "the 2026 CAD Contest at ICCAD publishes them with Problem A; "
+    "put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this module",
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

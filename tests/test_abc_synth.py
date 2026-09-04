@@ -431,7 +431,7 @@ def test_optimize_depth_handles_q_bus_sharing_corner() -> None:
 def _load(case: str) -> Design:
     _p = os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase")
     if not os.path.isdir(_p):
-        pytest.skip("Alpha_Testcase corpus not present -- put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
+        pytest.skip("Alpha_Testcase corpus not present -- the 2026 CAD Contest at ICCAD publishes them with Problem A; put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
     return parse_verilog(os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase", case, f"{case}.v"))
 
 

@@ -39,8 +39,9 @@ from tests.helpers import corpus_available_beta
 
 pytestmark = pytest.mark.skipif(
     not corpus_available_beta(),
-    reason="Beta_Testcase corpus not present -- put the released testcases "
-    "under Beta_Testcase/testcase/testNN/ to enable this module",
+    reason="Beta_Testcase corpus not present -- "
+    "the 2026 CAD Contest at ICCAD publishes them with Problem A; "
+    "put the released testcases under Beta_Testcase/testcase/testNN/ to enable this module",
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

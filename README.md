@@ -15,15 +15,16 @@ function before accepting the result.
 This is the open part of a personal project exploring ICCAD 2026 Problem A
 (Cadence). Three things are deliberately not here:
 
-- **The rule-based router.** In the full version, a router of ~119 regex
-  patterns over 95 handlers recognizes a request and calls the engine directly —
+- **The rule-based router.** In the full version, a router of ~120 regex
+  patterns over 96 handlers recognizes a request and calls the engine directly —
   deterministic, no model in the loop, no latency. It is the part that took the
   most work and it stays private. This repository ships a stub in its place, so
   every request goes to the LLM path described below.
-- **The contest problem statement, Q&A, and the 40 released testcases.** Those
+- **The contest problem statement, the Q&A, and the released testcases.** Those
   are Cadence's documents and Cadence's benchmark data. Redistributing them is
-  not mine to do. Tests that need them skip cleanly when they are absent; see
-  *Bring your own testcases*.
+  not mine to do — the problem is Problem A of the 2026 CAD Contest at ICCAD,
+  and the organizers publish all of it themselves. Tests that need the testcases
+  skip cleanly when they are absent; see *Bring your own testcases*.
 - **The measurement experiments** built on top of both.
 
 What remains is the engine itself and the LLM path over it — which is a complete,
@@ -86,15 +87,22 @@ eight transforms break such a bound if nothing re-enforces it.
 ## Bring your own testcases
 
 Some tests exercise the engine against real gate-level designs rather than
-synthetic ones. Those designs are not in this repository. If you have the
-contest's released testcases, drop them in:
+synthetic ones. Those designs are not in this repository, because they are the
+contest organizers' benchmark data and not mine to redistribute.
+
+They are published by the organizers themselves: look for Problem A on the
+official site of the 2026 CAD Contest at ICCAD. There have been two releases,
+and each has its own directory here:
 
 ```
-Alpha_Testcase/testcase/testNN/testNN.v
+Alpha_Testcase/testcase/testNN/testNN.v     # the earlier release
+Beta_Testcase/testcase/testNN/testNN.v      # the later one
 ```
 
-and the corpus-backed tests activate. Without them they skip with a message
-saying so — they do not fail, and they do not silently disappear.
+Each case directory also holds the release's own `prompt.txt`. Drop either or
+both in and the corpus-backed tests for that release activate. Without them they
+skip with a message naming the directory they wanted — they do not fail, and
+they do not silently disappear.
 
 Any gate-level Verilog netlist using only built-in primitive gates works with the
 engine; the layout above is just what the corpus-backed tests look for.
@@ -136,14 +144,16 @@ artifact, and git history is forever. Instead:
 
 [![CI](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml)
 
-`pytest` — **593 passing, 66 skipped** on a clean checkout with no testcases
+`pytest` — **614 passing, 69 skipped** on a clean checkout with no testcases
 present. The skips are not hidden: `addopts = ["-rs"]` makes pytest print the
-reason for every one, and each says either "Alpha_Testcase corpus not present"
-or "requires the private rule-based router". Nothing fails, and nothing
-silently vanishes.
+reason for every one, and every reason names what is missing: an
+"Alpha_Testcase corpus not present" or "Beta_Testcase corpus not present" for
+the two benchmark releases, and "requires the private rule-based router" for
+the part that stays private. Nothing fails, and nothing silently vanishes.
 
-Drop the contest testcases in and the corpus-backed tests activate, taking the
-suite to just over a thousand passing.
+Drop both releases in and the corpus-backed tests activate, taking the suite to
+**1060 passing, 13 skipped** — measured, not estimated. With only the earlier
+release it is 1057 and 16.
 
 CI builds ABC from scratch at the pinned commit on a clean Ubuntu runner and
 runs the suite there — the actual proof that the dependency is reproducible on a

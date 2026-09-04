@@ -104,7 +104,7 @@ def test_limit_fanout_smoke_and_invariant(path: str, tmp_path) -> None:
 
 
 @pytest.mark.parametrize("name", LARGEST)
-@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
+@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- the 2026 CAD Contest at ICCAD publishes them with Problem A; put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
 def test_transform_sweep_performance_on_largest_files(name: str, tmp_path) -> None:
     path = os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase", name, f"{name}.v")
     design = parse_verilog(path)

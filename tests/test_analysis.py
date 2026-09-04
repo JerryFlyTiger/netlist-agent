@@ -783,7 +783,7 @@ def _endpoints_of_longest_chain(graph: NetlistGraph) -> tuple[NetBit, NetBit]:
 
 
 @pytest.mark.parametrize("case", ["test39", "test12", "test33"])
-@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
+@pytest.mark.skipif(not corpus_available(), reason="Alpha_Testcase corpus not present -- the 2026 CAD Contest at ICCAD publishes them with Problem A; put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
 def test_large_fixture_performance(case: str) -> None:
     path = os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase", case, f"{case}.v")
     design = parse_verilog(path)
@@ -824,7 +824,7 @@ def test_large_fixture_performance(case: str) -> None:
 def _real_design(case: str) -> Design:
     _p = os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase")
     if not os.path.isdir(_p):
-        pytest.skip("Alpha_Testcase corpus not present -- put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
+        pytest.skip("Alpha_Testcase corpus not present -- the 2026 CAD Contest at ICCAD publishes them with Problem A; put the released testcases under Alpha_Testcase/testcase/testNN/ to enable this test")
     return parse_verilog(os.path.join(REPO_ROOT, "Alpha_Testcase", "testcase", case, f"{case}.v"))
 
 

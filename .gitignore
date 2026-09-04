@@ -47,5 +47,14 @@ Beta_Testcase/testcase/*/*_out.v
 alpha test result/
 beta test result/
 
+# Corpus-replay artifacts under experiments/. A replay writes each case's log,
+# output netlist and path-enumeration side files next to the results, and those
+# enumerations can run to nine figures of bytes -- one hit 104 MB and GitHub
+# rejected the push. summary.json is the actual result and stays tracked; the
+# rest is regenerable by re-running the driver.
+experiments/*/*_results/*.log
+experiments/*/*_results/*_out.v
+experiments/*/*_results/*_*.txt
+
 # demo/run_demo.sh scratch working directories (copied inputs + run artifacts)
 demo/runs/

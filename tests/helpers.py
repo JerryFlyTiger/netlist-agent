@@ -68,3 +68,12 @@ def corpus_available() -> bool:
     are skipped (not failed/errored) when this is False -- see the modules
     that check it."""
     return os.path.isdir(os.path.join(_REPO_ROOT, "Alpha_Testcase", "testcase"))
+
+
+def corpus_available_beta() -> bool:
+    """Same as corpus_available(), for the second (0813 release) corpus --
+    Beta_Testcase/, also not part of this public repo. Kept as a separate
+    function rather than a parametrised corpus_available(corpus_name) so
+    every existing caller of corpus_available() (Alpha-only) is untouched by
+    this second corpus's arrival."""
+    return os.path.isdir(os.path.join(_REPO_ROOT, "Beta_Testcase", "testcase"))

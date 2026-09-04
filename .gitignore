@@ -33,6 +33,13 @@ Alpha_Testcase/*.log
 Alpha_Testcase/*_*.txt
 Alpha_Testcase/testcase/*/*_out.v
 
+# The same three, for the 0813 release. run_corpus.py --root points at this
+# corpus too, so it strands the same artifacts here on a run that dies before
+# the sweep. Same depth limits, same reason: prompt.txt lives one level down.
+Beta_Testcase/*.log
+Beta_Testcase/*_*.txt
+Beta_Testcase/testcase/*/*_out.v
+
 # Claude Code session lock (per-machine, never useful to share)
 .claude/
 

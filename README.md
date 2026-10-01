@@ -16,7 +16,7 @@ This is the open part of a personal project exploring ICCAD 2026 Problem A
 (Cadence). Three things are deliberately not here:
 
 - **The rule-based router.** In the full version, a router of ~120 regex
-  patterns over 96 handlers recognizes a request and calls the engine directly —
+  patterns over 98 handlers recognizes a request and calls the engine directly —
   deterministic, no model in the loop, no latency. It is the part that took the
   most work and it stays private. This repository ships a stub in its place, so
   every request goes to the LLM path described below.
@@ -194,7 +194,7 @@ artifact, and git history is forever. Instead:
 
 [![CI](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml)
 
-`pytest` — **614 passing, 69 skipped** on a clean checkout with no testcases
+`pytest` — **723 passing, 77 skipped** on a clean checkout with no testcases
 present. The skips are not hidden: `addopts = ["-rs"]` makes pytest print the
 reason for every one, and every reason names what is missing: an
 "Alpha_Testcase corpus not present" or "Beta_Testcase corpus not present" for
@@ -202,8 +202,7 @@ the two benchmark releases, and "requires the private rule-based router" for
 the part that stays private. Nothing fails, and nothing silently vanishes.
 
 Drop both releases in and the corpus-backed tests activate, taking the suite to
-**1060 passing, 13 skipped** — measured, not estimated. With only the earlier
-release it is 1057 and 16.
+**1175 passing, 15 skipped** — measured, not estimated.
 
 CI builds ABC from scratch at the pinned commit on a clean Ubuntu runner and
 runs the suite there — the actual proof that the dependency is reproducible on a

@@ -179,5 +179,7 @@ def test_check_asserted_only_when_dff_counterexample_carries_caveat() -> None:
     result = check_asserted_only_when(design, "done", "both req is 1 and busy is 0")
     assert result.holds is False
     assert result.assignment is not None
+    # the synthetic per-instance PI is mapped back to the design's own net name
     assert "busy" in result.assignment
+    assert not any("__dff_Q__" in k for k in result.assignment)
     assert result.caveat is not None

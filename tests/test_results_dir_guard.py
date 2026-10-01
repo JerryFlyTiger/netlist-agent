@@ -146,6 +146,14 @@ class TestCheckCaseArtifacts:
     subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
     reason="git not installed",
 )
+# Keyed on "this is the public export" (the exporter is absent), not on
+# run_corpus.py alone: in the private repo a renamed or moved runner must
+# turn this red, not quietly skip it.
+@pytest.mark.skipif(
+    not os.path.isfile(os.path.join(REPO_ROOT, "scripts", "run_corpus.py"))
+    and not os.path.isfile(os.path.join(REPO_ROOT, "scripts", "export_public.py")),
+    reason="requires scripts/run_corpus.py, the private corpus runner (not in the public export)",
+)
 def test_run_corpus_refuses_a_tracked_unignored_results_dir():
     """End-to-end: scripts/run_corpus.py wired the guard into its sweep
     loop, not just imported it. Runs one real case against a scratch

@@ -29,7 +29,7 @@ from typing import Optional
 
 from netlist_agent.abc_bridge import DEFAULT_ABC_TIMEOUT, check_implication
 from netlist_agent.ir import Design, Gate, GateType, NetBit
-from netlist_agent.netref import resolve_bit, signal_name_only
+from netlist_agent.netref import netbit_token, resolve_bit
 
 _NET = r"\w+(?:\[\d+\])?"
 
@@ -190,13 +190,15 @@ def check_asserted_only_when(
 
     assignment = parse_counterexample(result.detail)
     caveat = None
-    # `assignment` keys may be per-bit-of-a-bus tokens like "n0[7]" (ABC bit-
-    # blasts bus PIs in its own "Input pattern:" line -- confirmed by real
-    # output, see `_PI_ASSIGN_RE`), while `promoted_q_source` is keyed by
-    # whole-SIGNAL name (no bracket suffix -- promotion happens at Signal
-    # granularity, see `extract_combinational_view`'s docstring) -- strip the
-    # bit-select before checking membership, or a promoted-DFF-Q bus PI's
-    # caveat would be silently missed.
-    if any(signal_name_only(name) in promoted_q_source for name in assignment):
+    # `assignment` keys are the counterexample's PI tokens. A DFF's Q state is
+    # a synthetic per-instance PI "__dff_Q__<inst>" (see
+    # `extract_combinational_view`); `promoted_q_source` maps each such token
+    # to the original Q net-bit it drives. The caveat check stays BEFORE the
+    # mapping (the synthetic keys are what mark a DFF-state counterexample),
+    # then the keys are rewritten to the design's own net names.
+    if any(name in promoted_q_source for name in assignment):
         caveat = free_pi_caveat("counterexample")
+    assignment = {
+        (netbit_token(promoted_q_source[k]) if k in promoted_q_source else k): v for k, v in assignment.items()
+    }
     return PropertyResult(False, result.detail, assignment, caveat)

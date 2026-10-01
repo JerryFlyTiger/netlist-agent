@@ -1237,13 +1237,41 @@ def test_optimize_depth_tool_contract(tmp_path) -> None:
     depth_before = TOOL_REGISTRY["get_max_design_depth"](session)["depth"]
 
     result = TOOL_REGISTRY["do_optimize_depth"](session)
-    assert set(result) == {"changed", "depth_before", "depth_after", "note"}
+    assert set(result) == {"changed", "depth_before", "depth_after", "note", "failure"}
     assert result["depth_before"] == depth_before
     assert result["depth_after"] <= depth_before
     assert isinstance(result["changed"], bool)
     assert isinstance(result["note"], str) and result["note"]
     # session.current_design was updated in place to whatever the tool returned.
     assert TOOL_REGISTRY["get_max_design_depth"](session)["depth"] == result["depth_after"]
+
+
+@pytest.mark.parametrize(
+    "tool,kwargs",
+    [
+        ("do_optimize_depth", {}),
+        ("do_optimize_cone_depth", {"net": "n20"}),
+        ("do_optimize_gate_count", {}),
+        ("do_optimize_cone_gate_count", {"net": "n20"}),
+    ],
+)
+def test_optimize_tools_report_failure_when_abc_cannot_run(tmp_path, monkeypatch, tool, kwargs) -> None:
+    """Every optimize tool reports "could not run" in `failure`. For the
+    gate-count tools it is the only signal: their note is word-for-word the
+    same whether no candidate ran or every candidate ran and none was smaller."""
+    from netlist_agent import abc_synth
+    from netlist_agent.abc_bridge import ABCBridgeError
+
+    def _broken(*args, **kwargs):
+        raise ABCBridgeError("ABC exited with code -6: Assertion failed")
+
+    monkeypatch.setattr(abc_synth, "_run_abc_synthesis", _broken)
+    session = _new_session(tmp_path)
+    before = session.current_design
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result["changed"] is False
+    assert result["failure"] is not None and "Assertion failed" in result["failure"]
+    assert session.current_design is before
 
 
 def test_optimize_depth_tool_rejects_unknown_basis(tmp_path) -> None:
@@ -1257,7 +1285,7 @@ def test_optimize_cone_depth_tool_contract(tmp_path) -> None:
     depth_before = TOOL_REGISTRY["get_depth_of_cone"](session, net="n20")["depth"]
 
     result = TOOL_REGISTRY["do_optimize_cone_depth"](session, net="n20", basis="and_not")
-    assert set(result) == {"changed", "depth_before", "depth_after", "note"}
+    assert set(result) == {"changed", "depth_before", "depth_after", "note", "failure"}
     assert result["depth_before"] == depth_before
     assert result["depth_after"] <= depth_before
     assert TOOL_REGISTRY["get_depth_of_cone"](session, net="n20")["depth"] == result["depth_after"]

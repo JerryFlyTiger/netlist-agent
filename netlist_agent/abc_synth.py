@@ -72,16 +72,18 @@ from typing import Callable, Optional
 from netlist_agent.abc_bridge import (
     ABCBridgeError,
     DEFAULT_ABC_TIMEOUT,
+    DEFAULT_VERIFY_TIMEOUT,
+    _is_declared_bit,
     _restrict_to_fanin_cone,
     _resolve_abc,
     extract_combinational_view,
     verify_equivalence,
+    write_blif,
 )
 from netlist_agent.graph import NetlistGraph
-from netlist_agent.ir import Const, Design, Gate, GateType, NetBit, OUTPUT_PIN, Pin
+from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, OUTPUT_PIN, Pin
 from netlist_agent.netref import netbit_token, parse_net
 from netlist_agent.transform import remove_dangling_gates
-from netlist_agent.writer import write_verilog
 
 # ----------------------------------------------------------------------
 # Genlib generation (empirical finding 1 & 2 above)
@@ -264,14 +266,20 @@ _AREA_CANDIDATE_SCRIPTS: tuple[str, ...] = (_OPT_SCRIPT, "strash; dc2; resub; dc
 def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_script: str = _OPT_SCRIPT) -> _BlifNetlist:
     genlib_text = _genlib_text(basis)
     with tempfile.TemporaryDirectory(prefix="abc_synth_") as tmpdir:
-        v_path = os.path.join(tmpdir, "in.v")
+        in_blif_path = os.path.join(tmpdir, "in.blif")
         lib_path = os.path.join(tmpdir, "basis.genlib")
         blif_path = os.path.join(tmpdir, "out.blif")
-        write_verilog(view, v_path)
+        # `read_blif`, not `read_verilog`: the latter asserts and crashes ABC
+        # on any bus whose MSB reaches 128 (abc_bridge.py module docstring,
+        # finding 4) -- real on this project's own corpus. `strash` (the
+        # first stage of every `opt_script` below) accepts either input form
+        # identically, so nothing downstream (opt_script, map, write_blif,
+        # this function's own `parse_blif` read-back) needed to change.
+        write_blif(view, in_blif_path)
         with open(lib_path, "w") as f:
             f.write(genlib_text)
         script = (
-            f'read_verilog "{v_path}"; {opt_script}; '
+            f'read_blif "{in_blif_path}"; {opt_script}; '
             f'read_genlib "{lib_path}"; map; write_blif "{blif_path}"'
         )
         try:
@@ -307,8 +315,9 @@ def _token_resolver(
     work: Design, pi_tokens: frozenset[str], promoted_q_source: dict[str, NetBit], net_prefix: str
 ) -> Callable[[str], NetBit]:
     """Builds a memoized token -> NetBit resolver for `work`'s namespace: a
-    PI token resolves to the REAL net it stands for (a promoted/split DFF-Q
-    net via `promoted_q_source`, or an ordinary PI parsed by name); every
+    PI token resolves to the REAL net it stands for (a DFF's Q net via
+    `promoted_q_source`, or an ordinary PI parsed by name and required to be
+    a declared bit of an INPUT signal of `work`); every
     other token (an ABC-invented internal wire, or one of our own PO/D-tap
     output names) gets a brand-new net freshly allocated in `work` -- this is
     the "duplication" half of the splice-by-duplication approach: nothing
@@ -324,6 +333,9 @@ def _token_resolver(
             nb = promoted_q_source.get(token)
             if nb is None:
                 nb = parse_net(token)
+                sig = work.signals.get(nb.name)
+                if sig is None or sig.direction != Direction.INPUT or not _is_declared_bit(sig, nb):
+                    raise _SynthError(f"ABC PI token {token!r} maps to no primary input of the design")
         else:
             nb = work.fresh_net(net_prefix)
         cache[token] = nb
@@ -405,20 +417,11 @@ def _splice_whole_design(work: Design, blif: _BlifNetlist, promoted_q_source: di
 
     dff_gates = [g for g in work.gates if g.gate_type == GateType.DFF]
     dff_by_inst = {g.inst_name: g for g in dff_gates}
-    # A DFF's Q bit can appear as one of `blif.outputs` without being a real
-    # sink to retap: extract_combinational_view's free_pi promotion keeps a
-    # promoted (or split) Q bit's ORIGINAL bus declared as an OUTPUT port
-    # (Port direction lives at whole-signal granularity, so promoting one
-    # bit can't clear it), yet that bit's true driver -- the DFF itself --
-    # was dropped from `comb` entirely; the result is a floating, ABC-tied-
-    # to-constant-0 PO bit in the extracted view that is NOT the real net's
-    # value at all (test39-style corner: a Q bit sharing a bus with
-    # combinationally-driven sibling bits). Retapping it here would
-    # literally disconnect the real DFF's Q pin (its output pin IS this
-    # net-bit's registered driver in `work`, per `net_driver`) and replace
-    # it with ABC's meaningless constant guess -- so any such token is
-    # skipped outright; the DFF's Q value is a source, never a sink, and is
-    # correctly left completely untouched.
+    # A DFF's Q net can appear as one of `blif.outputs`: in the extracted
+    # view it is a PO (or an internal net) re-driven by the synthesized BUF
+    # from the `__dff_Q__<inst>` PI. It is a source in `work`, never a sink
+    # to retap -- retapping would disconnect the real DFF's Q pin -- so any
+    # such token is skipped.
     dff_q_bits = {g.pins["Q"] for g in dff_gates if isinstance(g.pins.get("Q"), NetBit)}
     for token in blif.outputs:
         fresh_nb = out_map[token]
@@ -433,6 +436,11 @@ def _splice_whole_design(work: Design, blif: _BlifNetlist, promoted_q_source: di
             continue
         po_nb = parse_net(token)
         if po_nb in dff_q_bits:
+            continue
+        # A PO bit nothing drives in the original design (floating) stays
+        # floating: ABC ties it to constant 0 in the view, and retapping
+        # would invent a constant driver the original never had (F6).
+        if po_nb not in work.net_driver:
             continue
         _retap_output(work, po_nb, fresh_nb)
 
@@ -458,12 +466,25 @@ class DepthOptResult:
     depth_before: int
     depth_after: int
     note: str
+    # None: optimization RAN TO COMPLETION (ABC succeeded and, if it ran,
+    # equivalence verified) but simply found nothing better -- a genuine
+    # "already optimal" outcome. Non-None: optimization did NOT complete
+    # (ABC crashed/errored/timed out, produced an unparseable BLIF, or the
+    # post-synthesis equivalence check itself raised or found a mismatch) --
+    # a short, human-readable reason, never derived from `note` (router
+    # reads this field, not `note`, to decide how to phrase failure).
+    failure: Optional[str] = None
 
 
 _CONE_OUT_TOKEN = "__depth_opt_cone_out__"
 
 
-def optimize_depth(design: Design, basis: Optional[str] = None, timeout: float = DEFAULT_ABC_TIMEOUT) -> DepthOptResult:
+def optimize_depth(
+    design: Design,
+    basis: Optional[str] = None,
+    timeout: float = DEFAULT_ABC_TIMEOUT,
+    verify_timeout: float = DEFAULT_VERIFY_TIMEOUT,
+) -> DepthOptResult:
     """Whole-design depth optimization: re-synthesize the ENTIRE
     combinational logic (every non-DFF gate) via ABC, honoring `basis` if
     given (see `BASIS_GATE_NAMES`; None allows any of the 6 two-input
@@ -486,6 +507,9 @@ def optimize_depth(design: Design, basis: Optional[str] = None, timeout: float =
     STRICTLY lower, or equal with a lower total gate count (a tie-breaker
     favoring the smaller of two equal-depth designs); otherwise reject and
     report the original as already optimal.
+
+    `verify_timeout` bounds the final `cec` equivalence check only; it is
+    separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
     depth_before = NetlistGraph(design).max_design_depth()
@@ -501,10 +525,25 @@ def optimize_depth(design: Design, basis: Optional[str] = None, timeout: float =
         remove_dangling_gates(work)
     except (ABCBridgeError, _SynthError) as exc:
         return DepthOptResult(
-            design, False, depth_before, depth_before, f"ABC could not improve depth ({exc}); kept the original design."
+            design,
+            False,
+            depth_before,
+            depth_before,
+            f"ABC could not improve depth ({exc}); kept the original design.",
+            failure=str(exc),
         )
 
-    eq = verify_equivalence(design, work, timeout=timeout)
+    try:
+        eq = verify_equivalence(design, work, timeout=verify_timeout)
+    except ABCBridgeError as exc:
+        return DepthOptResult(
+            design,
+            False,
+            depth_before,
+            depth_before,
+            f"ABC could not improve depth (equivalence check failed: {exc}); kept the original design.",
+            failure=f"equivalence check failed: {exc}",
+        )
     if not eq.equivalent:
         return DepthOptResult(
             design,
@@ -513,6 +552,7 @@ def optimize_depth(design: Design, basis: Optional[str] = None, timeout: float =
             depth_before,
             f"Equivalence check failed after resynthesis (this indicates a bug, not a normal outcome) -- "
             f"kept the original design untouched. Detail: {eq.detail}",
+            failure=f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}",
         )
 
     depth_after = NetlistGraph(work).max_design_depth()
@@ -528,7 +568,11 @@ def optimize_depth(design: Design, basis: Optional[str] = None, timeout: float =
 
 
 def optimize_cone_depth(
-    design: Design, target: NetBit, basis: Optional[str] = None, timeout: float = DEFAULT_ABC_TIMEOUT
+    design: Design,
+    target: NetBit,
+    basis: Optional[str] = None,
+    timeout: float = DEFAULT_ABC_TIMEOUT,
+    verify_timeout: float = DEFAULT_VERIFY_TIMEOUT,
 ) -> DepthOptResult:
     """Cone-restricted depth optimization: re-synthesize only `target`'s
     fanin cone via ABC, honoring `basis` if given, leaving every other gate
@@ -549,6 +593,9 @@ def optimize_cone_depth(
     rule as `optimize_depth` (see its docstring) -- restricted to a single
     net-bit's cone depth (`NetlistGraph.depth_to_sink`) rather than the whole
     design's.
+
+    `verify_timeout` bounds the final `cec` equivalence check only; it is
+    separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
     depth_before = NetlistGraph(design).depth_to_sink(target)
@@ -558,11 +605,9 @@ def optimize_cone_depth(
     work = copy.deepcopy(design)
     try:
         promoted_q_source: dict[str, NetBit] = {}
-        # `target` itself is guaranteed to keep its original name/identity in
-        # `comb`: extract_combinational_view only ever promotes/splits a net
-        # that is some DFF's Q pin, and depth_before > 0 (checked above)
-        # already implies target's own driver is a real combinational gate,
-        # not a DFF -- so target is never a candidate for that promotion.
+        # Every original net (Q nets included) keeps its name in `comb`:
+        # a Q net is just re-driven by a BUF from its `__dff_Q__<inst>` PI,
+        # so `target` needs no mapping.
         comb = extract_combinational_view(work, "free_pi", promoted_q_source)
         cone = _restrict_to_fanin_cone(comb, target, _CONE_OUT_TOKEN)
         blif = _run_abc_synthesis(cone, basis, timeout)
@@ -570,10 +615,25 @@ def optimize_cone_depth(
         remove_dangling_gates(work)
     except (ABCBridgeError, _SynthError) as exc:
         return DepthOptResult(
-            design, False, depth_before, depth_before, f"ABC could not improve depth ({exc}); kept the original design."
+            design,
+            False,
+            depth_before,
+            depth_before,
+            f"ABC could not improve depth ({exc}); kept the original design.",
+            failure=str(exc),
         )
 
-    eq = verify_equivalence(design, work, timeout=timeout)
+    try:
+        eq = verify_equivalence(design, work, timeout=verify_timeout)
+    except ABCBridgeError as exc:
+        return DepthOptResult(
+            design,
+            False,
+            depth_before,
+            depth_before,
+            f"ABC could not improve depth (equivalence check failed: {exc}); kept the original design.",
+            failure=f"equivalence check failed: {exc}",
+        )
     if not eq.equivalent:
         return DepthOptResult(
             design,
@@ -582,6 +642,7 @@ def optimize_cone_depth(
             depth_before,
             f"Equivalence check failed after resynthesis (this indicates a bug, not a normal outcome) -- "
             f"kept the original design untouched. Detail: {eq.detail}",
+            failure=f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}",
         )
 
     depth_after = NetlistGraph(work).depth_to_sink(target)
@@ -641,10 +702,22 @@ class AreaOptResult:
     depth_before: int
     depth_after: int
     note: str
+    # Same contract as `DepthOptResult.failure`, adapted for multi-candidate
+    # search: None as long as AT LEAST ONE candidate script ran to
+    # completion (ABC succeeded and verified equivalent), even if none of
+    # them beat the original gate count or honored `max_depth` -- that is
+    # still a genuine "nothing better found" outcome, not a failure. Only
+    # non-None when EVERY candidate failed to complete (the first failure's
+    # reason is kept).
+    failure: Optional[str] = None
 
 
 def optimize_gate_count(
-    design: Design, basis: Optional[str] = None, max_depth: Optional[int] = None, timeout: float = DEFAULT_ABC_TIMEOUT
+    design: Design,
+    basis: Optional[str] = None,
+    max_depth: Optional[int] = None,
+    timeout: float = DEFAULT_ABC_TIMEOUT,
+    verify_timeout: float = DEFAULT_VERIFY_TIMEOUT,
 ) -> AreaOptResult:
     """Whole-design gate-count optimization: try every script in
     `_AREA_CANDIDATE_SCRIPTS` against the entire combinational logic (same
@@ -655,6 +728,9 @@ def optimize_gate_count(
     splicing, not a target to approach). Never mutates `design` in place;
     see this module's optimize_depth for the same never-mutates/always-
     verify discipline, shared verbatim here.
+
+    `verify_timeout` bounds the final `cec` equivalence check only; it is
+    separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
     gates_before = len(design.gates)
@@ -667,6 +743,8 @@ def optimize_gate_count(
     best_work: Optional[Design] = None
     best_gates: Optional[int] = None
     best_depth: Optional[int] = None
+    any_completed = False
+    first_failure: Optional[str] = None
     for candidate_script in _AREA_CANDIDATE_SCRIPTS:
         work = copy.deepcopy(design)
         try:
@@ -675,11 +753,24 @@ def optimize_gate_count(
             blif = _run_abc_synthesis(comb, basis, timeout, candidate_script)
             _splice_whole_design(work, blif, promoted_q_source)
             remove_dangling_gates(work)
-        except (ABCBridgeError, _SynthError):
+        except (ABCBridgeError, _SynthError) as exc:
+            if first_failure is None:
+                first_failure = str(exc)
             continue
-        eq = verify_equivalence(design, work, timeout=timeout)
+        try:
+            eq = verify_equivalence(design, work, timeout=verify_timeout)
+        except ABCBridgeError as exc:
+            if first_failure is None:
+                first_failure = f"equivalence check failed: {exc}"
+            continue
         if not eq.equivalent:
+            if first_failure is None:
+                first_failure = f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}"
             continue
+        # This candidate ran to completion (ABC succeeded, equivalence
+        # verified) -- it counts as a completed optimization attempt even if
+        # it goes on to lose to `max_depth`/gate-count below.
+        any_completed = True
         gates_after = len(work.gates)
         depth_after = NetlistGraph(work).max_design_depth()
         if max_depth is not None and depth_after > max_depth:
@@ -693,7 +784,8 @@ def optimize_gate_count(
         note = "No candidate restructuring reduced the gate count below the original"
         note += " while honoring the maximum-depth constraint" if max_depth is not None else ""
         note += "; design left unchanged."
-        return AreaOptResult(design, False, gates_before, gates_before, depth_before, depth_before, note)
+        failure = None if any_completed else first_failure
+        return AreaOptResult(design, False, gates_before, gates_before, depth_before, depth_before, note, failure=failure)
     return AreaOptResult(
         best_work, True, gates_before, best_gates, depth_before, best_depth, f"Reduced gate count from {gates_before} to {best_gates}."
     )
@@ -705,6 +797,7 @@ def optimize_cone_gate_count(
     basis: Optional[str] = None,
     max_depth: Optional[int] = None,
     timeout: float = DEFAULT_ABC_TIMEOUT,
+    verify_timeout: float = DEFAULT_VERIFY_TIMEOUT,
 ) -> AreaOptResult:
     """Cone-restricted gate-count optimization: the `optimize_cone_depth`
     counterpart of `optimize_gate_count` above -- restricted to `target`'s
@@ -713,6 +806,9 @@ def optimize_cone_gate_count(
     given) is checked against `NetlistGraph.depth_to_sink(target)` after
     splicing, not the whole design's depth. Every other gate in `design` is
     left completely untouched, same as `optimize_cone_depth`.
+
+    `verify_timeout` bounds the final `cec` equivalence check only; it is
+    separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
     gates_before = len(design.gates)
@@ -731,6 +827,8 @@ def optimize_cone_gate_count(
     best_work: Optional[Design] = None
     best_gates: Optional[int] = None
     best_depth: Optional[int] = None
+    any_completed = False
+    first_failure: Optional[str] = None
     for candidate_script in _AREA_CANDIDATE_SCRIPTS:
         work = copy.deepcopy(design)
         try:
@@ -740,11 +838,21 @@ def optimize_cone_gate_count(
             blif = _run_abc_synthesis(cone, basis, timeout, candidate_script)
             _splice_cone(work, target, blif, _CONE_OUT_TOKEN, promoted_q_source)
             remove_dangling_gates(work)
-        except (ABCBridgeError, _SynthError):
+        except (ABCBridgeError, _SynthError) as exc:
+            if first_failure is None:
+                first_failure = str(exc)
             continue
-        eq = verify_equivalence(design, work, timeout=timeout)
+        try:
+            eq = verify_equivalence(design, work, timeout=verify_timeout)
+        except ABCBridgeError as exc:
+            if first_failure is None:
+                first_failure = f"equivalence check failed: {exc}"
+            continue
         if not eq.equivalent:
+            if first_failure is None:
+                first_failure = f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}"
             continue
+        any_completed = True
         gates_after = len(work.gates)
         depth_after = NetlistGraph(work).depth_to_sink(target)
         if max_depth is not None and depth_after > max_depth:
@@ -758,7 +866,8 @@ def optimize_cone_gate_count(
         note = "No candidate restructuring reduced the gate count below the original"
         note += " while honoring the maximum-depth constraint" if max_depth is not None else ""
         note += "; design left unchanged."
-        return AreaOptResult(design, False, gates_before, gates_before, depth_before, depth_before, note)
+        failure = None if any_completed else first_failure
+        return AreaOptResult(design, False, gates_before, gates_before, depth_before, depth_before, note, failure=failure)
     return AreaOptResult(
         best_work, True, gates_before, best_gates, depth_before, best_depth, f"Reduced gate count from {gates_before} to {best_gates}."
     )

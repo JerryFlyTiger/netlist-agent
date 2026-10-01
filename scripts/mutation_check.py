@@ -151,7 +151,32 @@ def _invalidate_bytecode(path: str) -> None:
             pass
 
 
-_FAILED_LINE_RE = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
+# A bare `\S+` truncates at the first whitespace -- but a parametrized test
+# id's `[...]` suffix can itself contain whitespace (e.g.
+# `test_f3[What is the total gate count?]`), and pytest's own reason text
+# comes after that suffix, separated by " - " (e.g. "... - AssertionError").
+# Measured directly (2026-09-28): with a bare `\S+`, that id truncates to
+# "...test_f3[What", so an `expect_red` entry written as the full question
+# text can never match and every such knife reports MISFIRED regardless of
+# whether it actually hit its target.
+#
+# The bracketed alternative is tried first: `\S+` (no internal whitespace,
+# matching the node id up to the bracket), a literal `[`, then a LAZY `.*?`
+# (which does cross whitespace) up to the first `]` that is followed by
+# " - " or by end of line -- i.e. the first `]` where pytest's own
+# "id - reason" layout can resume. Lazy, not greedy: the reason text often
+# ends in its own `]` (e.g. `AssertionError: bad idx[5]`), and a greedy
+# `.*\]` would run on to that last `]` and swallow the whole reason into
+# the id (reproduced with pytest 9.1.1 when the summary line is not
+# truncated, e.g. under a wide COLUMNS). The lazy form still keeps ids that
+# contain their own " - " (`test[a - b]`) or nested brackets
+# (`test[n5[2]]`) whole, because an inner `]` there is followed by neither.
+# What it gets wrong: an id containing the literal sequence "] - " is cut
+# at that point -- no id in this repo has one. The plain `\S+` alternative is
+# the fallback for ids with no `[` at all (unparametrized tests, bare
+# collection-error "ERROR path" lines, and setup/teardown
+# "ERROR path::test - reason" lines).
+_FAILED_LINE_RE = re.compile(r"^(?:FAILED|ERROR) (\S+\[.*?\](?= - |$)|\S+)", re.MULTILINE)
 _FAILURES_HEADER_RE = re.compile(r"^_+ (\S+) _+$", re.MULTILINE)
 
 

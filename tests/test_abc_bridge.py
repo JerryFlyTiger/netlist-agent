@@ -8,6 +8,8 @@ tests/test_abc_bridge_real_files.py for integration coverage against the real
 
 from __future__ import annotations
 
+import copy
+
 from netlist_agent.abc_bridge import (
     are_equivalent,
     check_symmetry,
@@ -266,8 +268,15 @@ def test_extract_combinational_view_dff_boundary(tmp_path) -> None:
     free_pi = extract_combinational_view(design, "free_pi")
     assert all(g.gate_type != GateType.DFF for g in free_pi.gates)
     assert {"g0", "g2"} <= {g.inst_name for g in free_pi.gates}
-    q_port = next(p for p in free_pi.ports if p.name == "n_q")
-    assert q_port.direction == Direction.INPUT
+    # The Q net keeps its name and is re-driven by a BUF from the
+    # per-instance PI `__dff_Q__g1`; it is not a port itself.
+    assert not any(p.name == "n_q" for p in free_pi.ports)
+    q_pi = next(p for p in free_pi.ports if p.name == "__dff_Q__g1")
+    assert q_pi.direction == Direction.INPUT
+    assert free_pi.signals["__dff_Q__g1"].direction == Direction.INPUT
+    q_bufs = [g for g in free_pi.gates if g.gate_type == GateType.BUF and g.pins.get("O") == NetBit("n_q", None)]
+    assert len(q_bufs) == 1
+    assert q_bufs[0].pins["I0"] == NetBit("__dff_Q__g1", None)
     # The D-pin boundary is exposed via a canonical per-instance tap, keyed
     # on the DFF instance name (stable across transforms), not the net name.
     assert not any(p.name == "n_next" for p in free_pi.ports)
@@ -293,10 +302,9 @@ def test_extract_combinational_view_dff_boundary(tmp_path) -> None:
 
 
 def test_extract_combinational_view_q_wired_straight_to_existing_po(tmp_path) -> None:
-    """Edge case (a) of the promotion-order rule: a DFF's Q net literally IS
-    an already-declared primary output. free_pi promotion must still win
-    (INPUT), overwriting the pre-existing OUTPUT port entry rather than
-    leaving two conflicting Port entries for the same name."""
+    """A DFF's Q net literally IS an already-declared primary output. It
+    stays an OUTPUT (with real truth: driven by a BUF from the
+    `__dff_Q__<inst>` PI); it is not turned into an INPUT."""
     src = """
     module top(clk, rst, d_in, q_out);
       input clk, rst, d_in;
@@ -310,8 +318,15 @@ def test_extract_combinational_view_q_wired_straight_to_existing_po(tmp_path) ->
     free_pi = extract_combinational_view(design, "free_pi")
     ports_named_q_out = [p for p in free_pi.ports if p.name == "q_out"]
     assert len(ports_named_q_out) == 1
-    assert ports_named_q_out[0].direction == Direction.INPUT
-    assert free_pi.signals["q_out"].direction == Direction.INPUT
+    assert ports_named_q_out[0].direction == Direction.OUTPUT
+    assert free_pi.signals["q_out"].direction == Direction.OUTPUT
+    drv = free_pi.net_driver[NetBit("q_out", None)]
+    assert drv.gate_type == GateType.BUF
+    assert drv.pins["I0"] == NetBit("__dff_Q__g0", None)
+    assert next(p for p in free_pi.ports if p.name == "__dff_Q__g0").direction == Direction.INPUT
+
+    result = verify_equivalence(design, copy.deepcopy(design))
+    assert result.equivalent, result.detail
 
 
 def test_extract_combinational_view_direct_dff_to_dff_chain(tmp_path) -> None:
@@ -331,18 +346,21 @@ def test_extract_combinational_view_direct_dff_to_dff_chain(tmp_path) -> None:
     design = parse_verilog(path)
 
     free_pi = extract_combinational_view(design, "free_pi")
-    # Both DFFs dropped; the only gates are the two canonical D-pin taps.
+    # Both DFFs dropped; the only gates are the two canonical D-pin taps and
+    # the two Q BUFs re-driving q1/q2 from their per-instance PIs.
     assert all(g.gate_type == GateType.BUF for g in free_pi.gates)
     taps = {g.pins["O"]: g.pins["I0"] for g in free_pi.gates}
     assert taps == {
         NetBit("__dff_D__g0", None): NetBit("q2", None),
         NetBit("__dff_D__g1", None): NetBit("q1", None),
+        NetBit("q1", None): NetBit("__dff_Q__g0", None),
+        NetBit("q2", None): NetBit("__dff_Q__g1", None),
     }
     for name in ("q1", "q2"):
         matching_ports = [p for p in free_pi.ports if p.name == name]
         assert len(matching_ports) == 1
-        assert matching_ports[0].direction == Direction.INPUT
-        assert free_pi.signals[name].direction == Direction.INPUT
+        assert matching_ports[0].direction == Direction.OUTPUT
+        assert free_pi.signals[name].direction == Direction.OUTPUT
 
 
 def test_extract_combinational_view_dff_q_shares_bus_with_combinational_bit(tmp_path) -> None:
@@ -350,8 +368,8 @@ def test_extract_combinational_view_dff_q_shares_bus_with_combinational_bit(tmp_
     a bit-select of a wider bus whose OTHER bits are independently driven by
     ordinary combinational gates. Whole-Signal Direction promotion can't turn
     the whole bus into a primary input (bit 0 would become simultaneously a
-    PI bit and gate-driven) -- the fix splits just the DFF's own bit off into
-    its own fresh single-bit input, leaving the rest of the bus untouched."""
+    PI bit and gate-driven) -- the fix leaves the bus alone and re-drives the
+    DFF's bit through a BUF from its own per-instance PI."""
     src = """
     module top(clk, rst, a, b, y_gate, y_dff);
       input clk, rst, a, b;
@@ -369,8 +387,8 @@ def test_extract_combinational_view_dff_q_shares_bus_with_combinational_bit(tmp_
     free_pi = extract_combinational_view(design, "free_pi")
     assert all(g.gate_type != GateType.DFF for g in free_pi.gates)
 
-    # The bus as a whole is never promoted: bit 0 is still ordinarily
-    # gate-driven, so Signal-granularity promotion of "shared" would be invalid.
+    # The bus is never promoted or split: it stays INTERNAL and no consumer
+    # is rewired.
     assert free_pi.signals["shared"].direction == Direction.INTERNAL
     assert not any(p.name == "shared" for p in free_pi.ports)
 
@@ -380,15 +398,14 @@ def test_extract_combinational_view_dff_q_shares_bus_with_combinational_bit(tmp_
     g2 = next(g for g in free_pi.gates if g.inst_name == "g2")
     assert g2.pins["I0"] == NetBit("shared", 0)
 
-    # bit 1 (the DFF's Q) was split into its own fresh input; nothing in the
-    # extracted design references NetBit("shared", 1) anymore.
-    assert not any(v == NetBit("shared", 1) for g in free_pi.gates for v in g.pins.values())
+    # g3 still reads shared[1]; that bit is now driven by a BUF from the
+    # per-instance PI.
     g3 = next(g for g in free_pi.gates if g.inst_name == "g3")
-    split_net = g3.pins["I0"]
-    assert isinstance(split_net, NetBit) and split_net.bit is None and split_net != NetBit("shared", 1)
-    split_port = next(p for p in free_pi.ports if p.name == split_net.name)
-    assert split_port.direction == Direction.INPUT
-    assert free_pi.signals[split_net.name].direction == Direction.INPUT
+    assert g3.pins["I0"] == NetBit("shared", 1)
+    drv = free_pi.net_driver[NetBit("shared", 1)]
+    assert drv.gate_type == GateType.BUF
+    assert drv.pins["I0"] == NetBit("__dff_Q__g1", None)
+    assert free_pi.signals["__dff_Q__g1"].direction == Direction.INPUT
 
     # Equivalence checking across this exact boundary shape must still work
     # end to end (this is what actually matters -- the split is plumbing).
@@ -425,3 +442,30 @@ def test_verify_equivalence_survives_d_pin_rewire(tmp_path) -> None:
 
     result = verify_equivalence(original, transformed)
     assert result.equivalent, result.detail
+
+
+# ----------------------------------------------------------------------
+# `_run_abc`: nonzero exit code (an ABC crash, e.g. an internal assert) must
+# raise ABCBridgeError with the exit code and a stderr excerpt, rather than
+# silently returning empty/partial stdout (batch 6b, 2026-09-30).
+# ----------------------------------------------------------------------
+
+
+def test_run_abc_nonzero_exit_raises_with_stderr(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    import pytest
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_abc
+
+    class _FakeResult:
+        returncode = -6
+        stdout = ""
+        stderr = "abc: some_file.c:123: some_func: Assertion `x == y' failed.\nAborted"
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", lambda *a, **k: _FakeResult())
+
+    with pytest.raises(ABCBridgeError, match="Assertion"):
+        _run_abc("some script", timeout=5.0)

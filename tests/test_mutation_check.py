@@ -175,6 +175,50 @@ def test_failed_line_regex_finds_all_failures_not_just_first():
     ]
 
 
+def test_failed_line_regex_keeps_the_full_parametrized_id_with_spaces():
+    """A parametrized test id's `[...]` suffix can contain whitespace (real
+    example: `test_f3_regex_robustness_dispatches_to_expected_handler[What
+    is the total gate count?]`). A bare `\\S+` truncates at the first space
+    inside the brackets, which silently breaks every `expect_red` entry
+    written as the question text: `want in failed` (see `main()`) can never
+    find a substring match against a truncated id, so a knife that DID hit
+    its intended test still reports MISFIRED.
+
+    Also covers: an id whose bracketed param itself contains " - " (the same
+    separator pytest uses before the reason text) must not be cut short
+    there either, and a plain unparametrized id (no brackets at all) must
+    still work via the fallback branch.
+
+    Also covers the opposite failure: a reason text that itself ends in `]`
+    (`bad idx[5]`) must NOT be swallowed into the id, and a nested-bracket
+    param (`n5[2]`) must still be captured whole.
+
+    Mutations: narrow `_FAILED_LINE_RE` back to `^(?:FAILED|ERROR) (\\S+)`
+    (the parametrized and " - "-in-brackets cases truncate), or make the
+    bracket body greedy `.*\\]` (the `bad idx[5]` reason is swallowed). This
+    test must go red under either.
+    """
+    output = (
+        "FAILED tests/test_router.py::test_f3_regex_robustness_dispatches_to_expected_handler"
+        "[What is the total gate count?] - AssertionError: assert 'X' == 'Y'\n"
+        "FAILED tests/test_x.py::test_param[a - b] - AssertionError\n"
+        "FAILED tests/test_y.py::test_msg[p] - AssertionError: bad idx[5]\n"
+        "FAILED tests/test_z.py::test_nested[n5[2]] - AssertionError: got n5[3]\n"
+        "FAILED tests/test_a.py::test_one - AssertionError\n"
+        "ERROR tests/test_c.py::test_three - ImportError\n"
+    )
+    matches = mutation_check._FAILED_LINE_RE.findall(output)
+    assert matches == [
+        "tests/test_router.py::test_f3_regex_robustness_dispatches_to_expected_handler"
+        "[What is the total gate count?]",
+        "tests/test_x.py::test_param[a - b]",
+        "tests/test_y.py::test_msg[p]",
+        "tests/test_z.py::test_nested[n5[2]]",
+        "tests/test_a.py::test_one",
+        "tests/test_c.py::test_three",
+    ]
+
+
 def test_failures_header_regex_finds_all_headers():
     """Same as above, for the bare-header fallback pattern."""
     output = "____ test_one ____\nsome text\n____ test_two ____\nmore text\n"

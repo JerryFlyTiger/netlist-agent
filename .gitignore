@@ -58,3 +58,7 @@ experiments/*/*_results/*_*.txt
 
 # demo/run_demo.sh scratch working directories (copied inputs + run artifacts)
 demo/runs/
+
+# Local symlink to final_release_100/: the final testcase prompts say
+# "testcase/testNNN/", and _h_load joins that path literally.
+/testcase

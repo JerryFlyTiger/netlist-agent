@@ -1485,6 +1485,9 @@ def do_optimize_depth(session: Session, basis: Optional[str] = None) -> dict[str
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
+        # None = the optimization ran and found nothing better; a string = it
+        # could not run (ABC crash/timeout, verification error).
+        "failure": result.failure,
     }
 
 
@@ -1499,6 +1502,9 @@ def do_optimize_cone_depth(session: Session, net: str, basis: Optional[str] = No
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
+        # None = the optimization ran and found nothing better; a string = it
+        # could not run (ABC crash/timeout, verification error).
+        "failure": result.failure,
     }
 
 
@@ -1521,6 +1527,10 @@ def do_optimize_gate_count(session: Session, basis: Optional[str] = None, max_de
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
+        # None = the optimization ran and found nothing better; a string = it
+        # could not run (ABC crash/timeout, verification error). The note is
+        # word-for-word the same in both cases here, so only this tells them apart.
+        "failure": result.failure,
     }
 
 
@@ -1542,6 +1552,10 @@ def do_optimize_cone_gate_count(
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
+        # None = the optimization ran and found nothing better; a string = it
+        # could not run (ABC crash/timeout, verification error). The note is
+        # word-for-word the same in both cases here, so only this tells them apart.
+        "failure": result.failure,
     }
 
 

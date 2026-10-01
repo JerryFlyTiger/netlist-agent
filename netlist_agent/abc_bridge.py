@@ -15,8 +15,10 @@ binary before this module was written -- do not re-derive, just rely on it):
      ABC by this module may ever contain a `dff` instance -- DFF boundaries
      are always turned into ports/ties first (see `extract_combinational_view`).
 
-  2. Equivalence checking is `cec fileA.v fileB.v` (two file paths, no prior
-     `read_verilog` needed). Confirmed verbatim output patterns:
+  2. Equivalence checking is `cec fileA fileB` (two file paths, no prior
+     `read_*` needed; `_run_cec` passes two `.blif` paths -- see finding 4 --
+     but `cec` itself is format-agnostic, confirmed against a `.v`/`.blif`
+     mix too). Confirmed verbatim output patterns:
        - equivalent:     "Networks are equivalent after structural hashing.  Time = ..."
        - not equivalent: "Networks are NOT EQUIVALENT.  Time = ..." followed by
                           a counterexample block (INPUT:/OUTPUT: line, a
@@ -37,6 +39,24 @@ binary before this module was written -- do not re-derive, just rely on it):
   3. Undriven/floating internal wires produce a harmless stdout warning
      ("Warning: Constant-0 drivers added to N non-driven nets...") -- not an
      error, never treated as one here.
+
+  4. `read_verilog` asserts and crashes ABC (SIGABRT, "Assertion failed:
+     nMsb < 128 ... Ver_ParseInsertsSuffix") on any bus whose declared MSB
+     bit index reaches 128 -- real in this project's own corpus (final's
+     widest buses run 192-4096 bits). `cec`/synthesis therefore never hand
+     ABC Verilog: both go through `write_blif` (below) and `read_blif`/
+     `cec a.blif b.blif` instead, which has no such limit. Confirmed
+     empirically (scratchpad, 2026-09-30) that the PI/PO name tokens ABC
+     itself writes back out are byte-for-byte identical whether the input
+     was Verilog-then-strashed or BLIF-then-strashed (`n5[199]` etc., same
+     "name"/"name[bit]" shape `netbit_token`/`parse_net` already expect) --
+     so `abc_synth.py`'s BLIF-token-based read-back (`parse_blif`,
+     `_token_resolver`) needed no changes for this switch. Also confirmed:
+     an undriven net referenced by `read_blif` (never a `.names`/`.gate`
+     output column) gets the identical harmless constant-0-tie treatment as
+     an undriven net under `read_verilog` (point 3) -- so `write_blif` never
+     needs to emit anything explicit for a floating net, only omit it from
+     every output column, exactly as `write_verilog` already implicitly did.
 """
 
 from __future__ import annotations
@@ -55,11 +75,12 @@ from netlist_agent.ir import (
     Gate,
     GateType,
     NetBit,
+    ONE_INPUT_GATES,
+    OUTPUT_PIN,
     Pin,
     Port,
     Signal,
 )
-from netlist_agent.writer import write_verilog
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIND_ABC_SCRIPT = os.path.join(REPO_ROOT, "scripts", "find_abc.sh")
@@ -68,6 +89,11 @@ FIND_ABC_SCRIPT = os.path.join(REPO_ROOT, "scripts", "find_abc.sh")
 # raises ABCBridgeError (via subprocess.TimeoutExpired) rather than hanging
 # silently. Callers of the public functions below may override per call.
 DEFAULT_ABC_TIMEOUT = 120.0
+# Separate, larger budget for the post-synthesis equivalence check (`cec`).
+# Measured `cec` on final_release_100/test062: 49.5 s (this Q-boundary
+# model, 2026-09-30); 121 s (run_corpus, idle) and 257 s (CPU contended) under
+# earlier models. n=3, different code and different CPU load each time.
+DEFAULT_VERIFY_TIMEOUT = 600.0
 _RESOLVE_TIMEOUT = 30.0
 
 DffQMode = Literal["free_pi", "const_zero"]
@@ -109,6 +135,15 @@ def _run_abc(script: str, timeout: float) -> str:
         result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise ABCBridgeError(f"ABC invocation timed out after {timeout}s running {script!r}") from exc
+    if result.returncode != 0:
+        # A nonzero exit is ABC crashing (e.g. an internal assert/SIGABRT),
+        # distinct from the "always 0" guarantee documented above for the
+        # graceful equivalent/not-equivalent/failure-pattern outcomes of
+        # `cec` -- this module's only caller of `_run_abc` (`_run_cec`) never
+        # relied on reading `stdout` when the process crashed, so raising
+        # here instead of returning is safe.
+        stderr_tail = result.stderr.strip()[-500:]
+        raise ABCBridgeError(f"ABC exited with code {result.returncode} running {script!r}: {stderr_tail}")
     return result.stdout
 
 
@@ -125,12 +160,172 @@ def _parse_cec_output(stdout: str) -> "EquivResult":
     )
 
 
+# Single-output-column SOP covers for the fixed primitive gate set, ALWAYS in
+# onset form (every listed row's output value column is "1") -- deliberately
+# avoids the offset-listing BLIF convention (rows of "0", everything else
+# implicitly 1) entirely, so there is exactly one row-emission rule for every
+# gate type instead of two, and no reader-dependent "what's the default for
+# an unlisted combination" question to get wrong. Verified byte-for-byte
+# equivalent (via ABC `cec`) against ABC's own `read_verilog` semantics for
+# every one of these primitives, including the ones (NAND/NOR/XNOR) whose
+# naive rendering would be an offset cover (scratchpad, 2026-09-30).
+_TWO_INPUT_BLIF_COVERS: dict[GateType, tuple[str, ...]] = {
+    GateType.AND: ("11 1",),
+    GateType.OR: ("1- 1", "-1 1"),
+    GateType.NAND: ("0- 1", "-0 1"),
+    GateType.NOR: ("00 1",),
+    GateType.XOR: ("10 1", "01 1"),
+    GateType.XNOR: ("11 1", "00 1"),
+}
+_ONE_INPUT_BLIF_COVERS: dict[GateType, tuple[str, ...]] = {
+    GateType.NOT: ("0 1",),
+    GateType.BUF: ("1 1",),
+}
+
+
+def _blif_token(value: Pin, const_names: dict[Const, str], design: Design, unconnected_counter: list[int]) -> str:
+    if value is None:
+        # Mirrors writer.py's `_render_pin(None) -> ""` (an unconnected
+        # positional pin becomes an empty Verilog port-connection slot, i.e.
+        # ABC sees a brand-new floating net there): allocate a fresh,
+        # otherwise-unreferenced BLIF token so it is likewise never driven --
+        # same constant-0-tie outcome as any other undriven net (module
+        # docstring, finding 4). Not known to be exercised by any real gate
+        # in this codebase's corpus today; handled defensively for parity
+        # with write_verilog rather than assumed unreachable.
+        unconnected_counter[0] += 1
+        name = f"__blif_unconnected_{unconnected_counter[0]}__"
+        while name in design.signals:
+            unconnected_counter[0] += 1
+            name = f"__blif_unconnected_{unconnected_counter[0]}__"
+        return name
+    if isinstance(value, Const):
+        if value not in const_names:
+            base = "c0" if value == Const.ZERO else "c1"
+            name = base
+            suffix = 0
+            while name in design.signals or name in const_names.values():
+                suffix += 1
+                name = f"{base}_{suffix}"
+            const_names[value] = name
+        return const_names[value]
+    return value.name if value.bit is None else f"{value.name}[{value.bit}]"
+
+
+def write_blif(design: Design, path: str) -> None:
+    """Write `design` (must already be free of `dff` instances, e.g. via
+    `extract_combinational_view` -- raises `ABCBridgeError` if one is found)
+    as a BLIF netlist for ABC's `read_blif`, sidestepping `read_verilog`'s
+    >=128-bit-bus-index assertion crash entirely (module docstring, finding
+    4). PI/PO port token spelling ("name" / "name[bit]") is exactly what
+    `write_verilog` + ABC's own `read_verilog` already produced -- confirmed
+    empirically identical round-tripped back out of ABC (see finding 4) --
+    so nothing downstream of this module's callers (abc_synth.py's
+    `parse_blif`/`_token_resolver`) needed to change.
+
+    Every primitive gate becomes one `.names` line (see `_TWO_INPUT_BLIF_COVERS`/
+    `_ONE_INPUT_BLIF_COVERS`); a `Const.ZERO`/`Const.ONE` pin value is routed
+    through one shared, lazily-declared constant net per value (`.names c0`
+    with no cover row = constant 0, `.names c1` / `1` = constant 1 --
+    confirmed against ABC, scratchpad 2026-09-30), collision-checked against
+    `design`'s own signal names since a real net could plausibly already be
+    named "c0". A floating net (referenced by a gate pin or a primary output,
+    but driven by nothing -- neither a PI nor any gate's `O`) gets an
+    explicit `.names <net>` (no-cover = constant 0) tie emitted for it below,
+    rather than relying on ABC's own identical implicit default (confirmed
+    empirically, finding 4) -- explicit here is not required for correctness
+    against the ABC version this was tested against, but does not depend on
+    that default continuing to hold in a future ABC version either.
+
+    No line-wrapping (`\\`-continuation) is used for long `.inputs`/`.outputs`
+    lines: confirmed ABC's `read_blif` parses a single unwrapped line of
+    20,000 whitespace-separated tokens (~590KB) without issue (scratchpad,
+    2026-09-30) -- comfortably past this project's largest corpus design
+    (test051, ~213k gates) -- so the continuation machinery the module
+    docstring speculated might be needed is not implemented.
+    """
+    const_names: dict[Const, str] = {}
+    unconnected_counter = [0]
+
+    def token(value: Pin) -> str:
+        return _blif_token(value, const_names, design, unconnected_counter)
+
+    # A port name is a whole Signal, possibly multi-bit -- must be expanded to
+    # one "name[bit]" token per bit here, exactly as ABC's own `read_verilog`
+    # already flattens a `input [msb:lsb] name;` declaration into per-bit PIs
+    # (confirmed: writing just the bare port name once, not one token per bit,
+    # silently produced a network with far fewer PIs than gates actually
+    # reference -- every bit past bit 0 then reads back as an *undriven
+    # internal* net instead of the PI bit it should be, which is exactly
+    # `optimize_gate_count`'s "collapsed to near-constant" false gate-count
+    # win caught by `tests/test_abc_synth.py`'s test18/and_not regression
+    # test during this fix's own verification).
+    def port_tokens(direction: Direction) -> list[str]:
+        toks: list[str] = []
+        for p in design.ports:
+            if p.direction != direction:
+                continue
+            for nb in design.signals[p.name].bits():
+                toks.append(nb.name if nb.bit is None else f"{nb.name}[{nb.bit}]")
+        return toks
+
+    pi_tokens = port_tokens(Direction.INPUT)
+    po_tokens = port_tokens(Direction.OUTPUT)
+
+    lines: list[str] = [f".model {design.module_name}"]
+    lines.append(".inputs " + " ".join(pi_tokens))
+    lines.append(".outputs " + " ".join(po_tokens))
+
+    driven_tokens: set[str] = set(pi_tokens)
+    referenced_tokens: set[str] = set(po_tokens)
+    gate_lines: list[str] = []
+    for g in design.gates:
+        if g.gate_type == GateType.DFF:
+            raise ABCBridgeError(
+                f"write_blif: dff instance {g.inst_name!r} reached the ABC BLIF writer -- "
+                "callers must pass a Design already run through extract_combinational_view"
+            )
+        o_tok = token(g.pins.get("O"))
+        driven_tokens.add(o_tok)
+        if g.gate_type in ONE_INPUT_GATES:
+            i0_tok = token(g.pins.get("I0"))
+            referenced_tokens.add(i0_tok)
+            gate_lines.append(f".names {i0_tok} {o_tok}")
+            gate_lines.extend(_ONE_INPUT_BLIF_COVERS[g.gate_type])
+        else:
+            i0_tok = token(g.pins.get("I0"))
+            i1_tok = token(g.pins.get("I1"))
+            referenced_tokens.add(i0_tok)
+            referenced_tokens.add(i1_tok)
+            gate_lines.append(f".names {i0_tok} {i1_tok} {o_tok}")
+            gate_lines.extend(_TWO_INPUT_BLIF_COVERS[g.gate_type])
+    lines.extend(gate_lines)
+
+    for value, name in const_names.items():
+        driven_tokens.add(name)
+        lines.append(f".names {name}")
+        if value == Const.ONE:
+            lines.append("1")
+
+    # Explicit constant-0 tie for every net referenced (as a gate input or a
+    # primary output) but driven by nothing (not a PI, not any gate's O, not
+    # one of the const nets just declared above) -- see docstring. Sorted so
+    # output is deterministic byte-for-byte, not dependent on dict/set
+    # iteration order.
+    for undriven_tok in sorted(referenced_tokens - driven_tokens):
+        lines.append(f".names {undriven_tok}")
+
+    lines.append(".end")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def _run_cec(design_a: Design, design_b: Design, timeout: float) -> "EquivResult":
     with tempfile.TemporaryDirectory(prefix="abc_bridge_") as tmpdir:
-        path_a = os.path.join(tmpdir, "a.v")
-        path_b = os.path.join(tmpdir, "b.v")
-        write_verilog(design_a, path_a)
-        write_verilog(design_b, path_b)
+        path_a = os.path.join(tmpdir, "a.blif")
+        path_b = os.path.join(tmpdir, "b.blif")
+        write_blif(design_a, path_a)
+        write_blif(design_b, path_b)
         stdout = _run_abc(f'cec "{path_a}" "{path_b}"', timeout=timeout)
     return _parse_cec_output(stdout)
 
@@ -140,38 +335,13 @@ def _run_cec(design_a: Design, design_b: Design, timeout: float) -> "EquivResult
 # ----------------------------------------------------------------------
 
 
-def _set_or_add_port(design: Design, name: str, direction: Direction) -> None:
-    for p in design.ports:
-        if p.name == name:
-            p.direction = direction
-            return
-    design.ports.append(Port(name=name, direction=direction))
-
-
-def _split_bit_to_fresh_input(design: Design, nb: NetBit) -> NetBit:
-    """Split one bit of a bus off into its own fresh single-bit primary
-    INPUT: every gate pin currently referencing `nb` is rewired to the fresh
-    net-bit instead, and the fresh net is added as a new input port. `nb`'s
-    original signal (and every one of its *other* bits) is left completely
-    untouched -- confirmed to occur for real (test39): a DFF's Q pin can be a
-    bit-select of a wider bus whose other bits are independently driven by
-    ordinary combinational gates, so whole-Signal-granularity Direction
-    promotion (the only kind this IR's Port/Signal model supports directly)
-    would leave those other bits simultaneously a primary-input bit and
-    gate-driven -- an invalid multiply-driven net. Since `nb` itself was
-    driven only by the (already-excluded) DFF, nothing in `design` drives it
-    after the split; ABC tolerates an undriven net gracefully (a harmless
-    "Constant-0 drivers added" warning), same as it already does for
-    ordinary floating ports in these testcases.
-    """
-    fresh = design.fresh_net("t_dffq_split_")
-    for gate in design.gates:
-        for pin_name, value in list(gate.pins.items()):
-            if value == nb:
-                design.rewire_pin(gate, pin_name, fresh)
-    design.signals[fresh.name].direction = Direction.INPUT
-    design.ports.append(Port(name=fresh.name, direction=Direction.INPUT))
-    return fresh
+def _is_declared_bit(sig: Signal, nb: NetBit) -> bool:
+    """O(1) "is `nb` a declared bit of `sig`". Deliberately NOT
+    `nb in sig.bits()`: that materialises the whole bus per call, which made
+    extraction quadratic on the 4096-bit buses in the final corpus."""
+    if sig.msb is None or sig.lsb is None:
+        return nb.bit is None
+    return nb.bit is not None and min(sig.msb, sig.lsb) <= nb.bit <= max(sig.msb, sig.lsb)
 
 
 def extract_combinational_view(
@@ -184,25 +354,41 @@ def extract_combinational_view(
     matters for everything downstream that hands this to ABC).
 
     `dff_q_mode`:
-      - "free_pi": every DFF's Q net becomes a genuine new primary INPUT
-        (free variable). Used for equivalence/symmetry checking, where a
+      - "free_pi": every DFF gets one new primary INPUT `__dff_Q__<inst>`
+        (a free variable) and a synthesized BUF re-drives the DFF's original
+        Q net from it. Used for equivalence/symmetry checking, where a
         flop's stored value must range over both 0 and 1.
       - "const_zero": every DFF's Q net is tied to Const.ZERO via a
-        synthesized BUF gate instead of becoming a port -- used only by
+        synthesized BUF gate instead -- used only by
         `is_constant` (via the cone-restriction helper below) to ask "is
         this net constant when every flop happens to hold 0".
 
     `promoted_q_source`, if given (mutated in place; only meaningful for
-    "free_pi"), is populated with one entry per promoted DFF-Q primary
-    input: the PI's SIGNAL NAME in the returned Design -> the original Q
-    NetBit in `design` it stands for. For an ordinary promotion this is a
-    trivial same-name entry (`nb.name -> nb`); for the `_split_bit_to_fresh_input`
-    corner it is the only way to recover which original net-bit a fresh
-    split name (e.g. "t_dffq_split_0") actually represents, since that name
-    exists nowhere in `design` itself. abc_synth.py's whole-design/cone depth
-    optimizers need this to correctly wire newly-synthesized gates (which
-    reference the extracted view's PI names) back into `design`'s own
-    namespace.
+    "free_pi"), is populated with one entry per DFF: the PI's signal name
+    `__dff_Q__<inst>` in the returned Design -> that DFF's original Q
+    NetBit in `design`. abc_synth.py's depth optimizers need this to wire
+    newly-synthesized gates (which reference the view's PI names) back into
+    `design`'s own namespace.
+
+    Q side is identified by DFF *instance* name, symmetric with the D side
+    below; both are kept in sync across renames by the same
+    `Session.mirror_rename`. The original Q net is NOT renamed, split or
+    promoted, and no consumer is rewired. Rewiring consumers or renaming Q
+    nets (earlier designs) required every entry point to map names back:
+    a D-tap reading a Q net lost its value (F1), extraction cost O(gates x
+    DFFs) (F2), the query entry points (`are_equivalent`, `check_symmetry`,
+    `find_pair_for_op`) needed a reverse map (F3), and a true Q-pin swap
+    was invisible because Q was keyed by net name while D was keyed by
+    instance (F4). Re-driving the untouched net through a BUF is the same
+    shape `const_zero` already used.
+
+    Sibling bits of a Q bus that no DFF drives and nothing else drives are
+    left floating and are tied to 0 by `write_blif`, the existing
+    convention (zero of them were read by any gate in the corpus).
+
+    Malformed Q wiring raises `ABCBridgeError`: two DFFs on one Q net, a Q
+    net also driven by a gate, a Q net that is a primary input or not a
+    declared bit, or a name collision with `__dff_Q__<inst>`.
 
     Every DFF's D-pin value is exposed as a new primary OUTPUT in BOTH modes
     (uniformity: `is_constant`'s cone-restriction step discards whichever POs
@@ -242,8 +428,8 @@ def extract_combinational_view(
     disappearance. Stated in the conditional because no transform in this
     codebase does that today -- all six gate-removal sites exempt DFFs, and
     `tests/test_snapshot_rename_collision.py` runs them to say so rather
-    than asserting it in prose. The Q side stays keyed by net name: Q nets are
-    driver-side and none of the existing transforms rewire or rename them.
+    than asserting it in prose. The Q side is keyed by instance name too and
+    relies on the same `mirror_rename` sync.
     """
     new_design = Design(module_name=design.module_name)
     for name, sig in design.signals.items():
@@ -256,62 +442,54 @@ def extract_combinational_view(
             continue
         new_design.add_gate(Gate(inst_name=g.inst_name, gate_type=g.gate_type, pins=dict(g.pins)))
 
-    # Dedupe by net-bit identity (name+bit), not just by signal name: two
-    # distinct DFF Q/D pins may share a signal *name* while addressing
-    # different bits of the same bus (only matters for const_zero's
-    # per-net-bit BUF ties below; port/direction promotion operates at
-    # Signal granularity regardless, since Port has no per-bit direction).
-    q_netbits: dict[NetBit, None] = {}
+    # Q side: the original Q net keeps its name, direction and port entry.
+    # It is simply re-driven by one BUF whose source is a per-instance
+    # primary input (free_pi) or Const.ZERO (const_zero). Nothing is rewired
+    # and no bus is split or promoted, so every original net in the view
+    # keeps its name and meaning (see the docstring for why).
+    q_owner: dict[NetBit, str] = {}
     for g in dff_gates:
         q = g.pins.get("Q")
-        if isinstance(q, NetBit):
-            q_netbits.setdefault(q, None)
-
-    # Deterministic promotion order: ALL Q promotions first, forcing INPUT
-    # direction and overwriting any pre-existing (e.g. OUTPUT) Port entry of
-    # the same name -- INPUT status always wins. This resolves the "DFF.Q
-    # wired straight to a PO" case (the Q net was already a declared output)
-    # by keeping it INPUT rather than leaving a conflicting output port.
-    if dff_q_mode == "free_pi":
-        seen_q_names: set[str] = set()
-        for nb in q_netbits:
-            if nb.name in seen_q_names:
-                continue
-            sig = new_design.signals[nb.name]
-            # Direction lives on the whole Signal in this IR, so promoting nb
-            # to INPUT at Signal granularity is only safe when no *other* bit
-            # of the same bus is independently driven by an ordinary gate --
-            # otherwise that sibling would end up simultaneously a
-            # primary-input bit and gate-driven (an invalid multiply-driven
-            # net). When that conflict exists, split just this one bit off
-            # into its own fresh single-bit input instead (see
-            # `_split_bit_to_fresh_input`) rather than promoting -- or
-            # refusing to promote -- the whole bus; every other bit of `sig`
-            # (including any other DFF's Q sharing this same bus, which is
-            # not itself in `net_driver` and so never trips this check) is
-            # left exactly as it was.
-            conflict = any(
-                other_nb != nb and other_nb in new_design.net_driver for other_nb in sig.bits()
+        if not isinstance(q, NetBit):
+            continue
+        if q in q_owner:
+            raise ABCBridgeError(
+                f"DFFs {q_owner[q]!r} and {g.inst_name!r} both drive {q}"
             )
-            if conflict:
-                fresh = _split_bit_to_fresh_input(new_design, nb)
-                if promoted_q_source is not None:
-                    promoted_q_source[fresh.name] = nb
-                continue
-            seen_q_names.add(nb.name)
-            sig.direction = Direction.INPUT
-            _set_or_add_port(new_design, nb.name, Direction.INPUT)
-            if promoted_q_source is not None:
-                promoted_q_source[nb.name] = nb
-    else:
-        for nb in q_netbits:
-            new_design.add_gate(
-                Gate(
-                    inst_name=new_design.fresh_gate_name(),
-                    gate_type=GateType.BUF,
-                    pins={"O": nb, "I0": Const.ZERO},
+        if q in new_design.net_driver:
+            raise ABCBridgeError(
+                f"DFF {g.inst_name!r} Q net {q} is also driven by a combinational gate"
+            )
+        sig = new_design.signals.get(q.name)
+        if sig is None or not _is_declared_bit(sig, q):
+            raise ABCBridgeError(
+                f"DFF {g.inst_name!r} Q net {q} is not a declared bit of any signal"
+            )
+        if sig.direction == Direction.INPUT:
+            raise ABCBridgeError(
+                f"DFF {g.inst_name!r} Q net {q} is a primary input"
+            )
+        q_owner[q] = g.inst_name
+        if dff_q_mode == "free_pi":
+            pi_name = f"__dff_Q__{g.inst_name}"
+            if pi_name in new_design.signals:
+                raise ABCBridgeError(
+                    f"canonical DFF Q name {pi_name!r} collides with an existing signal"
                 )
+            new_design.signals[pi_name] = Signal(name=pi_name, msb=None, lsb=None, direction=Direction.INPUT)
+            new_design.ports.append(Port(name=pi_name, direction=Direction.INPUT))
+            src: NetBit | Const = NetBit(pi_name, None)
+            if promoted_q_source is not None:
+                promoted_q_source[pi_name] = q
+        else:
+            src = Const.ZERO
+        new_design.add_gate(
+            Gate(
+                inst_name=new_design.fresh_gate_name(),
+                gate_type=GateType.BUF,
+                pins={"O": q, "I0": src},
             )
+        )
 
     # THEN the D side: one canonical BUF tap per DFF instance (see the
     # docstring). Unconditional and uniform -- because the tap drives its
@@ -433,20 +611,37 @@ class EquivResult:
     detail: str  # raw relevant ABC stdout: the counterexample block, or the equivalent-confirmation line(s)
 
 
+_DFF_LEGEND = (
+    "(__dff_Q__<name> / __dff_D__<name> are flip-flop <name>'s current state (Q) "
+    "and next-state input (D).)"
+)
+
+
+def _with_dff_legend(result: EquivResult) -> EquivResult:
+    """Append a one-line legend to a NON-equivalent result whose detail names a
+    synthetic DFF boundary PI, so the user can read `__dff_Q__r1`. The line
+    must not contain "Input pattern:" (`property_check._INPUT_PATTERN_RE`
+    matches on it)."""
+    if result.equivalent or ("__dff_Q__" not in result.detail and "__dff_D__" not in result.detail):
+        return result
+    return EquivResult(False, result.detail + "\n" + _DFF_LEGEND)
+
+
 def verify_equivalence(
     design_a: Design,
     design_b: Design,
     signals: Optional[list[str]] = None,
-    timeout: float = DEFAULT_ABC_TIMEOUT,
+    timeout: float = DEFAULT_VERIFY_TIMEOUT,
 ) -> EquivResult:
     """Whole-design (or, if `signals` given, per-named-output-cone) Boolean
     equivalence check via ABC `cec`, across the DFF boundary (both designs
     are first passed through `extract_combinational_view(..., "free_pi")`).
 
     Raises `ABCBridgeError` if the two designs' post-extraction PI or PO name
-    *sets* don't match -- this codebase's transforms never rename ports or
-    DFFs, so a mismatch here means something is genuinely wrong upstream,
-    not a normal code path. Cheaper and more testable to catch in Python
+    *sets* don't match -- this codebase's transforms never rename ports, and
+    DFF renames are mirrored into the snapshot by `Session.mirror_rename`, so
+    a mismatch here means something is genuinely wrong upstream, not a normal
+    code path. Cheaper and more testable to catch in Python
     than to parse ABC's own mismatch error text for this particular case.
 
     `signals`, if given, restricts the comparison to just those named
@@ -473,7 +668,7 @@ def verify_equivalence(
         )
 
     if signals is None:
-        return _run_cec(comb_a, comb_b, timeout=timeout)
+        return _with_dff_legend(_run_cec(comb_a, comb_b, timeout=timeout))
 
     details = []
     for idx, sig_name in enumerate(signals):
@@ -494,7 +689,7 @@ def verify_equivalence(
             cone_b = _restrict_to_fanin_cone(comb_b, nb, out_name)
             result = _run_cec(cone_a, cone_b, timeout=timeout)
             if not result.equivalent:
-                return result
+                return _with_dff_legend(result)
             details.append(result.detail)
     return EquivResult(True, "\n".join(details))
 
@@ -547,7 +742,7 @@ def check_implication(
     design: Design,
     net: NetBit,
     promoted_q_source: Optional[dict[str, NetBit]] = None,
-    timeout: float = DEFAULT_ABC_TIMEOUT,
+    timeout: float = DEFAULT_VERIFY_TIMEOUT,
 ) -> EquivResult:
     """Whether `net` is provably constant-1 (true across every reachable
     flop state -- every DFF Q free per `extract_combinational_view`'s
@@ -577,12 +772,11 @@ def check_implication(
     return verify_equivalence(cone, one_ref, timeout=timeout)
 
 
-def _swap_in_cone(cone: Design, a: NetBit, b: NetBit) -> Design:
-    """Copy of `cone` with every gate pin whose value equals `a` rewritten to
-    `b` and vice versa (a full swap across every gate in the cone). Building
-    the swap on the already-cone-restricted design rather than on the whole
-    comb design first is equivalent (swapping a leaf PI value never changes
-    which gates are backward-reachable) and cheaper.
+def _swap_consumers(comb: Design, a: NetBit, b: NetBit) -> Design:
+    """Copy of `comb` with every gate INPUT pin whose value equals `a`
+    rewritten to `b` and vice versa. Output (driver) pins are left alone, so
+    swapping two internal nets exchanges what their readers see, not what
+    drives them.
     """
 
     def _swap_val(v: Pin) -> Pin:
@@ -592,12 +786,13 @@ def _swap_in_cone(cone: Design, a: NetBit, b: NetBit) -> Design:
             return a
         return v
 
-    swapped = Design(module_name=cone.module_name)
-    for name, sig in cone.signals.items():
+    swapped = Design(module_name=comb.module_name)
+    for name, sig in comb.signals.items():
         swapped.signals[name] = Signal(name=sig.name, msb=sig.msb, lsb=sig.lsb, direction=sig.direction)
-    swapped.ports = [Port(name=p.name, direction=p.direction) for p in cone.ports]
-    for g in cone.gates:
-        new_pins = {pin: _swap_val(val) for pin, val in g.pins.items()}
+    swapped.ports = [Port(name=p.name, direction=p.direction) for p in comb.ports]
+    for g in comb.gates:
+        out_pin = OUTPUT_PIN[g.gate_type]
+        new_pins = {pin: (val if pin == out_pin else _swap_val(val)) for pin, val in g.pins.items()}
         swapped.add_gate(Gate(inst_name=g.inst_name, gate_type=g.gate_type, pins=new_pins))
     return swapped
 
@@ -676,10 +871,14 @@ def check_symmetry(
     special-casing: swapping a net that's not referenced anywhere is a
     no-op, so the two cone copies end up structurally identical and the
     miter trivially proves constant-0 -- symmetric by definition.
+
+    If an input is an internal net, "swap" means exchanging the two wires'
+    readers. When each is in the other's fanin cone the swap creates a
+    combinational loop, and ABC fails loudly (`ABCBridgeError`).
     """
     comb = extract_combinational_view(design, "free_pi")
     cone_orig = _restrict_to_fanin_cone(comb, output_net, "sym_orig_out")
-    cone_swap = _swap_in_cone(cone_orig, input_a, input_b)
+    cone_swap = _restrict_to_fanin_cone(_swap_consumers(comb, input_a, input_b), output_net, "sym_orig_out")
     miter = _build_xor_miter(cone_orig, cone_swap, "_orig", "_swap")
 
     pi_ports = [p for p in miter.ports if p.direction == Direction.INPUT]

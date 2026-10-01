@@ -244,6 +244,26 @@ def deduplicate_gates(design: Design) -> int:
     return merged
 
 
+def deduplicate_gates_to_fixpoint(design: Design) -> int:
+    """Repeatedly call `deduplicate_gates` until a pass merges nothing, and
+    return the running total of merges across all passes.
+
+    One pass only catches duplicates whose inputs are *already* identical.
+    Merging a duplicate pair one level down can make two gates one level up
+    suddenly share the same inputs too (their previously-distinct fan-in nets
+    just got redirected to the same survivor), so a fresh pass is needed to
+    catch those newly-created duplicates. This terminates because each pass
+    that isn't the last one removes at least one gate (`merged > 0`), and the
+    design has finitely many gates.
+    """
+    total = 0
+    while True:
+        merged = deduplicate_gates(design)
+        total += merged
+        if merged == 0:
+            return total
+
+
 # ----------------------------------------------------------------------
 # 4. Constant-input simplification for 2-input gates
 # ----------------------------------------------------------------------

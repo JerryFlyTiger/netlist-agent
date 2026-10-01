@@ -32,9 +32,8 @@ LARGEST = ["test39", "test12", "test33"]
 # pin that is a bit-select of a wider bus whose OTHER bits are independently
 # driven by combinational gates, which extract_combinational_view's free_pi
 # mode (Signal-granularity Direction promotion) couldn't handle without a
-# multiply-driven net. Fixed by _split_bit_to_fresh_input in abc_bridge.py,
-# which splits just the conflicting bit off into its own fresh single-bit
-# input instead of promoting (or refusing to promote) the whole bus -- see
+# multiply-driven net. Fixed by re-driving each DFF's Q net through a BUF
+# from a per-instance `__dff_Q__<inst>` PI (no bus is promoted or split) -- see
 # test_extract_combinational_view_dff_q_shares_bus_with_combinational_bit in
 # tests/test_abc_bridge.py for the targeted synthetic regression test.
 

@@ -20,9 +20,11 @@ instead runs a three-stage pipeline:
      returned.
 
 DFF boundary handling is delegated entirely to
-`abc_bridge.extract_combinational_view(..., "free_pi", ...)` (DFF Q treated
-as a free pseudo primary input) -- this module never re-derives that
-convention itself.
+`abc_bridge.extract_combinational_view(..., "free_pi", ...)` (each DFF's Q
+net keeps its original name in the view, re-driven from a synthetic
+`__dff_Q__<inst>` primary input) -- this module never re-derives that
+convention itself. The synthetic `__dff_Q__` / `__dff_D__` nets are not
+signals of the design and are never pair candidates.
 """
 
 from __future__ import annotations
@@ -38,6 +40,10 @@ from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, O
 from netlist_agent.netref import netbit_token
 
 SUPPORTED_OPS = ("AND", "NAND", "OR", "NOR", "XOR", "XNOR")
+
+# Synthetic boundary nets that `extract_combinational_view` adds; neither is a
+# signal that exists in the original netlist, so neither is a pair candidate.
+_SYNTHETIC_PREFIXES = ("__dff_D__", "__dff_Q__")
 
 DEFAULT_NUM_SAMPLES = 2048
 # Cap on the size of the signature-surviving candidate set (AND/NAND/OR/NOR)
@@ -160,17 +166,17 @@ def _simulate_signatures(design: Design, num_samples: int, seed: Optional[int]) 
 # ----------------------------------------------------------------------
 
 
-def _resolve_to_original(nb: NetBit, promoted_q_source: dict[str, NetBit]) -> Optional[NetBit]:
+def _resolve_to_original(nb: NetBit) -> Optional[NetBit]:
     """Map a combinational-view net-bit back to the net-bit that names it in
-    the ORIGINAL (pre-extraction) design -- trivial identity for an ordinary
-    internal/PI net, but a real remap for a promoted-DFF-Q pseudo-PI (whether
-    a plain same-name promotion or a `_split_bit_to_fresh_input` split, both
-    recorded uniformly in `promoted_q_source`). Returns None for a synthetic
-    `__dff_D__...` boundary tap, which is not a signal that exists in the
-    original netlist at all."""
-    if nb.name.startswith("__dff_D__"):
+    the ORIGINAL (pre-extraction) design. Original nets keep their names in
+    the view (a DFF's Q net is re-driven by a BUF from its own synthetic
+    `__dff_Q__<inst>` PI), so this is the identity for every net that exists
+    in the design. Returns None for a synthetic `__dff_D__...` / `__dff_Q__...`
+    boundary net, which is not a signal that exists in the original netlist
+    at all."""
+    if nb.name.startswith(_SYNTHETIC_PREFIXES):
         return None
-    return promoted_q_source.get(nb.name, nb)
+    return nb
 
 
 def _verify_pair(design: Design, a: NetBit, b: NetBit, op: str, target: NetBit, timeout: float) -> bool:
@@ -225,8 +231,7 @@ def find_pair_for_op(
     if op not in SUPPORTED_OPS:
         raise ValueError(f"unsupported operator {op!r}; choose one of {SUPPORTED_OPS}")
 
-    promoted_q_source: dict[str, NetBit] = {}
-    comb = extract_combinational_view(design, "free_pi", promoted_q_source)
+    comb = extract_combinational_view(design, "free_pi")
     sig = _simulate_signatures(comb, num_samples, seed)
 
     if target not in sig:
@@ -246,7 +251,7 @@ def find_pair_for_op(
     # Every signature-tracked net-bit except the target itself and the
     # synthetic DFF-D boundary taps (not "signals already in the netlist").
     candidates: dict[NetBit, int] = {
-        nb: s for nb, s in sig.items() if nb != target and not nb.name.startswith("__dff_D__")
+        nb: s for nb, s in sig.items() if nb != target and not nb.name.startswith(_SYNTHETIC_PREFIXES)
     }
     nets_scanned = len(candidates)
 
@@ -310,8 +315,8 @@ def find_pair_for_op(
     for a_nb, b_nb in pairs:
         if verified_count >= max_verify:
             break
-        orig_a = _resolve_to_original(a_nb, promoted_q_source)
-        orig_b = _resolve_to_original(b_nb, promoted_q_source)
+        orig_a = _resolve_to_original(a_nb)
+        orig_b = _resolve_to_original(b_nb)
         if orig_a is None or orig_b is None:
             continue
         verified_count += 1

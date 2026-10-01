@@ -13,14 +13,17 @@ import os
 
 import pytest
 
-from netlist_agent.abc_bridge import verify_equivalence
+from netlist_agent import abc_synth as abc_synth_module
+from netlist_agent.abc_bridge import ABCBridgeError, EquivResult, verify_equivalence
 from netlist_agent.abc_synth import (
     BASIS_GATE_NAMES,
+    AreaOptResult,
     DepthOptResult,
     _BlifGate,
     _SynthError,
     allowed_gate_types,
     optimize_cone_depth,
+    optimize_cone_gate_count,
     optimize_depth,
     optimize_gate_count,
     parse_blif,
@@ -381,9 +384,9 @@ def test_optimize_depth_rewires_dff_d_pin_correctly() -> None:
 def test_optimize_depth_handles_q_bus_sharing_corner() -> None:
     """test39-style corner: one bit of a bus is a DFF's Q output, a sibling
     bit of the SAME bus is combinationally driven. Whole-design optimization
-    must leave the DFF's Q bit exactly as-is (still driven by the DFF) and
-    must not corrupt it via the floating-PO-bit artifact that
-    extract_combinational_view's free_pi promotion creates for the split bit
+    must leave the DFF's Q bit exactly as-is (still driven by the DFF); the
+    Q net is a PO of the extracted view, re-driven by a BUF from the
+    `__dff_Q__<inst>` PI, and must not be retapped
     (see abc_synth._splice_whole_design's dff_q_bits guard)."""
     design = Design(module_name="top")
     for n in ("a", "b", "clk", "rn"):
@@ -530,3 +533,138 @@ def test_gate_count_optimization_reports_no_change_when_it_cannot_shrink(capsys)
     assert not result.changed
     assert result.gates_after == result.gates_before
     assert "left unchanged" in result.note
+
+
+# ----------------------------------------------------------------------
+# `failure` field: batch 6b (2026-09-30) -- a failed optimization must be
+# distinguishable, in the result object, from a genuine "already optimal"
+# outcome. Covers all four public entry points (whole-design and
+# cone-restricted, depth and area).
+# ----------------------------------------------------------------------
+
+_DEPTH_ENTRY_POINTS = [
+    ("optimize_depth", lambda design: optimize_depth(design)),
+    ("optimize_cone_depth", lambda design: optimize_cone_depth(design, _nb("y"))),
+]
+
+_AREA_ENTRY_POINTS = [
+    ("optimize_gate_count", lambda design: optimize_gate_count(design)),
+    ("optimize_cone_gate_count", lambda design: optimize_cone_gate_count(design, _nb("y"))),
+]
+
+
+@pytest.mark.parametrize("name,call", _DEPTH_ENTRY_POINTS, ids=[n for n, _ in _DEPTH_ENTRY_POINTS])
+def test_depth_opt_synth_failure_sets_failure_field(monkeypatch, name, call) -> None:
+    def _boom(*args, **kwargs):
+        raise ABCBridgeError("ABC exited with code 2: boom")
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _boom)
+    design = _build_and_chain()
+    result = call(design)
+    assert not result.changed
+    assert result.design is design
+    assert result.failure is not None
+    assert "boom" in result.failure
+
+
+@pytest.mark.parametrize("name,call", _DEPTH_ENTRY_POINTS, ids=[n for n, _ in _DEPTH_ENTRY_POINTS])
+def test_depth_opt_verify_equivalence_exception_is_caught(monkeypatch, name, call) -> None:
+    """`verify_equivalence` raising ABCBridgeError must degrade to
+    changed=False + failure=... rather than propagate -- the docstring's
+    "never raises out of this function" promise, made real."""
+
+    def _boom(*args, **kwargs):
+        raise ABCBridgeError("cec timed out")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _boom)
+    design = _build_and_chain()
+    original = copy.deepcopy(design)
+    result = call(design)  # must not raise
+    assert not result.changed
+    assert result.design is design
+    assert design.gates == original.gates
+    assert result.failure is not None
+    assert "cec timed out" in result.failure
+
+
+@pytest.mark.parametrize("name,call", _DEPTH_ENTRY_POINTS, ids=[n for n, _ in _DEPTH_ENTRY_POINTS])
+def test_depth_opt_not_equivalent_sets_failure_field(monkeypatch, name, call) -> None:
+    def _not_equiv(*args, **kwargs):
+        return EquivResult(False, "counterexample: a=1 b=0")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _not_equiv)
+    design = _build_and_chain()
+    result = call(design)
+    assert not result.changed
+    assert result.design is design
+    assert result.failure is not None
+
+
+def test_depth_opt_already_optimal_leaves_failure_none() -> None:
+    """The genuine "nothing better found" outcome (from an earlier test in
+    this file) must NOT be mistaken for a failure."""
+    design = Design(module_name="top")
+    for n in ("a", "b"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port("a", Direction.INPUT), Port("b", Direction.INPUT), Port("y", Direction.OUTPUT)]
+    design.add_gate(Gate("g0", GateType.AND, {"O": _nb("y"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.build_indices()
+
+    result = optimize_depth(design)
+    assert not result.changed
+    assert result.failure is None
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_all_candidates_fail_sets_failure_field(monkeypatch, name, call) -> None:
+    def _boom(*args, **kwargs):
+        raise ABCBridgeError("all candidates broken")
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _boom)
+    design = _build_and_chain()
+    result = call(design)
+    assert not result.changed
+    assert result.design is design
+    assert result.failure is not None
+    assert "all candidates broken" in result.failure
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_one_candidate_completes_leaves_failure_none_even_without_improvement(monkeypatch, name, call) -> None:
+    """First candidate script fails outright, second runs to completion (ABC
+    succeeds + verifies equivalent) but doesn't beat the original gate count
+    -- this counts as "ran to completion", not a failure, per the module's
+    multi-candidate contract."""
+    real_run = abc_synth_module._run_abc_synthesis
+    calls = {"n": 0}
+
+    def _first_fails_rest_real(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ABCBridgeError("first candidate broken")
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _first_fails_rest_real)
+    design = _build_and_chain()
+    result = call(design)
+    assert calls["n"] >= 1
+    # Either a real candidate beat the original (changed=True, failure=None
+    # per contract) or none did but at least one completed (failure=None
+    # anyway) -- either way `failure` must be None once any candidate ran to
+    # completion.
+    assert result.failure is None
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_verify_equivalence_exception_all_candidates_sets_failure(monkeypatch, name, call) -> None:
+    def _boom(*args, **kwargs):
+        raise ABCBridgeError("cec broke")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _boom)
+    design = _build_and_chain()
+    result = call(design)
+    assert not result.changed
+    assert result.design is design
+    assert result.failure is not None
+    assert "cec broke" in result.failure

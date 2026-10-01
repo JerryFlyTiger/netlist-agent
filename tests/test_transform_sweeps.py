@@ -12,6 +12,7 @@ from netlist_agent.transform import (
     collapse_double_inverters,
     collapse_inverter_buffer_chains,
     deduplicate_gates,
+    deduplicate_gates_to_fixpoint,
     insert_buffer_per_load,
     limit_fanout,
     limit_fanout_net,
@@ -261,6 +262,62 @@ def test_dedup_non_po_duplicate_merges_into_po_driver() -> None:
     assert "g_po" in remaining and "g_dup" not in remaining
     c = next(g for g in design.gates if g.inst_name == "c")
     assert c.pins["I0"] == _nb("y")
+
+
+def test_dedup_to_fixpoint_needs_a_second_round() -> None:
+    # g1/g2 are duplicate ANDs of (a, b); g3/g4 are NOTs of g1's/g2's outputs
+    # respectively. Before any merging, g3 and g4 have DIFFERENT inputs (x1
+    # vs x2), so a single `deduplicate_gates` pass can't group them -- only
+    # after g1/g2 merge (redirecting g4's input to g1's surviving output) do
+    # g3 and g4 become duplicates in their own right. Each NOT feeds a
+    # distinct non-PO consumer so the merge is visible on both sides.
+    design = Design(module_name="t")
+    _sig(design, "a", Direction.INPUT)
+    _sig(design, "b", Direction.INPUT)
+    _sig(design, "outA", Direction.OUTPUT)
+    _sig(design, "outB", Direction.OUTPUT)
+    for name in ("x1", "x2", "y1", "y2"):
+        _sig(design, name, Direction.INTERNAL)
+    design.gates.append(Gate("g1", GateType.AND, {"O": _nb("x1"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.gates.append(Gate("g2", GateType.AND, {"O": _nb("x2"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.gates.append(Gate("g3", GateType.NOT, {"O": _nb("y1"), "I0": _nb("x1")}))
+    design.gates.append(Gate("g4", GateType.NOT, {"O": _nb("y2"), "I0": _nb("x2")}))
+    design.gates.append(Gate("c1", GateType.BUF, {"O": _nb("outA"), "I0": _nb("y1")}))
+    design.gates.append(Gate("c2", GateType.BUF, {"O": _nb("outB"), "I0": _nb("y2")}))
+    design.build_indices()
+
+    # A single pass only catches the AND duplicates: the NOTs still look
+    # different (different inputs) until that merge has happened.
+    single_pass_design = Design(module_name="t")
+    single_pass_design.signals = dict(design.signals)
+    single_pass_design.ports = list(design.ports)
+    single_pass_design.gates = [
+        Gate(g.inst_name, g.gate_type, dict(g.pins)) for g in design.gates
+    ]
+    single_pass_design.build_indices()
+    single_merged = deduplicate_gates(single_pass_design)
+    assert single_merged == 1
+    remaining_types = [g.gate_type for g in single_pass_design.gates]
+    assert remaining_types.count(GateType.NOT) == 2  # both NOTs survive: still "duplicates"
+
+    total = deduplicate_gates_to_fixpoint(design)
+    assert total == 2  # 1 AND merge + 1 NOT merge, only reachable after two rounds
+    assert len(design.gates) == 4  # one AND + one NOT + the two original BUFs
+
+
+def test_dedup_to_fixpoint_no_duplicates_is_a_noop() -> None:
+    design = Design(module_name="t")
+    _sig(design, "a", Direction.INPUT)
+    _sig(design, "b", Direction.INPUT)
+    _sig(design, "y1", Direction.OUTPUT)
+    _sig(design, "y2", Direction.OUTPUT)
+    design.gates.append(Gate("g1", GateType.AND, {"O": _nb("y1"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.gates.append(Gate("g2", GateType.OR, {"O": _nb("y2"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.build_indices()
+
+    total = deduplicate_gates_to_fixpoint(design)
+    assert total == 0
+    assert {g.inst_name for g in design.gates} == {"g1", "g2"}
 
 
 # ----------------------------------------------------------------------

@@ -255,9 +255,10 @@ class Session:
         under its old label while `current_design`'s copy has the new one
         -- and when the renamed gate is a DFF, that divergence surfaces as
         `ABCBridgeError` leaking to the user out of `verify_equivalence`
-        (the `__dff_D__<instance name>` PO boundary, keyed on instance
+        (the `__dff_D__<instance name>` PO boundary and the
+        `__dff_Q__<instance name>` PI boundary, both keyed on instance
         name -- see `abc_bridge.extract_combinational_view`), because the
-        two designs' PO name sets no longer match. See the branch below
+        two designs' PO/PI name sets no longer match. See the branch below
         for how this is now handled instead of skipped.
         """
         if self.original_snapshot is None:

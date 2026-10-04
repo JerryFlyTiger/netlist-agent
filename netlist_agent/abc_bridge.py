@@ -70,6 +70,7 @@ from typing import Literal, Optional
 from netlist_agent.graph import NetlistGraph
 from netlist_agent.ir import (
     Const,
+    DFF_PIN_ORDER,
     Design,
     Direction,
     Gate,
@@ -345,7 +346,12 @@ def _is_declared_bit(sig: Signal, nb: NetBit) -> bool:
 
 
 def extract_combinational_view(
-    design: Design, dff_q_mode: DffQMode, promoted_q_source: Optional[dict[str, NetBit]] = None
+    design: Design,
+    dff_q_mode: DffQMode,
+    promoted_q_source: Optional[dict[str, NetBit]] = None,
+    *,
+    tap_control_pins: bool = False,
+    skip_control_taps: frozenset = frozenset(),
 ) -> Design:
     """Return a new, purely-combinational `Design` (never mutates `design`):
     every non-DFF gate is copied unchanged, and every DFF instance is dropped
@@ -362,6 +368,22 @@ def extract_combinational_view(
         synthesized BUF gate instead -- used only by
         `is_constant` (via the cone-restriction helper below) to ask "is
         this net constant when every flop happens to hold 0".
+
+    `tap_control_pins` (default False; only `verify_equivalence` turns it on):
+    when True, every DFF's control pins (`DFF_PIN_ORDER` minus D and Q, i.e.
+    RN/SN/CK) are ALSO exposed as primary OUTPUTs `__dff_<PIN>__<inst>`, one
+    BUF tap each, exactly like the D tap (None = unconnected is skipped;
+    constants are tapped; a name collision raises `ABCBridgeError`). Without
+    it the equivalence boundary saw only Q and D, so rewiring SN/RN/CK was
+    judged "equivalent". It is off for every other caller on purpose:
+    `abc_synth._splice_whole_design` does not handle `__dff_<PIN>__` tokens,
+    and the query-style callers (`is_constant`, `check_implication`,
+    `check_symmetry`, `are_equivalent`, `signal_pair_search`) ask about
+    combinational functions, which the extra POs do not belong to.
+
+    `skip_control_taps`: a set of `(inst_name, pin)` pairs that are NOT tapped
+    even when `tap_control_pins` is on. `verify_equivalence` passes the same
+    set for both designs so their PO name sets stay equal.
 
     `promoted_q_source`, if given (mutated in place; only meaningful for
     "free_pi"), is populated with one entry per DFF: the PI's signal name
@@ -519,6 +541,31 @@ def extract_combinational_view(
             )
         )
 
+    if tap_control_pins:
+        # Control pins (RN/SN/CK): same canonical per-instance BUF tap as D,
+        # except the (inst, pin) pairs in `skip_control_taps` (identical
+        # Const / identical PI on both sides, see `verify_equivalence`).
+        # Derived from DFF_PIN_ORDER so a pin added there is covered too.
+        for pin in (p for p in DFF_PIN_ORDER if p not in ("D", "Q")):
+            for g in dff_gates:
+                val = g.pins.get(pin)
+                if val is None or (g.inst_name, pin) in skip_control_taps:
+                    continue
+                out_name = f"__dff_{pin}__{g.inst_name}"
+                if out_name in new_design.signals:
+                    raise ABCBridgeError(
+                        f"canonical DFF {pin}-tap name {out_name!r} collides with an existing signal"
+                    )
+                new_design.signals[out_name] = Signal(name=out_name, msb=None, lsb=None, direction=Direction.OUTPUT)
+                new_design.ports.append(Port(name=out_name, direction=Direction.OUTPUT))
+                new_design.add_gate(
+                    Gate(
+                        inst_name=new_design.fresh_gate_name(),
+                        gate_type=GateType.BUF,
+                        pins={"O": NetBit(out_name, None), "I0": val},
+                    )
+                )
+
     return new_design
 
 
@@ -613,7 +660,8 @@ class EquivResult:
 
 _DFF_LEGEND = (
     "(__dff_Q__<name> / __dff_D__<name> are flip-flop <name>'s current state (Q) "
-    "and next-state input (D).)"
+    "and next-state input (D); __dff_RN__/__dff_SN__/__dff_CK__<name> are its "
+    "reset, set and clock pins.)"
 )
 
 
@@ -622,9 +670,47 @@ def _with_dff_legend(result: EquivResult) -> EquivResult:
     synthetic DFF boundary PI, so the user can read `__dff_Q__r1`. The line
     must not contain "Input pattern:" (`property_check._INPUT_PATTERN_RE`
     matches on it)."""
-    if result.equivalent or ("__dff_Q__" not in result.detail and "__dff_D__" not in result.detail):
+    if result.equivalent or not any(
+        tag in result.detail
+        for tag in ("__dff_Q__", "__dff_D__", *(f"__dff_{p}__" for p in DFF_PIN_ORDER if p not in ("D", "Q")))
+    ):
         return result
     return EquivResult(False, result.detail + "\n" + _DFF_LEGEND)
+
+
+def _identical_control_pins(design_a: Design, design_b: Design) -> frozenset:
+    """(inst, pin) pairs for DFF control pins that are the same `Const` or the
+    same primary-input NetBit on both sides (see `verify_equivalence`).
+    Instances present on only one side are never skipped, so the PO name-set
+    check still sees them. If either side has a duplicated DFF instance name,
+    nothing is skipped: (inst, pin) is then not a unique key, and skipping
+    would swallow the tap-name collision `ABCBridgeError` that would otherwise
+    be raised, letting `verify_equivalence` return a wrong EQ (A: two `r1`
+    with SN=a/b, B: two `r1` with SN=a/a, no D/Q)."""
+    def is_pi(design: Design, nb: NetBit) -> bool:
+        sig = design.signals.get(nb.name)
+        return sig is not None and sig.direction == Direction.INPUT
+
+    names_a = [g.inst_name for g in design_a.gates if g.gate_type == GateType.DFF]
+    names_b = [g.inst_name for g in design_b.gates if g.gate_type == GateType.DFF]
+    if len(set(names_a)) != len(names_a) or len(set(names_b)) != len(names_b):
+        return frozenset()
+    dffs_b = {g.inst_name: g for g in design_b.gates if g.gate_type == GateType.DFF}
+    skip = set()
+    for ga in design_a.gates:
+        if ga.gate_type != GateType.DFF or ga.inst_name not in dffs_b:
+            continue
+        gb = dffs_b[ga.inst_name]
+        for pin in (p for p in DFF_PIN_ORDER if p not in ("D", "Q")):
+            va, vb = ga.pins.get(pin), gb.pins.get(pin)
+            if va is None or va != vb:
+                continue
+            # is_pi(design_b, ...) is redundant on normally parsed designs (the
+            # PI-set precheck in verify_equivalence rejects a PI-name mismatch
+            # first); kept as defence in depth.
+            if isinstance(va, Const) or (isinstance(va, NetBit) and is_pi(design_a, va) and is_pi(design_b, vb)):
+                skip.add((ga.inst_name, pin))
+    return frozenset(skip)
 
 
 def verify_equivalence(
@@ -635,7 +721,24 @@ def verify_equivalence(
 ) -> EquivResult:
     """Whole-design (or, if `signals` given, per-named-output-cone) Boolean
     equivalence check via ABC `cec`, across the DFF boundary (both designs
-    are first passed through `extract_combinational_view(..., "free_pi")`).
+    are first passed through `extract_combinational_view(..., "free_pi",
+    tap_control_pins=True)`). The boundary therefore includes each DFF's
+    RN/SN/CK pins (as `__dff_<PIN>__<inst>` outputs), so rewiring a control
+    pin is reported as NOT equivalent -- but only when `signals=None` (the
+    per-signal path compares just the named cones). This is on only here: the
+    other callers ask about combinational functions and keep the default off.
+    A control pin that is unconnected on one side and connected on the other
+    changes that side's PO name set, so it raises `ABCBridgeError` (see
+    below) rather than returning "not equivalent".
+
+    Skip rule: a (DFF instance, pin) present on both sides whose values are
+    identical and are either the same `Const` or the same primary-input net
+    is not tapped. Same constant or same PI means the same function by
+    construction, so comparing them only costs time (the corpus's control
+    pins are almost all constants or PIs). Any NetBit that is not an INPUT-
+    direction signal is tapped even when the name matches (a net driven by a
+    gate, an undriven net, a DFF Q net), because the logic driving it may have
+    changed.
 
     Raises `ABCBridgeError` if the two designs' post-extraction PI or PO name
     *sets* don't match -- this codebase's transforms never rename ports, and
@@ -649,8 +752,9 @@ def verify_equivalence(
     on each side) instead of the whole design -- useful when only a specific
     output is of interest on a huge design.
     """
-    comb_a = extract_combinational_view(design_a, "free_pi")
-    comb_b = extract_combinational_view(design_b, "free_pi")
+    skip = _identical_control_pins(design_a, design_b)
+    comb_a = extract_combinational_view(design_a, "free_pi", tap_control_pins=True, skip_control_taps=skip)
+    comb_b = extract_combinational_view(design_b, "free_pi", tap_control_pins=True, skip_control_taps=skip)
 
     pi_a = {p.name for p in comb_a.ports if p.direction == Direction.INPUT}
     pi_b = {p.name for p in comb_b.ports if p.direction == Direction.INPUT}

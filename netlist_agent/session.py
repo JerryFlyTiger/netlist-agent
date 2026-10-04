@@ -255,9 +255,11 @@ class Session:
         under its old label while `current_design`'s copy has the new one
         -- and when the renamed gate is a DFF, that divergence surfaces as
         `ABCBridgeError` leaking to the user out of `verify_equivalence`
-        (the `__dff_D__<instance name>` PO boundary and the
-        `__dff_Q__<instance name>` PI boundary, both keyed on instance
-        name -- see `abc_bridge.extract_combinational_view`), because the
+        (the `__dff_D__<instance name>` PO boundary, the
+        `__dff_Q__<instance name>` PI boundary and, in `verify_equivalence`,
+        the `__dff_RN__/__dff_SN__/__dff_CK__<instance name>` control-pin
+        POs, all keyed on the instance name -- see
+        `abc_bridge.extract_combinational_view`), because the
         two designs' PO/PI name sets no longer match. See the branch below
         for how this is now handled instead of skipped.
         """
@@ -300,7 +302,8 @@ class Session:
                         # A stale DFF sitting under `new_name`. Moving it
                         # aside (the non-DFF branch below) is NOT safe here:
                         # a DFF's inst_name is embedded in its
-                        # `__dff_D__<instance name>` equivalence-check PO
+                        # `__dff_D__<instance name>` (and control-pin
+                        # `__dff_<PIN>__<instance name>`) equivalence-check PO
                         # boundary (`abc_bridge.extract_combinational_view`),
                         # so renaming `collision` would change the
                         # snapshot's OWN PO name set out from under it,
@@ -350,8 +353,9 @@ class Session:
                     # was already labeled out of sync with `current_design`
                     # before this call, and non-DFF inst_names play no part
                     # in `verify_equivalence`'s PI/PO name-set comparison
-                    # (only DFF instance names do, via the `__dff_D__`
-                    # boundary) -- measured directly, arm C of the same
+                    # (only DFF instance names do, via the `__dff_D__` and
+                    # control-pin `__dff_<PIN>__` boundaries) -- measured
+                    # directly, arm C of the same
                     # experiment cited above. Relabeling it to a name
                     # guaranteed unused in the snapshot preserves that
                     # snapshot's own internal consistency while freeing

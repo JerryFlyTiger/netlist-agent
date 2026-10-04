@@ -43,6 +43,7 @@ SUPPORTED_OPS = ("AND", "NAND", "OR", "NOR", "XOR", "XNOR")
 
 # Synthetic boundary nets that `extract_combinational_view` adds; neither is a
 # signal that exists in the original netlist, so neither is a pair candidate.
+# (If tap_control_pins is ever turned on here, add the __dff_RN__/__dff_SN__/__dff_CK__ prefixes.)
 _SYNTHETIC_PREFIXES = ("__dff_D__", "__dff_Q__")
 
 DEFAULT_NUM_SAMPLES = 2048

@@ -274,8 +274,8 @@ def write_design(session: Session, filename: str) -> dict[str, Any]:
 # Two conditional keys, carrying the same information `get_last_operation_summary`
 # holds, attached to the tool a model was MEASURED to reach for instead of it.
 #
-# 2026-09-02, experiments/present_state_inference_2026-09-02: asked "How many
-# NOR gates were added by replacing the XNOR gates?" (recorded answer: 6192),
+# 2026-09-02, experiments/present_state_inference_2026-09-02: asked how
+# many NOR gates the XNOR-replacement step added (recorded answer: 6192),
 # the model called count_gates_by_type, read NOR=11790 off the present design,
 # and replied "there are 11,790 NOR gates in the design, and 0 XNOR gates
 # remaining" -- every word true, none of it the answer. It never called
@@ -517,7 +517,7 @@ def get_max_pi_to_dff_d_depth(session: Session) -> dict[str, Any]:
 
 
 def check_gate_on_max_depth_path(session: Session, gate: str) -> dict[str, Any]:
-    """Whether a gate lies on any maximum-depth path of the whole design --
+    """Whether a gate sits on at least one longest-depth path across the whole design --
     thin wrapper over `graph.depth_through_gate`/`graph.max_design_depth`,
     the same two primitives `router._h_gate_on_max_depth_path` calls."""
     graph = _graph(session)
@@ -875,8 +875,8 @@ def check_property_asserted_only_when(session: Session, signal: str, condition: 
 
 
 def find_signal_pair_for_operator(session: Session, target: str, op: str) -> dict[str, Any]:
-    """"Does there exist a pair of signals (a, b) already in the netlist such
-    that OP(a, b) is equivalent to target?" -- bit-parallel-simulation-backed
+    """"Is there some pair of existing signals (a, b), already present in the netlist,
+    whose OP(a, b) is equivalent to target?" -- bit-parallel-simulation-backed
     search over `signal_pair_search.find_pair_for_op`, formally verified
     before being reported. `a == b` is allowed; neither may be `target`
     itself."""
@@ -1775,12 +1775,12 @@ TOOL_SCHEMA: list[ToolSpec] = [
     ToolSpec("get_max_design_depth", "Get the maximum combinational logic depth anywhere in the whole design.", _schema({})),
     ToolSpec(
         "get_max_reg_to_reg_depth",
-        "Get the maximum combinational depth on any register-to-register (DFF.Q to DFF.D) path.",
+        "Get the largest combinational logic depth over all register-to-register paths (from a DFF.Q to a DFF.D).",
         _schema({}),
     ),
     ToolSpec(
         "get_max_pi_to_dff_d_depth",
-        "Get the maximum combinational depth from any primary input to any DFF's D pin.",
+        "Get the largest combinational logic depth over all paths that start at a primary input and end at a DFF's D pin.",
         _schema({}),
     ),
     ToolSpec(

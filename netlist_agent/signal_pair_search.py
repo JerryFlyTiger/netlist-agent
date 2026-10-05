@@ -1,5 +1,5 @@
-"""Existential signal-pair search: "does there exist a pair of signals (a, b)
-already in the netlist such that OP(a, b) is functionally equivalent to a
+"""Existential signal-pair search: "is there a pair of existing signals (a, b)
+in the design whose OP(a, b) is functionally equivalent to a
 named target net z?" for OP in {AND, NAND, OR, NOR, XOR, XNOR}.
 
 Real designs in the corpus have on the order of 35k nets, so the naive O(n^2)

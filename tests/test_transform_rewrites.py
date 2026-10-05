@@ -1,6 +1,6 @@
 """Truth-table checks for the fixed-identity rewrites: constant-input
 simplification rules and every basis-decomposition recipe (including the
-verbatim-specified 4-NAND XOR and NOR-only XNOR recipes). Each check builds a
+spec-specified 4-NAND XOR and NOR-only XNOR recipes). Each check builds a
 minimal single-gate synthetic Design, applies the rewrite, and asserts the
 replacement's simulated truth table matches the original gate's, over every
 input combination.
@@ -69,8 +69,8 @@ def test_basis_decomposition_matches_truth_table(basis_name: str, gate_type: Gat
 
 
 def test_nand_xor_uses_exactly_four_nands() -> None:
-    """Spec calls out this exact recipe verbatim: "each 2-input XOR can be
-    realized with 4 NAND gates"."""
+    """Spec calls out this recipe (paraphrased here): an XOR of two inputs is
+    built from exactly 4 NAND gates."""
     design = _make_gate_design(GateType.XOR)
     remap_to_basis(design, "nand_not")
     types = [g.gate_type for g in design.gates]
@@ -79,8 +79,8 @@ def test_nand_xor_uses_exactly_four_nands() -> None:
 
 
 def test_nor_xnor_is_nor_only() -> None:
-    """Spec calls out this exact recipe verbatim: "convert every XNOR to an
-    equivalent NOR-only implementation"."""
+    """Spec calls out this recipe (paraphrased here): convert every XNOR to an
+    equivalent NOR-only implementation."""
     design = _make_gate_design(GateType.XNOR)
     remap_to_basis(design, "nor_not")
     types = [g.gate_type for g in design.gates]

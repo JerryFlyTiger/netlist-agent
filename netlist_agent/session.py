@@ -132,7 +132,7 @@ class Session:
 
     # Headline floating-input/unconnected-output-port count from the most
     # recent "check for floating inputs/unconnected output ports" query --
-    # consumed by a "how many floating signals were found?" follow-up
+    # consumed by the floating-signals count follow-up (`_h_floating_signals_count`)
     # without recomputing anything. `None` (as opposed to `last_op_count`'s
     # docstring-specified transform-count semantics -- deliberately NOT
     # reused here) distinguishes "no such query has run yet this session"
@@ -141,8 +141,8 @@ class Session:
 
     # Headline "flip-flops formally proven to have an enable/hold structure
     # in their D input logic" count (`EnableHoldResult.proven_hold`) from
-    # the most recent enable/hold check -- consumed by a "how many
-    # flip-flops were found to have enable or hold structures?" follow-up
+    # the most recent enable/hold check -- consumed by the enable/hold count
+    # follow-up (`_h_enable_hold_count`)
     # without recomputing anything. A dedicated field rather than reusing
     # `last_op_count` for the same reason `last_floating_count` isn't
     # reused either (see its docstring just above): `last_op_count` is

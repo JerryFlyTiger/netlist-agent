@@ -675,8 +675,8 @@ def limit_fanout(design: Design, max_fanout: int) -> int:
 
 
 def limit_fanout_net(design: Design, net_name: str, max_fanout: int, bit: Optional[int] = None) -> int:
-    """Same as `limit_fanout`, restricted to one named net (e.g. "insert
-    buffers on the reset signal n1 to reduce its fanout to at most 4 loads").
+    """Same as `limit_fanout`, restricted to one named net (e.g. buffering the
+    reset net n1 so that it drives no more than 4 loads).
     """
     if max_fanout < 1:
         raise ValueError("max_fanout must be >= 1")

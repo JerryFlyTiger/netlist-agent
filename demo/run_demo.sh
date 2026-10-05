@@ -156,7 +156,7 @@ case "$MODE" in
     dim  "  What is the design's maximum combinational logic depth?"
     dim  "  Which PI drives the most gates in this design?"
     dim  "  Collapse any back-to-back inverter pairs into a direct wire connection."
-    dim  "  Check that the current netlist is still equivalent to the netlist as last loaded from disk."
+    dim  "  Is the current design still functionally equivalent to the original?"
     dim  "  Write out the current design as ${CASE}_out.v."
     dim  ""
     dim  "This public build has no rule-based router: every request above is answered by"

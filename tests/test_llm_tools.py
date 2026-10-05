@@ -952,8 +952,8 @@ def test_cut_tools_no_path_still_carries_both_keys(tmp_path) -> None:
 
     This branch is not an edge case dredged up for completeness: it is the
     one the released corpus actually takes. The 0813 release's only
-    articulation-point request (test82 line 6, "Find all articulation points
-    in the combinational graph between n2 and n14") returns path_exists=False,
+    articulation-point request (test82 line 6, a request to list the
+    articulation points separating n2 from n14 in the combinational logic) returns path_exists=False,
     so the success branch above never runs there and this branch is the whole
     of A87's corpus-level exposure. A knife that dropped `cut_gates` here
     survived the whole suite on 2026-09-04, which is why this exists.
@@ -1547,8 +1547,8 @@ def test_get_last_operation_summary_after_rule_routed_mutation(tmp_path) -> None
 
     body = handle_request(
         session,
-        "Find and merge all gate pairs in the design that are functionally equivalent (produce the same "
-        "function). Make sure nothing changes functionally.",
+        "Please merge all gate pairs in this design that are functionally equivalent, "
+        "keeping the behavior unchanged.",
         _no_fallback,
     )
     assert session.last_op_count == 1
@@ -1610,8 +1610,8 @@ def test_do_deduplicate_gates_refuses_a_rerun_by_default_and_performs_no_mutatio
 
     handle_request(
         session,
-        "Find and merge all gate pairs in the design that are functionally equivalent (produce the same "
-        "function). Make sure nothing changes functionally.",
+        "Please merge all gate pairs in this design that are functionally equivalent, "
+        "keeping the behavior unchanged.",
         _no_fallback,
     )
     assert session.last_op_count == 1
@@ -1729,8 +1729,8 @@ def test_a_different_kind_of_operation_is_not_flagged_as_a_rerun(tmp_path) -> No
 
     handle_request(
         session,
-        "Find and merge all gate pairs in the design that are functionally equivalent (produce the same "
-        "function). Make sure nothing changes functionally.",
+        "Please merge all gate pairs in this design that are functionally equivalent, "
+        "keeping the behavior unchanged.",
         _no_fallback,
     )
     assert session.last_op_kind == "deduplicate_gates"
@@ -1765,8 +1765,8 @@ def test_get_last_operation_summary_reports_unaffected_by_this_turns_tool_calls(
 
     handle_request(
         session,
-        "Find and merge all gate pairs in the design that are functionally equivalent (produce the same "
-        "function). Make sure nothing changes functionally.",
+        "Please merge all gate pairs in this design that are functionally equivalent, "
+        "keeping the behavior unchanged.",
         _no_fallback,
     )
     summary_before = TOOL_REGISTRY["get_last_operation_summary"](session)

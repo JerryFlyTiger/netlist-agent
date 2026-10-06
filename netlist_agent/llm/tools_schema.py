@@ -1952,7 +1952,8 @@ TOOL_SCHEMA: list[ToolSpec] = [
     ToolSpec(
         "check_property_asserted_only_when",
         "Verify that a named output is asserted (1) only when a given condition holds, across every "
-        "input and register state; if the property fails, returns a concrete counterexample assignment.",
+        "input and register state; if the property fails, returns a concrete counterexample assignment "
+        "(holds=false with an empty assignment object means every input and register state violates it).",
         _schema(
             {
                 "signal": _s(_NET_DESC),

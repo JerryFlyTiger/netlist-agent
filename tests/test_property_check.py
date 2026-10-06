@@ -92,6 +92,32 @@ def test_parse_counterexample_bus_bit_names() -> None:
     }
 
 
+def test_parse_counterexample_keeps_dotted_and_dollar_names_verbatim() -> None:
+    detail = "Verification failed.\nInput pattern:  a=0 __dff_Q__u1.r_reg=1 x$y=0 b.x[3]=1"
+    assert parse_counterexample(detail) == {"a": 0, "__dff_Q__u1.r_reg": 1, "x$y": 0, "b.x[3]": 1}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["a=0 b=2", "a=0 junk", "a=0 =1", "a=0 b=", "a:0", "a=0 b=1x", "a=0 b=01", "a=0 b=10", "a=0=1"],
+)
+def test_parse_counterexample_any_bad_token_is_plain_valueerror(bad: str) -> None:
+    with pytest.raises(ValueError) as ei:
+        parse_counterexample(f"Verification failed.\nInput pattern:  {bad}")
+    assert not isinstance(ei.value, EmptyInputPatternError)
+
+
+def test_parse_counterexample_duplicate_key_raises() -> None:
+    with pytest.raises(ValueError, match="twice") as ei:
+        parse_counterexample("Verification failed.\nInput pattern:  a=0 a=1")
+    assert not isinstance(ei.value, EmptyInputPatternError)
+
+
+def test_parse_counterexample_whitespace_only_is_still_empty_pattern_error() -> None:
+    with pytest.raises(EmptyInputPatternError):
+        parse_counterexample("Verification failed.\nInput pattern:   \t \nTime = 0.00 sec")
+
+
 # ----------------------------------------------------------------------
 # check_asserted_only_when: end-to-end, both directions
 # ----------------------------------------------------------------------
@@ -470,3 +496,36 @@ def test_check_asserted_only_when_dff_single_literal_maps_name_and_caveat(abc_de
     assert not any("__dff_Q__" in k for k in result.assignment)
     values = simulate(design, inputs={NetBit("clk"): 0, NetBit("rn"): 1}, dff_q={NetBit("busy"): 1})
     assert values[NetBit("done")] == 1
+
+
+# ----------------------------------------------------------------------
+# Batch 10: dotted DFF instance name (bypassing the rename entry guard) must
+# still give the right key and keep the free_pi caveat.
+# ----------------------------------------------------------------------
+
+_DOT_NETLIST = """module top(clk, a, b, y);
+  input clk, a, b;
+  output y;
+  wire q, n1;
+  dff r1(.RN(1'b1), .SN(1'b1), .CK(clk), .D(a), .Q(q));
+  and g1(n1, q, b);
+  buf g2(y, n1);
+endmodule
+"""
+
+
+def test_dotted_dff_instance_name_keeps_key_and_caveat(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from netlist_agent.parser import parse_verilog
+
+    path = tmp_path / "dot.v"
+    path.write_text(_DOT_NETLIST)
+    design = parse_verilog(str(path))
+    gate = next(g for g in design.gates if g.inst_name == "r1")
+    gate.inst_name = "u1.r_reg"  # bypasses the entry-point name guard on purpose
+    design._gate_index = {}
+
+    result = check_asserted_only_when(design, "y", "a is 1")
+    assert result.holds is False
+    assert result.assignment == {"a": 0, "b": 1, "q": 1}
+    assert not any("__dff_Q__" in k for k in result.assignment)
+    assert result.caveat is not None

@@ -2,9 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union
+
+
+# A name this project may GIVE to a net or gate instance: a simple ASCII
+# identifier. This is the entry guard; the parsing side has its own strict
+# parsing in `property_check.parse_counterexample`. `$` is legal Verilog and
+# both ABC and iverilog accept it; it is rejected only because this project's
+# parser (`\w+`) cannot read it back. Non-ASCII is rejected because iverilog
+# cannot read such output; the parser's `\w` admits `aé`/`a²`, but they are
+# not legal Verilog.
+VALID_NEW_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class InvalidNameError(ValueError):
+    """`check_new_name` rejected a name (as opposed to a name collision)."""
+
+
+def check_new_name(new_name: str) -> None:
+    """Raise `InvalidNameError` (a `ValueError`) unless `new_name` is a simple identifier."""
+    if not isinstance(new_name, str) or VALID_NEW_NAME_RE.fullmatch(new_name) is None:
+        raise InvalidNameError(f"invalid name {new_name!r}: must match {VALID_NEW_NAME_RE.pattern}")
 
 
 class Direction(Enum):
@@ -288,6 +309,7 @@ class Design:
         """
         if old_name not in self.signals:
             raise KeyError(f"no such signal: {old_name!r}")
+        check_new_name(new_name)
         if new_name != old_name and new_name in self.signals:
             raise ValueError(f"signal name already in use: {new_name!r}")
         sig = self.signals.pop(old_name)

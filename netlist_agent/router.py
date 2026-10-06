@@ -29,7 +29,7 @@ import os
 import re
 from typing import Callable, Optional
 
-from netlist_agent.ir import Design, GateType, NetBit
+from netlist_agent.ir import Design, GateType, NetBit, check_new_name
 from netlist_agent.netref import netbit_token as _netbit_token
 from netlist_agent.session import Session
 
@@ -136,6 +136,7 @@ def _rename_gate_instance(design: Design, old_name: str, new_name: str) -> None:
     gate = next((g for g in design.gates if g.inst_name == old_name), None)
     if gate is None:
         raise KeyError(f"no such gate: {old_name!r}")
+    check_new_name(new_name)
     if new_name != old_name and any(g.inst_name == new_name for g in design.gates):
         raise ValueError(f"gate name already in use: {new_name!r}")
     gate.inst_name = new_name

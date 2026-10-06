@@ -61,14 +61,15 @@ _INPUT_PATTERN_RE = re.compile(r"Input pattern:[ \t]*(.*)")
 # (a bus PI is ONE word `name = W'hHEX`, not per-bit), items joined by ", ".
 _INPUT_LINE_RE = re.compile(r"INPUT: (.*?)\.  OUTPUT:", re.S)
 _INPUT_ITEM_RE = re.compile(r"(\S+) = (\d+)'h([0-9a-fA-F]+)")
-# ABC names individual bus bits like "n0[7]" (confirmed by real output on a
-# multi-bit-PI design, e.g. `Input pattern:  n0[7]=0 n0[0]=0 ...`), not just
-# bare single-bit names like the module docstring's own worked example
-# ("a=1 b=0") -- the bracket suffix must be captured too, or a bus-PI
-# design's counterexample line fails to parse at all (see
-# `parse_counterexample`'s docstring: that must be a loud error, and it was,
-# until this pattern was widened to match this real case).
-_PI_ASSIGN_RE = re.compile(r"(\w+(?:\[\d+\])?)=([01])")
+# One token of ABC's "Input pattern:" line: `<name>=<0|1>`, where <name> is
+# ANY run of non-space, non-`=` characters, kept verbatim (a bus bit prints as
+# "n0[7]", a DFF state PI as "__dff_Q__u1.r_reg"). It is applied with
+# `fullmatch` to each whitespace-separated token, NOT with `findall` over the
+# whole line: a `\w+`-based `findall` silently matches only the trailing `\w`
+# run of a name containing `.`/`$`/`\` ("u1.r_reg=1" -> "r_reg"), which gives
+# a wrong key (or a lost DFF-state caveat) with no error. A token that does
+# not fit must be a loud ValueError, never a partial result.
+_PI_ASSIGN_RE = re.compile(r"([^\s=]+)=([01])")
 
 _VALUE_MAP = {"0": 0, "1": 1, "low": 0, "high": 1}
 
@@ -116,7 +117,11 @@ def parse_counterexample(detail: str) -> dict[str, int]:
     0/1} dict. Raises `ValueError` -- never silently returns an empty/partial
     result -- if the line is missing or has no parseable assignments, so a
     format this hasn't been tested against fails loudly instead of being
-    guessed at.
+    guessed at. The line is split on whitespace and EVERY token must be
+    `<name>=<0|1>` (name kept verbatim, may contain `.`, `$`, `[n]`); any
+    other token, or a name assigned twice, raises plain `ValueError`. It is
+    deliberately not a word-character `findall`, which would keep only the tail of a
+    name such as "u1.r_reg" and return a wrong key without any error.
 
     A line that is present but whitespace-only raises the subclass
     `EmptyInputPatternError` (a line with non-assignment content raises plain
@@ -129,14 +134,20 @@ def parse_counterexample(detail: str) -> dict[str, int]:
     m = _INPUT_PATTERN_RE.search(detail)
     if not m:
         raise ValueError(f"no 'Input pattern:' line found in ABC output: {detail!r}")
-    content = m.group(1)
-    assignments = {name: int(val) for name, val in _PI_ASSIGN_RE.findall(content)}
-    if not assignments:
-        if content.strip():
-            # Something is on the line but nothing parses: an unknown format,
-            # not ABC's genuinely empty pattern. Fail loudly as before.
-            raise ValueError(f"'Input pattern:' line had unparseable content: {detail!r}")
+    tokens = m.group(1).split()
+    if not tokens:
         raise EmptyInputPatternError(f"'Input pattern:' line had no parseable assignments: {detail!r}")
+    assignments: dict[str, int] = {}
+    for tok in tokens:
+        tm = _PI_ASSIGN_RE.fullmatch(tok)
+        if tm is None:
+            # Something is on the line but it is not `<name>=<0|1>`: an unknown
+            # format, not ABC's genuinely empty pattern. Fail loudly.
+            raise ValueError(f"'Input pattern:' line had unparseable token {tok!r}: {detail!r}")
+        name = tm.group(1)
+        if name in assignments:
+            raise ValueError(f"'Input pattern:' line assigns {name!r} twice: {detail!r}")
+        assignments[name] = int(tm.group(2))
     return assignments
 
 

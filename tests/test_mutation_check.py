@@ -18,6 +18,7 @@ import json
 import os
 import py_compile
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -966,10 +967,8 @@ def _write_misfire_project(tmp_path):
     )
 
 
-def _run_tool(tmp_path, knives):
-    """The tool resolves `knife["file"]` against the directory ABOVE its own
-    location, so it has to be copied into the synthetic project rather than
-    invoked from the real repo -- same arrangement the .pyc tests above use."""
+def _install_tool(tmp_path, knives):
+    """Copy the tool and the `.venv/bin/python` shim into the synthetic project."""
     (tmp_path / "scripts").mkdir(exist_ok=True)
     shutil.copy2(mutation_check.__file__, tmp_path / "scripts" / "mutation_check.py")
     # The tool shells out to `.venv/bin/python` by name, so the synthetic
@@ -980,13 +979,25 @@ def _run_tool(tmp_path, knives):
     wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     (tmp_path / "knives.json").write_text(json.dumps(knives))
-    proc = subprocess.run(
+
+
+def _run_tool_proc(tmp_path, knives, env=None):
+    """The tool resolves `knife["file"]` against the directory ABOVE its own
+    location, so it has to be copied into the synthetic project rather than
+    invoked from the real repo -- same arrangement the .pyc tests above use."""
+    _install_tool(tmp_path, knives)
+    return subprocess.run(
         [sys.executable, "scripts/mutation_check.py", "knives.json", "--tests", "tests/test_m.py"],
         cwd=str(tmp_path),
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
+
+
+def _run_tool(tmp_path, knives):
+    proc = _run_tool_proc(tmp_path, knives)
     return proc.stdout + proc.stderr
 
 
@@ -1046,6 +1057,8 @@ def test_a_knife_that_reddens_its_intended_test_is_still_KILLED(tmp_path):
     assert "KILLED" in out, out
     assert "MISFIRED" not in out, out
     assert "1/1 killed" in out, out
+    # A finished run clears its inflight marker. Mutation: never unlink it.
+    assert not (tmp_path / ".mutation_check_inflight.json").exists()
 
 
 def test_a_knife_without_expect_red_keeps_the_old_behaviour(tmp_path):
@@ -1059,3 +1072,690 @@ def test_a_knife_without_expect_red_keeps_the_old_behaviour(tmp_path):
     )
     assert "KILLED" in out, out
     assert "MISFIRED" not in out, out
+
+
+# --- interruption: restore on SIGTERM/SIGHUP/SIGQUIT, marker for SIGKILL -----
+
+_MARKER = ".mutation_check_inflight.json"
+
+
+def _write_sleepy_project(tmp_path):
+    """pkg/m.py `> 3`; the test file writes $SENTINEL and sleeps once it sees
+    the knife's text (`> 300`) on disk, so the parent knows the knife is down
+    without guessing at timing."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "m.py").write_text("def big(q):\n    return len(q) > 3\n")
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_m.py").write_text(
+        "import os, sys, time\n"
+        "root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n"
+        "sys.path.insert(0, root)\n"
+        "if '> 300' in open(os.path.join(root, 'pkg', 'm.py')).read():\n"
+        "    open(os.environ['SENTINEL'], 'w').write('x')\n"
+        "    time.sleep(120)\n"
+        "from pkg.m import big\n"
+        "\n"
+        "def test_big():\n"
+        "    assert big('abcd')\n"
+    )
+    return [{"name": "raise threshold", "file": "pkg/m.py", "old": "> 3", "new": "> 300"}]
+
+
+def _child_signals_to_default():
+    """preexec_fn: undo any SIG_IGN inherited from a pytest started under
+    `nohup`, so the tool sees the dispositions a normal shell would give it."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(sig, signal.SIG_DFL)
+
+
+def _start_tool_in_own_session(tmp_path, knives, preexec_fn=None):
+    """Start the tool in its own session; return (Popen, sentinel, tmpdir).
+    The sentinel file appears once the knife is applied; the caller waits for
+    it and must kill the group in `finally`. The child starts with default
+    INT/TERM/HUP/QUIT dispositions (then `preexec_fn`, if any, runs)."""
+
+    def _preexec():
+        _child_signals_to_default()
+        if preexec_fn is not None:
+            preexec_fn()
+
+    _install_tool(tmp_path, knives)
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    sentinel = tmp_path / "sentinel"
+    env = dict(os.environ, SENTINEL=str(sentinel), TMPDIR=str(tmpdir))
+    with open(tmp_path / "out.log", "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "scripts/mutation_check.py", "knives.json", "--tests", "tests/test_m.py"],
+            cwd=str(tmp_path),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=_preexec,
+        )
+    return proc, sentinel, tmpdir
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait(timeout=30)
+
+
+def _wait_for(path, proc, seconds=60):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT])
+def test_fatal_signal_restores_target_and_leaves_no_marker_or_backup(tmp_path, sig):
+    """T1/T2 (+T3 mid-run half). Mutations that turn this red: remove the
+    SIGTERM, SIGHUP or SIGQUIT handler install in main() (drop SIGQUIT from
+    _CATCH_SIGNALS and the SIGQUIT case turns red); make the handler not raise;
+    do not unlink backups in the finally; do not unlink the marker in the
+    finally; drop the marker write (the mid-run assertion); remove
+    `sys.stdout.reconfigure(line_buffering=True)` (the `[baseline]` line is
+    then still in the buffer when the signal lands)."""
+    knives = _write_sleepy_project(tmp_path)
+    target = tmp_path / "pkg" / "m.py"
+    before = target.read_text()
+    mtime_before = target.stat().st_mtime_ns
+    proc, sentinel, tmpdir = _start_tool_in_own_session(tmp_path, knives)
+    try:
+        assert _wait_for(sentinel, proc), (tmp_path / "out.log").read_text()
+        # R5: output already printed is on disk while the tool is still running.
+        assert "[baseline]" in (tmp_path / "out.log").read_text()
+        # T3: while the knife is down, the marker exists and names the target.
+        marker = tmp_path / _MARKER
+        assert marker.exists()
+        listed = json.loads(marker.read_text())
+        assert str(target) in listed
+        assert "> 300" in target.read_text()
+        proc.send_signal(sig)
+        code = proc.wait(timeout=60)
+    finally:
+        _kill_group(proc)
+    assert code == 128 + sig, (code, (tmp_path / "out.log").read_text())
+    assert target.read_text() == before
+    assert target.stat().st_mtime_ns == mtime_before
+    assert not (tmp_path / _MARKER).exists()
+    assert list(tmpdir.glob("*.bak")) == []
+    assert f"interrupted by {sig.name}" in (tmp_path / "out.log").read_text()
+
+
+def test_leftover_marker_blocks_the_run_and_touches_nothing(tmp_path):
+    """T4. Mutations that turn this red: drop the marker check at startup;
+    make it restore from the listed backup (the .bak below is real and differs
+    from the target, so that is observable). "Print but continue" is NOT caught
+    here (the run then dies on the marker's own "x" open and still exits 2);
+    the test for that is `..._without_falling_into_the_race_backstop`."""
+    knives = _write_sleepy_project(tmp_path)
+    target = tmp_path / "pkg" / "m.py"
+    target.write_text("def big(q):\n    return len(q) > 300  # hand edit\n")
+    before = target.read_text()
+    old_backup = tmp_path / "old.bak"
+    old_backup.write_text("def big(q):\n    return len(q) > 3  # from the killed run\n")
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    (tmp_path / _MARKER).write_text(json.dumps({str(target): str(old_backup)}))
+    proc = _run_tool_proc(tmp_path, knives, env=dict(os.environ, TMPDIR=str(tmpdir)))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert str(target) in out, out
+    assert str(old_backup) in out, out
+    assert "[baseline]" not in out, out
+    assert target.read_text() == before
+    assert "from the killed run" in old_backup.read_text()
+    assert list(tmpdir.glob("*.bak")) == []
+    assert (tmp_path / _MARKER).exists()
+
+
+def test_red_baseline_leaves_no_backup_and_no_marker(tmp_path):
+    """T5. Mutations that turn this red: return from the baseline-red branch
+    outside the try/finally (the old early return); skip the marker unlink."""
+    _write_misfire_project(tmp_path)
+    (tmp_path / "tests" / "test_m.py").write_text("def test_red():\n    assert False\n")
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    target = tmp_path / "pkg" / "m.py"
+    before = target.read_text()
+    proc = _run_tool_proc(
+        tmp_path,
+        [{"name": "k", "file": "pkg/m.py", "old": "(?:design|netlist)", "new": "x"}],
+        env=dict(os.environ, TMPDIR=str(tmpdir)),
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "BASELINE IS RED" in out, out
+    assert list(tmpdir.glob("*.bak")) == []
+    assert not (tmp_path / _MARKER).exists()
+    assert target.read_text() == before
+
+
+def test_signals_are_ignored_during_restore_and_handlers_come_back(tmp_path, monkeypatch, restore_signals):
+    """T6. Runs main() in-process; a wrapper on shutil.copy2 records the
+    SIGINT/SIGTERM/SIGHUP/SIGQUIT dispositions at the moment the RESTORE copy happens
+    (source is a .bak file, destination is the target) -- the code path a
+    second signal would interrupt. Mutations that turn this red: drop the
+    SIG_IGN loop in the finally; drop the handler restore in main()'s finally
+    (the only place it is done); delete the marker before the restore loop
+    (the spy sees it missing)."""
+    _write_misfire_project(tmp_path)
+    monkeypatch.setattr(mutation_check, "_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["mutation_check.py", str(tmp_path / "k.json")])
+    (tmp_path / "k.json").write_text(
+        json.dumps([{"name": "k", "file": "pkg/m.py", "old": "(?:design|netlist)", "new": "x"}])
+    )
+    calls = iter([(0, "ok", []), (1, "red", ["t"])])
+    monkeypatch.setattr(mutation_check, "_run", lambda tests: next(calls))
+    seen = []
+    marker_present = []
+    real_copy2 = shutil.copy2
+
+    def spy(src, dst, *a, **kw):
+        if str(src).endswith(".bak"):
+            marker_present.append((tmp_path / _MARKER).exists())
+            seen.append(_dispositions())
+        return real_copy2(src, dst, *a, **kw)
+
+    monkeypatch.setattr(mutation_check.shutil, "copy2", spy)
+    before = _dispositions()
+    assert mutation_check.main() == 0
+    # One restore after the knife's run, one in the finally; the in-loop
+    # restore (before the finally) legitimately sees the live handlers.
+    assert len(seen) == 2
+    assert seen[-1] == {s: signal.SIG_IGN for s in before}
+    # The marker outlives every restore copy; it goes only after the last.
+    assert marker_present == [True, True]
+    after = _dispositions()
+    assert after == before
+    assert not (tmp_path / _MARKER).exists()
+
+
+# --- round-1 fixes ----------------------------------------------------------
+
+_ALL_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+def _dispositions():
+    return {s: signal.getsignal(s) for s in _ALL_SIGS}
+
+
+@pytest.fixture
+def restore_signals():
+    """Start the test with default dispositions (a pytest run under `nohup`
+    would otherwise hand it SIG_IGN, which main() deliberately respects) and
+    put the originals back afterwards."""
+    before = _dispositions()
+    for sig in _ALL_SIGS:
+        signal.signal(sig, signal.SIG_DFL)
+    yield before
+    for sig, handler in before.items():
+        signal.signal(sig, handler)
+
+
+def _inprocess_project(tmp_path, monkeypatch, knives):
+    _write_misfire_project(tmp_path)
+    monkeypatch.setattr(mutation_check, "_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["mutation_check.py", str(tmp_path / "k.json")])
+    (tmp_path / "k.json").write_text(json.dumps(knives))
+
+
+_OK_KNIFE = {"name": "k", "file": "pkg/m.py", "old": "(?:design|netlist)", "new": "x"}
+
+
+def test_missing_knife_file_fails_before_any_cut_and_leaves_no_trace(tmp_path):
+    """#1/#2. Mutations that turn this red: register the backup before
+    copying it (the finally then writes an empty .bak over / creates the
+    target); drop the OSError report so a traceback replaces the message and
+    exit code."""
+    _write_misfire_project(tmp_path)
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    before = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if "__pycache__" not in p.parts)
+    proc = _run_tool_proc(
+        tmp_path,
+        [{"name": "typo", "file": "pkg/nope.py", "old": "a", "new": "b"}],
+        env=dict(os.environ, TMPDIR=str(tmpdir)),
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "pkg/nope.py" in out and "Traceback" not in out, out
+    assert "[baseline]" not in out, out
+    assert not (tmp_path / "pkg" / "nope.py").exists()
+    assert list(tmpdir.glob("*.bak")) == []
+    assert not (tmp_path / _MARKER).exists()
+    after = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if "__pycache__" not in p.parts)
+    # _install_tool adds scripts/, .venv/ and knives.json; nothing else appears.
+    added = set(after) - set(before)
+    assert all(a.startswith(("scripts", ".venv")) or a == "knives.json" for a in added), added
+
+
+def test_failed_first_backup_copy_keeps_the_original_and_leaves_no_bak(tmp_path, monkeypatch, restore_signals):
+    """#1. Mutations that turn this red: skip unlinking the half-made .bak on
+    failure; the pre-fix code (register before copying AND no cleanup), whose
+    finally restores the empty .bak over the original. Moving the registration
+    ahead of the copy alone does NOT turn it red here: the cleanup deletes the
+    .bak, so the finally's restore fails harmlessly (measured). That variant is
+    caught only when the cleanup also fails -- see
+    `test_a_partial_backup_is_never_registered_even_if_its_cleanup_fails`."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    monkeypatch.setattr(mutation_check.tempfile, "tempdir", str(tmpdir))
+    target = tmp_path / "pkg" / "m.py"
+    before = target.read_text()
+    assert before
+
+    real_copy2 = shutil.copy2
+    calls = []
+
+    def boom(src, dst, *a, **kw):
+        # Only the first (backup) copy fails; later copies behave normally,
+        # so a wrongly registered backup would really overwrite the target.
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return real_copy2(src, dst, *a, **kw)
+
+    monkeypatch.setattr(mutation_check.shutil, "copy2", boom)
+    assert mutation_check.main() == 2
+    assert target.read_text() == before
+    assert list(tmpdir.glob("*.bak")) == []
+    assert not (tmp_path / _MARKER).exists()
+
+
+def test_fatal_handler_ignores_all_four_signals_before_raising(restore_signals):
+    """#3. Mutation that turns this red: remove the SIG_IGN loop at the top of
+    _on_fatal_signal (a second signal could then re-raise during unwinding).
+    The fixture starts the test from default dispositions and restores them."""
+    with pytest.raises(SystemExit) as info:
+        mutation_check._on_fatal_signal(signal.SIGTERM, None)
+    assert info.value.code == 128 + signal.SIGTERM
+    assert _dispositions() == {s: signal.SIG_IGN for s in _ALL_SIGS}
+
+
+def test_an_already_ignored_sighup_stays_ignored_for_the_whole_run(tmp_path, monkeypatch, restore_signals):
+    """#4. Mutation that turns this red: drop the `is signal.SIG_IGN` skip in
+    main() (SIGHUP then gets the tool's handler)."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    seen = []
+
+    def fake_run(tests):
+        seen.append(_dispositions())
+        return (0, "ok", []) if len(seen) == 1 else (1, "red", ["t"])
+
+    monkeypatch.setattr(mutation_check, "_run", fake_run)
+    assert mutation_check.main() == 0
+    assert seen[0][signal.SIGHUP] is signal.SIG_IGN
+    assert seen[0][signal.SIGTERM] is mutation_check._on_fatal_signal
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+
+
+def test_sighup_under_an_ignoring_parent_does_not_stop_the_run(tmp_path):
+    """#4 end to end (nohup shape). Mutation that turns this red: drop the
+    `is signal.SIG_IGN` skip -- the HUP then ends the run with 129."""
+    knives = _write_sleepy_project(tmp_path)
+    (tmp_path / "tests" / "test_m.py").write_text(
+        "import os, sys, time\n"
+        "root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n"
+        "sys.path.insert(0, root)\n"
+        "if '> 300' in open(os.path.join(root, 'pkg', 'm.py')).read():\n"
+        "    open(os.environ['SENTINEL'], 'w').write('x')\n"
+        "    time.sleep(3)\n"
+        "from pkg.m import big\n"
+        "\n"
+        "def test_big():\n"
+        "    assert big('abcd')\n"
+    )
+    proc, sentinel, tmpdir = _start_tool_in_own_session(
+        tmp_path, knives, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    )
+    try:
+        assert _wait_for(sentinel, proc), (tmp_path / "out.log").read_text()
+        proc.send_signal(signal.SIGHUP)
+        code = proc.wait(timeout=60)
+    finally:
+        _kill_group(proc)
+    log = (tmp_path / "out.log").read_text()
+    assert code == 0, (code, log)
+    assert "interrupted by" not in log
+    assert "1/1 killed" in log, log
+
+
+def test_a_marker_that_is_not_an_object_is_printed_raw(tmp_path):
+    """#6. Mutation that turns this red: call `.items()` on whatever the marker
+    parsed to (AttributeError traceback), or print nothing about its content."""
+    knives = _write_sleepy_project(tmp_path)
+    (tmp_path / _MARKER).write_text('["pkg/m.py"]')
+    proc = _run_tool_proc(tmp_path, knives)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 2, out
+    assert "Traceback" not in out, out
+    assert '["pkg/m.py"]' in out, out
+    (tmp_path / _MARKER).write_text("{not json")
+    proc = _run_tool_proc(tmp_path, knives)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 2 and "{not json" in out and "Traceback" not in out, out
+
+
+def test_a_partly_written_marker_is_still_removed_after_a_clean_unwind(tmp_path, monkeypatch, restore_signals):
+    """#5. Mutation that turns this red: gate the marker unlink on a flag set
+    only after json.dump finishes (a dump that dies midway then leaves the
+    marker behind although every file was restored)."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    target = tmp_path / "pkg" / "m.py"
+    before = target.read_text()
+
+    def bad_dump(obj, handle, *a, **kw):
+        handle.write("{")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mutation_check.json, "dump", bad_dump)
+    with pytest.raises(OSError):
+        mutation_check.main()
+    assert target.read_text() == before
+    assert not (tmp_path / _MARKER).exists()
+
+
+def test_existing_marker_is_not_deleted_by_a_run_that_lost_the_race(tmp_path, monkeypatch, restore_signals):
+    """#5. Mutations that turn this red: open the marker with "w" instead of
+    "x" (the other run's marker is overwritten); unlink the marker without
+    having created it."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    marker = tmp_path / _MARKER
+    real_mkstemp = mutation_check.tempfile.mkstemp
+
+    def mkstemp_then_rival(*a, **kw):
+        # The startup check has passed; a rival run now creates its marker.
+        marker.write_text("{}")
+        return real_mkstemp(*a, **kw)
+
+    monkeypatch.setattr(mutation_check.tempfile, "mkstemp", mkstemp_then_rival)
+    monkeypatch.setattr(mutation_check, "_run", lambda tests: (0, "ok", []))
+    assert mutation_check.main() == 2
+    assert marker.read_text() == "{}"
+
+
+def test_restore_failure_is_reported_keeps_that_backup_and_the_marker_and_exits_3(tmp_path, monkeypatch, restore_signals, capsys):
+    """#9 + exit code. Normal return (no signal): knife b's run is the last one;
+    from then on every restore copy onto m.py fails, so only the finally's
+    restore of m.py fails (no counting of copy2 calls). The unlink of n.py's
+    backup also fails and must not matter. Mutations that turn
+    this red: drop `restored_all = False` (marker deleted, exit 0); return 0
+    instead of 3; unlink the backup even when its copy failed. (Counting an
+    unlink failure as a restore failure is NOT caught here, since m.py's
+    failure already forces exit 3 and keeps the marker; that is
+    `test_only_an_unlink_failure_still_removes_the_marker`.)"""
+    _write_misfire_project(tmp_path)
+    (tmp_path / "pkg" / "n.py").write_text("X = 1\n")
+    monkeypatch.setattr(mutation_check, "_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["mutation_check.py", str(tmp_path / "k.json")])
+    (tmp_path / "k.json").write_text(
+        json.dumps(
+            [
+                {"name": "a", "file": "pkg/m.py", "old": "(?:design|netlist)", "new": "x"},
+                {"name": "b", "file": "pkg/n.py", "old": "X = 1", "new": "X = 2"},
+            ]
+        )
+    )
+    m, n = tmp_path / "pkg" / "m.py", tmp_path / "pkg" / "n.py"
+    n_before = n.read_text()
+    state = {"runs": 0, "last_run_started": False}
+
+    def fake_run(tests):
+        state["runs"] += 1
+        if state["runs"] == 3:
+            state["last_run_started"] = True
+        return (0, "ok", []) if state["runs"] == 1 else (1, "red", ["t"])
+
+    real_copy2, real_unlink = shutil.copy2, os.unlink
+    backup_of = {}
+
+    def flaky_copy2(src, dst, *a, **kw):
+        if str(dst).endswith(".bak"):
+            backup_of[str(src)] = str(dst)
+        if state["last_run_started"] and str(dst) == str(m) and str(src).endswith(".bak"):
+            raise OSError("no space")
+        return real_copy2(src, dst, *a, **kw)
+
+    def flaky_unlink(path, *a, **kw):
+        if str(path) == backup_of.get(str(n)):
+            raise OSError("busy")
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(mutation_check, "_run", fake_run)
+    monkeypatch.setattr(mutation_check.shutil, "copy2", flaky_copy2)
+    monkeypatch.setattr(mutation_check.os, "unlink", flaky_unlink)
+    assert mutation_check.main() == 3
+    err = capsys.readouterr().err
+    assert f"RESTORE FAILED for {m}" in err, err
+    assert f"RESTORE FAILED for {n}" not in err, err
+    assert os.path.exists(backup_of[str(m)])
+    assert (tmp_path / _MARKER).exists()
+    assert n.read_text() == n_before
+
+
+def test_a_clean_run_exits_0(tmp_path, monkeypatch, restore_signals):
+    """Exit-code pair for the test above. Mutation that turns this red: make
+    the final return unconditional 3."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    runs = iter([(0, "ok", []), (1, "red", ["t"])])
+    monkeypatch.setattr(mutation_check, "_run", lambda tests: next(runs))
+    assert mutation_check.main() == 0
+
+
+# --- round-2 fixes ----------------------------------------------------------
+
+
+def test_a_partial_backup_is_never_registered_even_if_its_cleanup_fails(tmp_path, monkeypatch, restore_signals, capsys):
+    """Mutations that turn this red: register the backup before copying it
+    (with the cleanup failing, the finally would write the half-made .bak over
+    the original -- here the .bak is the partial copy, so the target must
+    still equal `before` and no RESTORE FAILED may be printed)."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    target = tmp_path / "pkg" / "m.py"
+    before = target.read_text()
+    real_copy2, real_unlink = shutil.copy2, os.unlink
+    first = []
+
+    def boom(src, dst, *a, **kw):
+        if not first:
+            first.append(1)
+            raise OSError("disk full")
+        return real_copy2(src, dst, *a, **kw)
+
+    def stuck_unlink(path, *a, **kw):
+        if str(path).endswith(".bak"):
+            raise OSError("busy")
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(mutation_check.shutil, "copy2", boom)
+    monkeypatch.setattr(mutation_check.os, "unlink", stuck_unlink)
+    assert mutation_check.main() == 2
+    assert target.read_text() == before
+    assert "RESTORE FAILED" not in capsys.readouterr().err
+
+
+def test_a_failed_restore_does_not_stop_the_loop_while_a_later_file_is_still_cut(tmp_path, monkeypatch, restore_signals, capsys):
+    """A signal lands while knife b's file is cut; the finally's restore of
+    m.py fails. Mutations that turn this red: stop the restore loop at the
+    first failure (n.py stays mutated); drop the marker keep-on-failure."""
+    _write_misfire_project(tmp_path)
+    (tmp_path / "pkg" / "n.py").write_text("X = 1\n")
+    monkeypatch.setattr(mutation_check, "_ROOT", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["mutation_check.py", str(tmp_path / "k.json")])
+    (tmp_path / "k.json").write_text(json.dumps([
+        {"name": "a", "file": "pkg/m.py", "old": "(?:design|netlist)", "new": "x"},
+        {"name": "b", "file": "pkg/n.py", "old": "X = 1", "new": "X = 2"},
+    ]))
+    m, n = tmp_path / "pkg" / "m.py", tmp_path / "pkg" / "n.py"
+    n_before = n.read_text()
+    state = {"runs": 0}
+
+    def fake_run(tests):
+        state["runs"] += 1
+        if state["runs"] == 3:  # knife b is on disk; a signal lands now
+            assert n.read_text() != n_before
+            raise SystemExit(143)
+        return (0, "ok", []) if state["runs"] == 1 else (1, "red", ["t"])
+
+    real_copy2 = shutil.copy2
+    restores_of_m = []
+
+    def flaky(src, dst, *a, **kw):
+        if str(dst) == str(m) and str(src).endswith(".bak"):
+            restores_of_m.append(1)
+            if len(restores_of_m) == 2:
+                raise OSError("no space")
+        return real_copy2(src, dst, *a, **kw)
+
+    monkeypatch.setattr(mutation_check, "_run", fake_run)
+    monkeypatch.setattr(mutation_check.shutil, "copy2", flaky)
+    with pytest.raises(SystemExit):
+        mutation_check.main()
+    assert f"RESTORE FAILED for {m}" in capsys.readouterr().err
+    assert n.read_text() == n_before
+    assert (tmp_path / _MARKER).exists()
+
+
+def test_only_an_unlink_failure_still_removes_the_marker(tmp_path, monkeypatch, restore_signals, capsys):
+    """Mutation that turns this red: count a failed backup unlink as a failed
+    restore (RESTORE FAILED printed, marker kept, exit 3)."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    real_unlink = os.unlink
+    runs = iter([(0, "ok", []), (1, "red", ["t"])])
+    monkeypatch.setattr(mutation_check, "_run", lambda tests: next(runs))
+
+    def stuck_unlink(path, *a, **kw):
+        if str(path).endswith(".bak"):
+            raise OSError("busy")
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(mutation_check.os, "unlink", stuck_unlink)
+    assert mutation_check.main() == 0
+    assert "RESTORE FAILED" not in capsys.readouterr().err
+    assert not (tmp_path / _MARKER).exists()
+
+
+def test_a_leftover_marker_refuses_without_falling_into_the_race_backstop(tmp_path):
+    """Mutation that turns this red: make the startup check print but carry on
+    (the run then trips over the marker's "x" open and reports "appeared while
+    starting" -- still exit 2, so only the message tells them apart)."""
+    knives = _write_sleepy_project(tmp_path)
+    (tmp_path / _MARKER).write_text(json.dumps({"x": "y"}))
+    proc = _run_tool_proc(tmp_path, knives)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 2, out
+    assert "appeared while starting" not in out, out
+
+
+def test_a_dead_stderr_does_not_stop_the_handler_from_raising(restore_signals, monkeypatch):
+    """Mutation that turns this red: let `_say` re-raise the OSError."""
+
+    class Dead:
+        def write(self, s):
+            raise BrokenPipeError
+
+        def flush(self):
+            raise BrokenPipeError
+
+    monkeypatch.setattr(sys, "stderr", Dead())
+    with pytest.raises(SystemExit):
+        mutation_check._on_fatal_signal(signal.SIGTERM, None)
+
+
+def test_an_already_ignored_sigterm_stays_ignored(tmp_path, monkeypatch, restore_signals):
+    """Mutation that turns this red: apply the SIG_IGN skip to SIGHUP only."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    seen = []
+
+    def fake_run(tests):
+        seen.append(_dispositions())
+        return (0, "ok", []) if len(seen) == 1 else (1, "red", ["t"])
+
+    monkeypatch.setattr(mutation_check, "_run", fake_run)
+    assert mutation_check.main() == 0
+    assert seen[0][signal.SIGTERM] is signal.SIG_IGN
+    assert seen[0][signal.SIGHUP] is mutation_check._on_fatal_signal
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+
+
+def test_a_signal_during_the_backup_copy_leaves_no_bak(tmp_path, monkeypatch, restore_signals):
+    """Mutation that turns this red: narrow the backup `except BaseException`
+    to `except OSError` (the SystemExit then skips the .bak cleanup)."""
+    _inprocess_project(tmp_path, monkeypatch, [_OK_KNIFE])
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    monkeypatch.setattr(mutation_check.tempfile, "tempdir", str(tmpdir))
+    target = tmp_path / "pkg" / "m.py"
+    before = target.read_text()
+
+    def boom(src, dst, *a, **kw):
+        raise SystemExit(143)
+
+    monkeypatch.setattr(mutation_check.shutil, "copy2", boom)
+    with pytest.raises(SystemExit):
+        mutation_check.main()
+    assert target.read_text() == before
+    assert list(tmpdir.glob("*.bak")) == []
+    assert not (tmp_path / _MARKER).exists()
+
+
+# --- round-3 fixes ----------------------------------------------------------
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only mode")
+def test_a_real_restore_failure_right_after_a_knife_is_loud_and_keeps_the_marker(tmp_path):
+    """The real shape of a failed restore, with nothing mocked: the suite run
+    under the knife makes the target read-only, so the copy right after the
+    knife fails, and so does the one in the finally. The run must exit non-zero
+    (here 1, from the traceback -- not the 3 of a finally-only failure), say
+    RESTORE FAILED, and keep the marker and the backup. Mutations that turn
+    this red: drop `restored_all = False` in the finally (marker deleted);
+    unlink the backup even when its copy failed; catch the in-loop copy's
+    error and carry on (the finally then fails too: exit 3, no traceback)."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    target = tmp_path / "pkg" / "m.py"
+    target.write_text("def big(q):\n    return len(q) > 3\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_m.py").write_text(
+        "import os, sys\n"
+        "root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n"
+        "sys.path.insert(0, root)\n"
+        "m = os.path.join(root, 'pkg', 'm.py')\n"
+        "if '> 300' in open(m).read():\n"
+        "    os.chmod(m, 0o444)\n"
+        "from pkg.m import big\n"
+        "\n"
+        "def test_big():\n"
+        "    assert big('abcd')\n"
+    )
+    tmpdir = tmp_path / "tooltmp"
+    tmpdir.mkdir()
+    knives = [{"name": "raise threshold", "file": "pkg/m.py", "old": "> 3", "new": "> 300"}]
+    try:
+        proc = _run_tool_proc(tmp_path, knives, env=dict(os.environ, TMPDIR=str(tmpdir)))
+    finally:
+        os.chmod(target, 0o644)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "RESTORE FAILED" in out
+    assert "PermissionError" in out
+    assert (tmp_path / _MARKER).exists()
+    assert str(target) in json.loads((tmp_path / _MARKER).read_text())
+    assert len(list(tmpdir.glob("*.bak"))) == 1
+    assert "> 300" in target.read_text()

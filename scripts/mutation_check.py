@@ -38,8 +38,22 @@ Write `expect_red` from the intent, before running: name the test that SHOULD
 notice this defect. If you cannot name one, that is the finding -- the defect
 has no observer -- and it is worth knowing before the run rather than after.
 
-Each knife is applied alone, the tests are run, and the file is restored --
-including on exit, so an interrupted run does not leave a mutated tree behind.
+Each knife is applied alone, the tests are run, and the file is restored.
+SIGINT, SIGTERM, SIGHUP and SIGQUIT (what Ctrl-C, `timeout`, a closed terminal
+and Ctrl-\\ send) all unwind through the restore, so those do not leave a
+mutated tree behind.
+Two cases still leave the tree for a human to fix, and both are loud rather
+than silent. Any terminating signal that is not caught (SIGKILL, SIGUSR1, ...)
+can only be reported by the marker below. A restore copy that fails
+(disk full, permissions) is reported as RESTORE FAILED and keeps its backup.
+When the copy right after a knife already fails, the run stops there with a
+traceback and exits 1; when only the final cleanup fails, it exits 3. Either
+way the exit is non-zero, so `... && git commit` does not go on.
+In both cases the tool writes `.mutation_check_inflight.json` before the first
+cut and removes it only after every file is restored, so the next start
+refuses to run while it exists and lists the files to check by hand. A signal
+that was already ignored when the tool started (e.g. SIGHUP under `nohup`) is
+left ignored.
 
 Why this exists rather than "do we have tests for it"
 -----------------------------------------------------
@@ -98,10 +112,41 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_MARKER_NAME = ".mutation_check_inflight.json"
+_CATCH_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+_RESTORE_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+def _say(message: str) -> None:
+    """Print to stderr; a dead stderr must not abort a restore."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def _on_fatal_signal(signum, frame):
+    """Turn SIGTERM/SIGHUP/SIGQUIT into SystemExit so the `finally` in main() runs.
+
+    Python's default for all three is to end the process on the spot,
+    skipping every `finally` -- which left a mutated source file behind. The
+    first thing done here is to ignore all four signals (INT, TERM, HUP,
+    QUIT): a second one arriving while SystemExit unwinds would raise again
+    inside subprocess.run and skip its kill(), delaying the restore until the
+    child ended on its own. main() puts the previous handlers back on the way
+    out.
+    """
+    for sig in _RESTORE_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    name = signal.Signals(signum).name
+    _say(f"interrupted by {name} -- restoring mutated files")
+    raise SystemExit(128 + signum)
 
 
 def _invalidate_bytecode(path: str) -> None:
@@ -249,6 +294,27 @@ def _run(tests: list[str]) -> tuple[int, str, list[str]]:
 
 
 def main() -> int:
+    # Block-buffered stdout (the default when piped to a log) loses every
+    # verdict already printed if the process is killed.
+    sys.stdout.reconfigure(line_buffering=True)
+    saved_handlers = {
+        sig: (signal.getsignal(sig) or signal.SIG_DFL) for sig in _RESTORE_SIGNALS
+    }
+    for sig in _CATCH_SIGNALS:
+        # Someone chose to ignore this one (e.g. `nohup` sets SIGHUP to
+        # SIG_IGN); do not override that choice.
+        if saved_handlers[sig] is signal.SIG_IGN:
+            continue
+        signal.signal(sig, _on_fatal_signal)
+    try:
+        return _main()
+    finally:
+        # The only place the handlers come back, on every way out.
+        for sig, previous in saved_handlers.items():
+            signal.signal(sig, previous)
+
+
+def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("knives", help="JSON list of {name, file, old, new}")
     parser.add_argument(
@@ -277,31 +343,89 @@ def main() -> int:
     with open(args.knives) as handle:
         knives = json.load(handle)
 
+    marker = os.path.join(_ROOT, _MARKER_NAME)
+    if os.path.exists(marker):
+        # Do not touch anything: the user may have edited these files by hand
+        # since the killed run, and restoring from an old backup would undo it.
+        raw = ""
+        listed = None
+        try:
+            with open(marker) as handle:
+                raw = handle.read()
+            listed = json.loads(raw)
+        except (OSError, ValueError) as error:
+            if not raw:
+                raw = f"<unreadable: {error}>"
+        print(f"REFUSING TO RUN: {marker} exists.", file=sys.stderr)
+        print(
+            "The previous run did not finish restoring (killed hard, e.g. SIGKILL, "
+            "or a restore failed). "
+            "These files may still hold a knife's mutated text:",
+            file=sys.stderr,
+        )
+        if isinstance(listed, dict):
+            for target, backup in listed.items():
+                print(f"  {target}   (backup: {backup})", file=sys.stderr)
+        else:
+            print("  (marker is not a {file: backup} object; its raw content follows)", file=sys.stderr)
+            print(f"  {raw}", file=sys.stderr)
+        print(
+            "Compare each with its backup (`diff <backup> <file>`), restore by hand, "
+            "then delete the marker file.",
+            file=sys.stderr,
+        )
+        return 2
+
     backups: dict[str, str] = {}
-    for knife in knives:
-        path = os.path.join(_ROOT, knife["file"])
-        if path not in backups:
-            descriptor, backup = tempfile.mkstemp(suffix=".bak")
-            os.close(descriptor)
-            shutil.copy2(path, backup)
-            backups[path] = backup
-
-    # A pre-existing stale .pyc for any of these files would make the
-    # baseline itself run the wrong code, which poisons every verdict
-    # that follows -- so clear the cache before the baseline runs, too.
-    for path in backups:
-        _invalidate_bytecode(path)
-
-    code, tail, _ = _run(tests)
-    print(f"[baseline] {tail}")
-    if code != 0:
-        print("BASELINE IS RED -- fix that first; against a red suite every knife reads as KILLED")
-        for path, backup in backups.items():
-            os.unlink(backup)
-        return 1
-
+    marker_owned = False
+    restored_all = True
     results: list[tuple[str, str]] = []
     try:
+        for knife in knives:
+            path = os.path.join(_ROOT, knife["file"])
+            if path not in backups:
+                descriptor, backup = tempfile.mkstemp(suffix=".bak")
+                os.close(descriptor)
+                try:
+                    shutil.copy2(path, backup)
+                except BaseException as error:
+                    # A half-made backup must never be registered: the finally
+                    # would copy it over the original. Nothing is cut yet, so
+                    # drop the scrap and report.
+                    try:
+                        os.unlink(backup)
+                    except OSError:
+                        pass
+                    if isinstance(error, OSError):
+                        _say(f"cannot back up {knife['file']}: {error} -- nothing was changed")
+                        return 2
+                    raise
+                backups[path] = backup
+
+        # Written after the backups exist and before the first cut, so a hard
+        # kill from here on leaves evidence for the next start to find.
+        # "x": never overwrite a marker that another run just created.
+        try:
+            handle = open(marker, "x")
+        except FileExistsError:
+            _say(f"REFUSING TO RUN: {marker} appeared while starting (another run?).")
+            return 2
+        marker_owned = True
+        with handle:
+            json.dump(backups, handle)
+
+        # A pre-existing stale .pyc for any of these files would make the
+        # baseline itself run the wrong code, which poisons every verdict
+        # that follows -- so clear the cache before the baseline runs, too.
+        for path in backups:
+            _invalidate_bytecode(path)
+
+        code, tail, _ = _run(tests)
+        print(f"[baseline] {tail}")
+        if code != 0:
+            print("BASELINE IS RED -- fix that first; against a red suite every knife reads as KILLED")
+            return 1
+
         for knife in knives:
             path = os.path.join(_ROOT, knife["file"])
             source = open(path).read()
@@ -353,9 +477,25 @@ def main() -> int:
                 print("      -- treat this as the knife missing, not as coverage.")
             results.append((knife["name"], verdict))
     finally:
+        # A second Ctrl-C (or a TERM right behind a INT) must not cut the
+        # restore loop in half, so the four signals are ignored until every
+        # file is back.
+        for sig in _RESTORE_SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
         for path, backup in backups.items():
-            shutil.copy2(backup, path)
-            os.unlink(backup)
+            try:
+                shutil.copy2(backup, path)
+            except OSError as error:
+                # Keep going: one failure must not strand the other files,
+                # and the backup + marker are kept for the manual recovery.
+                restored_all = False
+                _say(f"RESTORE FAILED for {path}: {error} (backup kept at {backup})")
+            else:
+                # The file is back; a leftover temp file is only clutter.
+                try:
+                    os.unlink(backup)
+                except OSError:
+                    pass
             # Covers the normal case, which is already safe on its own
             # (copy2 preserves the backup's original mtime, so a stale
             # freshly-mutated .pyc will not match it and gets recompiled).
@@ -365,10 +505,20 @@ def main() -> int:
             # .pyc before the interruption, and this `finally` block only
             # restores the file's content/mtime, not the cache -- leaving
             # a mutated .pyc keyed to the restored (original) mtime for
-            # the NEXT knife or the next invocation to collide with. Known
-            # gap: this path is not covered by a test, because reliably
-            # interrupting a subprocess mid-compile is itself a race.
+            # the NEXT knife or the next invocation to collide with.
+            # Known gap: SIGKILL skips this block entirely; the inflight
+            # marker is what reports that on the next start. The .pyc part
+            # of an interrupted run is still not covered by a test, because
+            # reliably interrupting a subprocess mid-compile is itself a race.
             _invalidate_bytecode(path)
+        # Only after EVERY file is back: a half-restored tree keeps its marker.
+        if marker_owned and restored_all:
+            try:
+                os.unlink(marker)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                _say(f"could not delete {marker}: {error}")
 
     killed = sum(1 for _, verdict in results if verdict == "KILLED")
     print(f"\n{killed}/{len(results)} killed")
@@ -387,7 +537,9 @@ def main() -> int:
         print("Decide which, and record the reason -- they look identical from here.")
         print("Before writing \"unreachable\": write down one input that WOULD reach it, and")
         print("run that input. If you cannot produce one, say what shapes you tried.")
-    return 0
+    # A failed restore (RESTORE FAILED above, marker kept) must not look like a
+    # finished run to `&&` chains.
+    return 0 if restored_all else 3
 
 
 if __name__ == "__main__":

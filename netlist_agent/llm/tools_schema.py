@@ -1527,10 +1527,19 @@ def do_optimize_gate_count(session: Session, basis: Optional[str] = None, max_de
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
-        # None = the optimization ran and found nothing better; a string = it
-        # could not run (ABC crash/timeout, verification error). The note is
-        # word-for-word the same in both cases here, so only this tells them apart.
+        # A string = no candidate ran to completion (ABC crash/timeout,
+        # verification error, resynthesized result not equivalent). None does
+        # NOT mean a candidate ran: the depth-0 early return is None too. With
+        # changed=False, "some candidate completed, nothing better" and "no
+        # candidate completed" carry word-for-word the same note, so only this
+        # tells them apart. With failure None, a non-empty `incomplete` means
+        # "nothing better found" does NOT rule out a smaller result.
         "failure": result.failure,
+        # One reason per candidate script that did not run to completion, even
+        # when another candidate did (then `failure` is None). Non-empty with
+        # changed=False means "nothing smaller" was not established by every
+        # candidate, so a smaller result is not ruled out.
+        "incomplete": list(result.incomplete),
     }
 
 
@@ -1552,10 +1561,19 @@ def do_optimize_cone_gate_count(
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
-        # None = the optimization ran and found nothing better; a string = it
-        # could not run (ABC crash/timeout, verification error). The note is
-        # word-for-word the same in both cases here, so only this tells them apart.
+        # A string = no candidate ran to completion (ABC crash/timeout,
+        # verification error, resynthesized result not equivalent). None does
+        # NOT mean a candidate ran: the depth-0 early return is None too. With
+        # changed=False, "some candidate completed, nothing better" and "no
+        # candidate completed" carry word-for-word the same note, so only this
+        # tells them apart. With failure None, a non-empty `incomplete` means
+        # "nothing better found" does NOT rule out a smaller result.
         "failure": result.failure,
+        # One reason per candidate script that did not run to completion, even
+        # when another candidate did (then `failure` is None). Non-empty with
+        # changed=False means "nothing smaller" was not established by every
+        # candidate, so a smaller result is not ruled out.
+        "incomplete": list(result.incomplete),
     }
 
 
@@ -2156,7 +2174,10 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "equivalence exactly. Optionally restricts the resynthesized logic to a fixed gate basis, and "
         "optionally enforces a hard maximum on the resulting maximum combinational depth (a candidate that "
         "would exceed it is rejected, never accepted). Only actually changes the design if a genuinely "
-        "smaller, verified-equivalent result was found; otherwise reports the design as unchanged.",
+        "smaller, verified-equivalent result was found; otherwise reports the design as unchanged. "
+        "Result field `failure`: a string means no candidate could be completed (nothing was established); "
+        "`incomplete`: a non-empty list means some candidate(s) could not be completed, so with changed=false "
+        "do NOT say the design is already minimal -- say a smaller result is not ruled out.",
         _schema(
             {
                 "basis": _s("Restrict resynthesized logic to this gate basis: one of 'and_not', 'and_or_not', 'nand_not', 'nor_not' (optional; unrestricted if omitted). NOT the same vocabulary as do_remap_to_basis's 'basis' -- see that tool's description.", _DEPTH_BASIS_VALUES),
@@ -2170,7 +2191,10 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "every other gate in the design untouched. Optionally restricts the resynthesized cone to a fixed "
         "gate basis, and optionally enforces a hard maximum on the resulting depth of that cone (a candidate "
         "that would exceed it is rejected, never accepted). Only actually changes the design if a genuinely "
-        "smaller, verified-equivalent result was found; otherwise reports the design as unchanged.",
+        "smaller, verified-equivalent result was found; otherwise reports the design as unchanged. "
+        "Result field `failure`: a string means no candidate could be completed (nothing was established); "
+        "`incomplete`: a non-empty list means some candidate(s) could not be completed, so with changed=false "
+        "do NOT say the design is already minimal -- say a smaller result is not ruled out.",
         _schema(
             {
                 "net": _s(_NET_DESC),

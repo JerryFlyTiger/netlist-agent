@@ -706,10 +706,22 @@ class AreaOptResult:
     # search: None as long as AT LEAST ONE candidate script ran to
     # completion (ABC succeeded and verified equivalent), even if none of
     # them beat the original gate count or honored `max_depth` -- that is
-    # still a genuine "nothing better found" outcome, not a failure. Only
-    # non-None when EVERY candidate failed to complete (the first failure's
-    # reason is kept).
+    # not a failure (but see `incomplete`: if it is non-empty, "nothing
+    # better found" does not rule out a smaller result). Only non-None
+    # when EVERY candidate failed to complete (= `incomplete[0]`).
     failure: Optional[str] = None
+    # One reason per candidate that did NOT run to completion (synthesis or
+    # verification error/timeout, or a "not equivalent" verdict), in script
+    # order, same text `failure` would carry. Filled on success too. Unlike
+    # `failure`, non-empty even when another candidate completed: it tells the
+    # presentation layer that "nothing smaller" was not established by every
+    # candidate. Relation: some candidate completed => failure is None;
+    # candidates > 0 and none completed => failure == incomplete[0]. The
+    # depth-0 early return has failure None with candidates == 0 and
+    # incomplete == (). Always len(incomplete) <= candidates.
+    incomplete: tuple[str, ...] = ()
+    # Number of candidate scripts actually tried (0 on the depth-0 early return).
+    candidates: int = 0
 
 
 def optimize_gate_count(
@@ -744,7 +756,7 @@ def optimize_gate_count(
     best_gates: Optional[int] = None
     best_depth: Optional[int] = None
     any_completed = False
-    first_failure: Optional[str] = None
+    incomplete: list[str] = []
     for candidate_script in _AREA_CANDIDATE_SCRIPTS:
         work = copy.deepcopy(design)
         try:
@@ -754,18 +766,15 @@ def optimize_gate_count(
             _splice_whole_design(work, blif, promoted_q_source)
             remove_dangling_gates(work)
         except (ABCBridgeError, _SynthError) as exc:
-            if first_failure is None:
-                first_failure = str(exc)
+            incomplete.append(str(exc))
             continue
         try:
             eq = verify_equivalence(design, work, timeout=verify_timeout)
         except ABCBridgeError as exc:
-            if first_failure is None:
-                first_failure = f"equivalence check failed: {exc}"
+            incomplete.append(f"equivalence check failed: {exc}")
             continue
         if not eq.equivalent:
-            if first_failure is None:
-                first_failure = f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}"
+            incomplete.append(f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}")
             continue
         # This candidate ran to completion (ABC succeeded, equivalence
         # verified) -- it counts as a completed optimization attempt even if
@@ -784,10 +793,29 @@ def optimize_gate_count(
         note = "No candidate restructuring reduced the gate count below the original"
         note += " while honoring the maximum-depth constraint" if max_depth is not None else ""
         note += "; design left unchanged."
-        failure = None if any_completed else first_failure
-        return AreaOptResult(design, False, gates_before, gates_before, depth_before, depth_before, note, failure=failure)
+        failure = None if any_completed else incomplete[0]
+        return AreaOptResult(
+            design,
+            False,
+            gates_before,
+            gates_before,
+            depth_before,
+            depth_before,
+            note,
+            failure=failure,
+            incomplete=tuple(incomplete),
+            candidates=len(_AREA_CANDIDATE_SCRIPTS),
+        )
     return AreaOptResult(
-        best_work, True, gates_before, best_gates, depth_before, best_depth, f"Reduced gate count from {gates_before} to {best_gates}."
+        best_work,
+        True,
+        gates_before,
+        best_gates,
+        depth_before,
+        best_depth,
+        f"Reduced gate count from {gates_before} to {best_gates}.",
+        incomplete=tuple(incomplete),
+        candidates=len(_AREA_CANDIDATE_SCRIPTS),
     )
 
 
@@ -828,7 +856,7 @@ def optimize_cone_gate_count(
     best_gates: Optional[int] = None
     best_depth: Optional[int] = None
     any_completed = False
-    first_failure: Optional[str] = None
+    incomplete: list[str] = []
     for candidate_script in _AREA_CANDIDATE_SCRIPTS:
         work = copy.deepcopy(design)
         try:
@@ -839,18 +867,15 @@ def optimize_cone_gate_count(
             _splice_cone(work, target, blif, _CONE_OUT_TOKEN, promoted_q_source)
             remove_dangling_gates(work)
         except (ABCBridgeError, _SynthError) as exc:
-            if first_failure is None:
-                first_failure = str(exc)
+            incomplete.append(str(exc))
             continue
         try:
             eq = verify_equivalence(design, work, timeout=verify_timeout)
         except ABCBridgeError as exc:
-            if first_failure is None:
-                first_failure = f"equivalence check failed: {exc}"
+            incomplete.append(f"equivalence check failed: {exc}")
             continue
         if not eq.equivalent:
-            if first_failure is None:
-                first_failure = f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}"
+            incomplete.append(f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}")
             continue
         any_completed = True
         gates_after = len(work.gates)
@@ -866,8 +891,27 @@ def optimize_cone_gate_count(
         note = "No candidate restructuring reduced the gate count below the original"
         note += " while honoring the maximum-depth constraint" if max_depth is not None else ""
         note += "; design left unchanged."
-        failure = None if any_completed else first_failure
-        return AreaOptResult(design, False, gates_before, gates_before, depth_before, depth_before, note, failure=failure)
+        failure = None if any_completed else incomplete[0]
+        return AreaOptResult(
+            design,
+            False,
+            gates_before,
+            gates_before,
+            depth_before,
+            depth_before,
+            note,
+            failure=failure,
+            incomplete=tuple(incomplete),
+            candidates=len(_AREA_CANDIDATE_SCRIPTS),
+        )
     return AreaOptResult(
-        best_work, True, gates_before, best_gates, depth_before, best_depth, f"Reduced gate count from {gates_before} to {best_gates}."
+        best_work,
+        True,
+        gates_before,
+        best_gates,
+        depth_before,
+        best_depth,
+        f"Reduced gate count from {gates_before} to {best_gates}.",
+        incomplete=tuple(incomplete),
+        candidates=len(_AREA_CANDIDATE_SCRIPTS),
     )

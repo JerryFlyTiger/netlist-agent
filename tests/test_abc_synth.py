@@ -668,3 +668,151 @@ def test_area_opt_verify_equivalence_exception_all_candidates_sets_failure(monke
     assert result.design is design
     assert result.failure is not None
     assert "cec broke" in result.failure
+
+
+# ----------------------------------------------------------------------
+# `incomplete` / `candidates` fields: batch 13 (2026-10-07) -- a candidate
+# that failed while another completed must still be visible in the result,
+# so the presentation layer cannot claim "nothing smaller exists".
+# ----------------------------------------------------------------------
+
+
+def _build_single_and() -> Design:
+    """Two PIs into one AND to PO: already minimal, nothing can shrink it."""
+    design = Design(module_name="top")
+    for n in ("a", "b"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port("a", Direction.INPUT), Port("b", Direction.INPUT), Port("y", Direction.OUTPUT)]
+    design.add_gate(Gate("g0", GateType.AND, {"O": _nb("y"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.build_indices()
+    return design
+
+
+def _first_synth_raises(monkeypatch, message: str = "synthetic") -> None:
+    real_run = abc_synth_module._run_abc_synthesis
+    calls = {"n": 0}
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ABCBridgeError(message)
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_partial_synth_failure_is_recorded_in_incomplete(monkeypatch, name, call) -> None:
+    _first_synth_raises(monkeypatch)
+    result = call(_build_single_and())
+    assert result.changed is False
+    assert result.failure is None
+    assert result.incomplete == ("synthetic",)
+    assert result.candidates == len(abc_synth_module._AREA_CANDIDATE_SCRIPTS) == 2
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_all_candidates_fail_failure_is_first_incomplete(monkeypatch, name, call) -> None:
+    calls = {"n": 0}
+
+    def _boom(*args, **kwargs):
+        calls["n"] += 1
+        raise ABCBridgeError(f"synthetic{calls['n']}")
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _boom)
+    result = call(_build_single_and())
+    assert result.incomplete == ("synthetic1", "synthetic2")
+    assert result.failure == "synthetic1"
+    assert result.candidates == 2
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_no_failure_leaves_incomplete_empty(name, call) -> None:
+    result = call(_build_single_and())
+    assert result.changed is False
+    assert result.failure is None
+    assert result.incomplete == ()
+    assert result.candidates == 2
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_partial_verify_exception_is_recorded(monkeypatch, name, call) -> None:
+    real_verify = abc_synth_module.verify_equivalence
+    calls = {"n": 0}
+
+    def _fake(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ABCBridgeError("cec timed out")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _fake)
+    result = call(_build_single_and())
+    assert result.failure is None
+    assert result.incomplete == ("equivalence check failed: cec timed out",)
+
+
+@pytest.mark.parametrize("name,call", _AREA_ENTRY_POINTS, ids=[n for n, _ in _AREA_ENTRY_POINTS])
+def test_area_opt_partial_not_equivalent_is_recorded(monkeypatch, name, call) -> None:
+    real_verify = abc_synth_module.verify_equivalence
+    calls = {"n": 0}
+
+    def _fake(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return EquivResult(False, "counterexample: a=1 b=0")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _fake)
+    result = call(_build_single_and())
+    assert result.failure is None
+    assert len(result.incomplete) == 1
+    assert result.incomplete[0].startswith("equivalence check found the resynthesized design not equivalent")
+    assert "counterexample: a=1 b=0" in result.incomplete[0]
+
+
+def test_area_opt_incomplete_is_also_filled_on_success(monkeypatch) -> None:
+    _first_synth_raises(monkeypatch)
+    result = optimize_gate_count(_load("test18"))
+    assert result.changed, "expected the second candidate alone to shrink test18"
+    assert result.failure is None
+    assert result.incomplete == ("synthetic",)
+    assert result.candidates == 2
+
+
+def _build_shrinkable_cone() -> Design:
+    """y = BUF(NOT(NOT(AND(a, b)))): the cone of y shrinks to an AND plus the tap BUF (4 -> 2 gates)."""
+    design = Design(module_name="top")
+    for n in ("a", "b"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    for n in ("n1", "n2", "n3"):
+        design.signals[n] = Signal(n, None, None, Direction.INTERNAL)
+    design.ports = [Port("a", Direction.INPUT), Port("b", Direction.INPUT), Port("y", Direction.OUTPUT)]
+    design.add_gate(Gate("g0", GateType.AND, {"O": _nb("n1"), "I0": _nb("a"), "I1": _nb("b")}))
+    design.add_gate(Gate("g1", GateType.NOT, {"O": _nb("n2"), "I0": _nb("n1")}))
+    design.add_gate(Gate("g2", GateType.NOT, {"O": _nb("n3"), "I0": _nb("n2")}))
+    design.add_gate(Gate("g3", GateType.BUF, {"O": _nb("y"), "I0": _nb("n3")}))
+    design.build_indices()
+    return design
+
+
+def test_area_opt_cone_incomplete_is_also_filled_on_success(monkeypatch) -> None:
+    _first_synth_raises(monkeypatch)
+    result = optimize_cone_gate_count(_build_shrinkable_cone(), _nb("y"))
+    assert result.changed is True
+    assert result.failure is None
+    assert result.incomplete == ("synthetic",)
+    assert result.candidates == 2
+
+
+def test_area_opt_depth_zero_early_return_has_no_candidates() -> None:
+    design = Design(module_name="top")
+    design.signals["a"] = Signal("a", None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port("a", Direction.INPUT), Port("y", Direction.OUTPUT)]
+    design.build_indices()
+    result = optimize_gate_count(design)
+    assert result.candidates == 0
+    assert result.incomplete == ()

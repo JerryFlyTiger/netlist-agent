@@ -506,6 +506,17 @@ def test_the_two_surfaces_reporting_the_recorded_change_agree(tmp_path) -> None:
     }
 
 
+@pytest.mark.parametrize("name", ["do_optimize_gate_count", "do_optimize_cone_gate_count"])
+def test_area_opt_tool_descriptions_warn_incomplete_is_not_minimal(name) -> None:
+    """The description sentence is the only thing stopping the LLM from saying
+    "already minimal" when some candidate could not be completed."""
+    spec = next(t for t in TOOL_SCHEMA if t.name == name)
+    assert "incomplete" in spec.description
+    assert "not ruled out" in spec.description
+    assert "do NOT say the design is already minimal" in spec.description
+    assert "nothing was established" in spec.description
+
+
 def test_the_count_tool_description_names_the_keys_it_adds() -> None:
     """The description must name the keys, and must keep GENERATING the names
     rather than spelling them out.
@@ -1272,6 +1283,32 @@ def test_optimize_tools_report_failure_when_abc_cannot_run(tmp_path, monkeypatch
     assert result["changed"] is False
     assert result["failure"] is not None and "Assertion failed" in result["failure"]
     assert session.current_design is before
+
+
+@pytest.mark.parametrize(
+    "tool,kwargs",
+    [("do_optimize_gate_count", {}), ("do_optimize_cone_gate_count", {"net": "n20"})],
+)
+def test_area_optimize_tools_report_incomplete_candidates(tmp_path, monkeypatch, tool, kwargs) -> None:
+    """Batch 13: a candidate that failed while another completed leaves
+    `failure` None but must still show up in `incomplete`."""
+    from netlist_agent import abc_synth
+    from netlist_agent.abc_bridge import ABCBridgeError
+
+    real_run = abc_synth._run_abc_synthesis
+    calls = {"n": 0}
+
+    def _first_fails(view, basis, timeout, opt_script=abc_synth._OPT_SCRIPT):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ABCBridgeError("first candidate broken")
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth, "_run_abc_synthesis", _first_fails)
+    session = _new_session(tmp_path)
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result["failure"] is None
+    assert result["incomplete"] == ["first candidate broken"]
 
 
 def test_optimize_depth_tool_rejects_unknown_basis(tmp_path) -> None:

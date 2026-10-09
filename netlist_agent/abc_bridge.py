@@ -145,6 +145,8 @@ def _resolve_abc() -> str:
             )
         except subprocess.TimeoutExpired as exc:
             raise ABCBridgeError(f"timed out resolving ABC binary via {FIND_ABC_SCRIPT}") from exc
+        except OSError as exc:
+            raise ABCBridgeError(f"could not run ABC locator: {_os_error_detail(exc)}") from exc
         if result.returncode != 0:
             raise ABCBridgeError(
                 f"failed to resolve ABC binary via {FIND_ABC_SCRIPT}: {result.stderr.strip()}"
@@ -179,6 +181,18 @@ def _scrub_abc_output(text: str, tmpdir: Optional[str]) -> str:
     return out
 
 
+def _os_error_detail(exc: OSError) -> str:
+    """User-facing text for an `OSError`, without any absolute path. `str(exc)`
+    embeds `: '<full path>'` (the temp dir, for this module's callers), so the
+    message is rebuilt from the errno's generic text plus the file's basename
+    only (the instance `strerror` can itself carry a path: `tempfile` puts the
+    searched directories in it)."""
+    detail = os.strerror(exc.errno) if isinstance(exc.errno, int) else type(exc).__name__
+    if exc.filename:
+        detail += f" ({os.path.basename(str(exc.filename))})"
+    return detail
+
+
 def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> str:
     """Production callers must pass `tmpdir` (the directory `script`'s files
     live in): without it only the command-line echo is dropped, and paths in
@@ -190,6 +204,10 @@ def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> st
         result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise ABCTimeoutError(f"ABC invocation timed out after {timeout}s running {_script_command(script)!r}") from exc
+    except OSError as exc:
+        # Loud failure, not "inconclusive": ABC never ran, so there is no
+        # verdict to be missing.
+        raise ABCBridgeError(f"could not run ABC: {_os_error_detail(exc)}") from exc
     if result.returncode != 0:
         # A nonzero exit is ABC crashing (e.g. an internal assert/SIGABRT),
         # distinct from the "always 0" guarantee documented above for the
@@ -198,8 +216,9 @@ def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> st
         # relied on reading `stdout` when the process crashed, so raising
         # here instead of returning is safe.
         stderr_tail = _scrub_abc_output(result.stderr, tmpdir).strip()[-500:]
+        suffix = f": {stderr_tail}" if stderr_tail else ""
         raise ABCBridgeError(
-            f"ABC exited with code {result.returncode} running {_script_command(script)!r}: {stderr_tail}"
+            f"ABC exited with code {result.returncode} running {_script_command(script)!r}{suffix}"
         )
     return _scrub_abc_output(result.stdout, tmpdir)
 
@@ -380,11 +399,21 @@ def write_blif(design: Design, path: str) -> None:
 
 
 def _run_cec(design_a: Design, design_b: Design, timeout: float) -> "EquivResult":
-    with tempfile.TemporaryDirectory(prefix="abc_bridge_") as tmpdir:
+    # OSErrors (disk full, unwritable temp dir) become `ABCBridgeError`: a loud
+    # failure, never `ABCInconclusiveError` ("ABC gave no verdict"). The message
+    # carries no path (`_os_error_detail`) -- it reaches user-facing text.
+    try:
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="abc_bridge_", ignore_cleanup_errors=True)
+    except OSError as exc:
+        raise ABCBridgeError(f"could not create ABC temp directory: {_os_error_detail(exc)}") from exc
+    with tmp_ctx as tmpdir:
         path_a = os.path.join(tmpdir, "a.blif")
         path_b = os.path.join(tmpdir, "b.blif")
-        write_blif(design_a, path_a)
-        write_blif(design_b, path_b)
+        try:
+            write_blif(design_a, path_a)
+            write_blif(design_b, path_b)
+        except OSError as exc:
+            raise ABCBridgeError(f"could not write ABC input file: {_os_error_detail(exc)}") from exc
         stdout = _run_abc(f'cec "{path_a}" "{path_b}"', timeout=timeout, tmpdir=tmpdir)
     return _parse_cec_output(stdout)
 

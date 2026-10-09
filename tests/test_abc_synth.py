@@ -14,6 +14,7 @@ import os
 import pytest
 
 from netlist_agent import abc_synth as abc_synth_module
+from netlist_agent import abc_bridge as abc_bridge_module
 from netlist_agent.abc_bridge import ABCBridgeError, EquivResult, verify_equivalence
 from netlist_agent.abc_synth import (
     BASIS_GATE_NAMES,
@@ -867,3 +868,268 @@ def test_synth_error_no_blif_output_stdout_has_no_tmpdir(monkeypatch) -> None:
     msg = str(exc.value)
     assert "no BLIF output" in msg and "Cannot open input file" in msg
     assert "abc_synth_" not in msg and "ABC command line" not in msg
+
+
+# ----------------------------------------------------------------------
+# Batch 16a: OSErrors in `_run_abc_synthesis` become `_SynthError` (so the
+# optimize paths report `failure`), pathless; no-BLIF reads stderr; no
+# dangling colon; verify catch separates "inconclusive" from "failed".
+# ----------------------------------------------------------------------
+
+_INJECTED_PATH = "/var/folders/zz/leak_dir/abc_synth_xyz/in.blif"
+
+
+def _assert_synth_oserror(exc_info) -> None:
+    assert type(exc_info.value) is _SynthError
+    msg = str(exc_info.value)
+    assert "No space left on device" in msg
+    assert "/var/folders" not in msg and "leak_dir" not in msg and "abc_synth_xyz" not in msg
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
+def _oserror() -> OSError:
+    return OSError(28, "No space left on device", _INJECTED_PATH)
+
+
+def _inject_synth_oserror(monkeypatch, point: str) -> None:
+    """Make exactly one OS-touching step of `_run_abc_synthesis` raise."""
+    import builtins
+    import subprocess as subprocess_module
+    import tempfile as tempfile_module
+
+    def _boom(*a, **k):
+        raise _oserror()
+
+    if point == "tempdir":
+        monkeypatch.setattr(tempfile_module, "TemporaryDirectory", _boom)
+    elif point == "write_blif":
+        monkeypatch.setattr(abc_synth_module, "write_blif", _boom)
+    elif point == "genlib":
+        real_open = builtins.open
+
+        def _open(path, *a, **k):
+            if str(path).endswith(".genlib"):
+                raise _oserror()
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", _open)
+    elif point == "exec":
+        monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
+        monkeypatch.setattr(subprocess_module, "run", _boom)
+    elif point == "readback":
+        import types
+
+        real_open = builtins.open
+
+        def _fake_run(argv, **k):
+            import re
+
+            d = re.search(r'read_blif "(.*?)/in\.blif"', argv[2]).group(1)
+            with real_open(os.path.join(d, "out.blif"), "w") as f:
+                f.write(".model x\n")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def _open(path, *a, **k):
+            if str(path).endswith("out.blif") and not (a and "w" in a[0]):
+                raise _oserror()
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
+        monkeypatch.setattr(subprocess_module, "run", _fake_run)
+        monkeypatch.setattr(builtins, "open", _open)
+    else:
+        raise AssertionError(point)
+
+
+_SYNTH_OS_POINTS = ["tempdir", "write_blif", "genlib", "exec", "readback"]
+
+
+@pytest.mark.parametrize("point", _SYNTH_OS_POINTS)
+def test_run_abc_synthesis_oserror_is_synth_error(monkeypatch, point) -> None:
+    design = _build_and_chain()
+    _inject_synth_oserror(monkeypatch, point)
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(design, None, 5.0)
+    _assert_synth_oserror(exc)
+
+
+@pytest.mark.parametrize("point", _SYNTH_OS_POINTS)
+def test_optimize_depth_oserror_becomes_failure_without_path(monkeypatch, point) -> None:
+    design = _build_and_chain()
+    _inject_synth_oserror(monkeypatch, point)
+    result = optimize_depth(design)
+    assert result.failure is not None
+    assert "No space left on device" in result.failure
+    assert "/var/folders" not in result.failure and "leak_dir" not in result.failure
+    assert "/var/folders" not in result.note
+    assert result.design is design and not result.changed
+
+
+def test_synth_no_blif_output_prefers_stderr(monkeypatch) -> None:
+    out = '======== ABC command line "read_blif "{d}/in.blif"; strash"\n'
+    _patch_synth_abc(monkeypatch, 0, out, 'Cannot open genlib file "{d}/basis.genlib".\n')
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "no BLIF output" in msg and 'Cannot open genlib file "basis.genlib"' in msg
+    assert "abc_synth_" not in msg and "ABC command line" not in msg
+
+
+def test_synth_no_blif_output_both_empty_has_no_dangling_colon(monkeypatch) -> None:
+    _patch_synth_abc(monkeypatch, 0, "", "  \n")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    assert str(exc.value) == "ABC synthesis produced no BLIF output"
+
+
+def test_synth_nonzero_exit_both_empty_has_no_dangling_colon(monkeypatch) -> None:
+    _patch_synth_abc(monkeypatch, -11, "", "")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    assert str(exc.value) == "ABC synthesis process exited with code -11"
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_synth_detail_is_truncated_to_last_500_chars(monkeypatch, rc) -> None:
+    _patch_synth_abc(monkeypatch, rc, "", "HEAD" + "x" * 600 + "TAIL")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert msg.endswith("TAIL") and "HEAD" not in msg
+    assert len(msg) < 600
+
+
+_ALL_ENTRY_POINTS = _DEPTH_ENTRY_POINTS + _AREA_ENTRY_POINTS
+
+
+def _failure_text(result) -> str:
+    return result.failure if result.failure is not None else result.incomplete[0]
+
+
+@pytest.mark.parametrize("name,call", _ALL_ENTRY_POINTS, ids=[n for n, _ in _ALL_ENTRY_POINTS])
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: abc_bridge_module.ABCTimeoutError("ABC invocation timed out after 5.0s running 'cec'"),
+        lambda: abc_bridge_module.CecUndecidedError("Networks are undecided."),
+    ],
+    ids=["timeout", "undecided"],
+)
+def test_verify_inconclusive_has_inconclusive_prefix(monkeypatch, name, call, exc_factory) -> None:
+    def _raise(*args, **kwargs):
+        raise exc_factory()
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _raise)
+    result = call(_build_and_chain())
+    text = _failure_text(result)
+    assert text.startswith("equivalence check was inconclusive: ")
+    assert "equivalence check failed" not in text
+    if name in ("optimize_depth", "optimize_cone_depth"):
+        assert "equivalence check was inconclusive" in result.note
+        assert "equivalence check failed" not in result.note
+    assert not result.changed
+
+
+@pytest.mark.parametrize("name,call", _ALL_ENTRY_POINTS, ids=[n for n, _ in _ALL_ENTRY_POINTS])
+def test_verify_generic_bridge_error_keeps_failed_prefix(monkeypatch, name, call) -> None:
+    def _raise(*args, **kwargs):
+        raise ABCBridgeError("cec crashed")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _raise)
+    result = call(_build_and_chain())
+    text = _failure_text(result)
+    assert text == "equivalence check failed: cec crashed"
+    assert "inconclusive" not in text
+
+
+# ----------------------------------------------------------------------
+# Batch 16 round-1 fixes: F2 (temp-dir cleanup errors), F9 (whitespace-only
+# stderr), gaps 1-3.
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def _rmdir_fails_for_abc_dirs(monkeypatch):
+    """Make `os.rmdir` fail for this module's temp dirs, as a cleanup error
+    in `TemporaryDirectory.__exit__` would; remove the leftovers afterwards."""
+    import shutil
+
+    real_rmdir = os.rmdir
+    left = []
+
+    def _rmdir(path, *a, **k):
+        if os.path.basename(str(path)).startswith(("abc_bridge_", "abc_synth_")):
+            left.append(str(path))
+            raise OSError(16, "Device or resource busy", str(path))
+        return real_rmdir(path, *a, **k)
+
+    monkeypatch.setattr(os, "rmdir", _rmdir)
+    yield left
+    monkeypatch.undo()
+    for p in left:
+        shutil.rmtree(p, ignore_errors=True)
+
+
+def test_synth_cleanup_error_does_not_mask_synth_error(monkeypatch, _rmdir_fails_for_abc_dirs) -> None:
+    _patch_synth_abc(monkeypatch, 1, "", "boom")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    assert "boom" in str(exc.value)
+    assert _rmdir_fails_for_abc_dirs, "the cleanup failure was never exercised"
+
+
+def test_synth_cleanup_error_does_not_break_success(_rmdir_fails_for_abc_dirs) -> None:
+    blif = abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 60.0)
+    assert blif is not None
+    assert _rmdir_fails_for_abc_dirs, "the cleanup failure was never exercised"
+
+
+def test_synth_nonzero_exit_whitespace_stderr_falls_back_to_stdout(monkeypatch) -> None:
+    _patch_synth_abc(monkeypatch, 1, "STDOUT-DIAGNOSTIC\n", "  \n")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    assert "code 1: STDOUT-DIAGNOSTIC" in str(exc.value)
+
+
+def test_synth_nonzero_exit_prefers_nonblank_stderr(monkeypatch) -> None:
+    _patch_synth_abc(monkeypatch, 1, "STDOUT-WORDS\n", "STDERR-WORDS\n")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "STDERR-WORDS" in msg and "STDOUT-WORDS" not in msg
+
+
+def test_synth_no_blif_output_nonecho_stdout_loses_to_stderr(monkeypatch) -> None:
+    _patch_synth_abc(monkeypatch, 0, "STDOUT-WORDS\n", "STDERR-WORDS\n")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "STDERR-WORDS" in msg and "STDOUT-WORDS" not in msg
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_synth_detail_scrubs_before_truncating(monkeypatch, rc) -> None:
+    # stderr is the temp path, "/in.blif", then 487 chars: 495 + len(tmpdir)
+    # in all, so a 500-char tail cut BEFORE the scrub starts inside the temp
+    # dir (for any tmpdir longer than 5 chars) and leaves half a path behind.
+    # rc=0 is the no-BLIF branch, rc=1 the nonzero-exit branch.
+    _patch_synth_abc(monkeypatch, rc, "", "{d}/in.blif" + "y" * 487)
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "in.blif" in msg and "/" not in msg
+
+
+def test_synth_exec_oserror_cause_is_the_injected_error(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    injected = OSError(8, "Exec format error", _INJECTED_PATH)
+
+    def _boom(*a, **k):
+        raise injected
+
+    monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    assert exc.value.__cause__ is injected

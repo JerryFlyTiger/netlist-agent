@@ -9,6 +9,7 @@ tests/test_abc_bridge_real_files.py for integration coverage against the real
 from __future__ import annotations
 
 import copy
+import os
 
 import pytest
 
@@ -723,3 +724,242 @@ def test_real_abc_not_equivalent_detail_has_no_tmpdir_and_keeps_counterexample(t
     from netlist_agent.property_check import parse_counterexample
 
     assert parse_counterexample(res.detail) in ({"a": 1, "b": 0}, {"a": 0, "b": 1})
+
+
+# ----------------------------------------------------------------------
+# Batch 16a: OSErrors become loud ABCBridgeError (never "inconclusive"),
+# with no absolute path in the message; empty stderr gives no dangling colon.
+# ----------------------------------------------------------------------
+
+_INJECTED_PATH = "/var/folders/zz/leak_dir/abc_bridge_xyz/a.blif"
+
+
+def _injected_os_error() -> OSError:
+    return OSError(28, "No space left on device", _INJECTED_PATH)
+
+
+def _assert_loud_and_pathless(exc_info) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError
+
+    assert type(exc_info.value) is ABCBridgeError
+    assert not isinstance(exc_info.value, ABCInconclusiveError)
+    msg = str(exc_info.value)
+    assert "No space left on device" in msg
+    assert "/var/folders" not in msg and "leak_dir" not in msg and "abc_bridge_xyz" not in msg
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
+def test_run_cec_tempdir_creation_oserror_is_bridge_error(monkeypatch, tmp_path) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    a, b = _tiny_designs(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise _injected_os_error()
+
+    monkeypatch.setattr(abc_bridge_module.tempfile, "TemporaryDirectory", _boom)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    _assert_loud_and_pathless(exc)
+
+
+@pytest.mark.parametrize("failing_call", [1, 2])
+def test_run_cec_write_blif_oserror_is_bridge_error(monkeypatch, tmp_path, failing_call) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    a, b = _tiny_designs(tmp_path)
+    real_write = abc_bridge_module.write_blif
+    calls = {"n": 0}
+
+    def _fake_write(design, path):
+        calls["n"] += 1
+        if calls["n"] == failing_call:
+            raise _injected_os_error()
+        return real_write(design, path)
+
+    monkeypatch.setattr(abc_bridge_module, "write_blif", _fake_write)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    assert calls["n"] == failing_call
+    _assert_loud_and_pathless(exc)
+
+
+def test_run_abc_exec_oserror_is_bridge_error(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_abc
+
+    def _boom(*a, **k):
+        raise OSError(8, "Exec format error", _INJECTED_PATH)
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_abc("cec x y", timeout=5.0)
+    msg = str(exc.value)
+    assert type(exc.value) is ABCBridgeError
+    assert "Exec format error" in msg and "a.blif" in msg
+    assert "/var/folders" not in msg and "leak_dir" not in msg
+
+
+def test_os_error_detail_without_strerror_or_filename() -> None:
+    from netlist_agent.abc_bridge import _os_error_detail
+
+    assert _os_error_detail(OSError()) == "OSError"
+    assert _os_error_detail(PermissionError()) == "PermissionError"
+    assert _os_error_detail(OSError(13, "Permission denied")) == "Permission denied"
+
+
+def test_run_abc_nonzero_exit_empty_stderr_has_no_dangling_colon(monkeypatch) -> None:
+    import subprocess as subprocess_module
+    import types
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_abc
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(
+        subprocess_module, "run", lambda *a, **k: types.SimpleNamespace(returncode=-11, stdout="", stderr="  \n")
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_abc("cec x y", timeout=5.0)
+    msg = str(exc.value)
+    assert "code -11" in msg
+    assert not msg.rstrip().endswith(":")
+
+
+# ----------------------------------------------------------------------
+# Batch 16 round-1 fixes: F1 (strerror may carry a path), F2 (temp-dir
+# cleanup errors), F3 (locator exec failure), F9 note, gaps 2 and 3.
+# ----------------------------------------------------------------------
+
+
+def test_os_error_detail_ignores_instance_strerror_with_path() -> None:
+    # `tempfile` puts the searched directories into `strerror` itself.
+    from netlist_agent.abc_bridge import _os_error_detail
+
+    exc = FileNotFoundError(2, "No usable temporary directory found in ['/var/folders/zz/T', '/tmp']")
+    detail = _os_error_detail(exc)
+    assert "/" not in detail and "var" not in detail
+    assert detail == os.strerror(2)
+
+
+def test_run_cec_tempdir_search_failure_message_has_no_path(monkeypatch, tmp_path) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    a, b = _tiny_designs(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise FileNotFoundError(2, "No usable temporary directory found in ['/var/folders/zz/T']")
+
+    monkeypatch.setattr(abc_bridge_module.tempfile, "TemporaryDirectory", _boom)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    assert "/" not in str(exc.value)
+
+
+@pytest.fixture
+def _rmdir_fails_for_abc_dirs(monkeypatch):
+    """Make `os.rmdir` fail for this module's temp dirs, as a cleanup error
+    in `TemporaryDirectory.__exit__` would; remove the leftovers afterwards."""
+    import shutil
+
+    real_rmdir = os.rmdir
+    left = []
+
+    def _rmdir(path, *a, **k):
+        if os.path.basename(str(path)).startswith(("abc_bridge_", "abc_synth_")):
+            left.append(str(path))
+            raise OSError(16, "Device or resource busy", str(path))
+        return real_rmdir(path, *a, **k)
+
+    monkeypatch.setattr(os, "rmdir", _rmdir)
+    yield left
+    monkeypatch.undo()
+    for p in left:
+        shutil.rmtree(p, ignore_errors=True)
+
+
+def test_run_cec_cleanup_error_does_not_mask_bridge_error(monkeypatch, tmp_path, _rmdir_fails_for_abc_dirs) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    _patch_abc(monkeypatch, lambda d: (1, "", "boom"))
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    assert "boom" in str(exc.value)
+    assert _rmdir_fails_for_abc_dirs, "the cleanup failure was never exercised"
+
+
+def test_run_cec_cleanup_error_does_not_break_success(monkeypatch, tmp_path, _rmdir_fails_for_abc_dirs) -> None:
+    from netlist_agent.abc_bridge import _run_cec
+
+    _patch_abc(monkeypatch, lambda d: (0, "Networks are equivalent.  Time = 0.00 sec\n", ""))
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 5.0)
+    assert res.equivalent
+    assert _rmdir_fails_for_abc_dirs, "the cleanup failure was never exercised"
+
+
+def test_resolve_abc_locator_oserror_is_bridge_error(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError, _resolve_abc
+
+    injected = OSError(2, "No such file or directory", "/usr/bin/bash")
+
+    def _boom(*a, **k):
+        raise injected
+
+    monkeypatch.setattr(abc_bridge_module, "_abc_path", None)
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert type(exc.value) is ABCBridgeError and not isinstance(exc.value, ABCInconclusiveError)
+    assert exc.value.__cause__ is injected
+    assert "/" not in str(exc.value)
+
+
+def test_run_abc_exec_oserror_cause_is_the_injected_error(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_abc
+
+    injected = OSError(8, "Exec format error", _INJECTED_PATH)
+
+    def _boom(*a, **k):
+        raise injected
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_abc("cec x y", timeout=5.0)
+    assert exc.value.__cause__ is injected
+
+
+def test_run_abc_nonzero_exit_scrubs_before_truncating(monkeypatch, tmp_path) -> None:
+    # stderr is the temp path, "/in.blif", then 487 chars: 495 + len(tmpdir)
+    # in all, so a 500-char tail cut BEFORE the scrub starts inside the temp
+    # dir (for any tmpdir longer than 5 chars) and leaves half a path behind.
+    import subprocess as subprocess_module
+    import types
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_abc
+
+    d = str(tmp_path)
+    err = f"{d}/in.blif" + "y" * 487
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(
+        subprocess_module, "run", lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=err)
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_abc("cec x y", timeout=5.0, tmpdir=d)
+    msg = str(exc.value)
+    assert "in.blif" in msg and "/" not in msg

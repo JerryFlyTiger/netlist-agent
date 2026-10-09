@@ -71,9 +71,11 @@ from typing import Callable, Optional
 
 from netlist_agent.abc_bridge import (
     ABCBridgeError,
+    ABCInconclusiveError,
     DEFAULT_ABC_TIMEOUT,
     DEFAULT_VERIFY_TIMEOUT,
     _is_declared_bit,
+    _os_error_detail,
     _restrict_to_fanin_cone,
     _resolve_abc,
     _scrub_abc_output,
@@ -264,9 +266,26 @@ _OPT_SCRIPT = "strash; balance; dch"
 _AREA_CANDIDATE_SCRIPTS: tuple[str, ...] = (_OPT_SCRIPT, "strash; dc2; resub; dc2")
 
 
+def _verify_failure_prefix(exc: ABCBridgeError) -> str:
+    """Wording for a `verify_equivalence` error: a timeout / undecided miter
+    (`ABCInconclusiveError`) gave no verdict, so it must not be phrased like a
+    failed check, which reads as "not equivalent"."""
+    if isinstance(exc, ABCInconclusiveError):
+        return "equivalence check was inconclusive"
+    return "equivalence check failed"
+
+
 def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_script: str = _OPT_SCRIPT) -> _BlifNetlist:
     genlib_text = _genlib_text(basis)
-    with tempfile.TemporaryDirectory(prefix="abc_synth_") as tmpdir:
+    # Every OSError below (disk full, unwritable temp dir, exec failure) becomes
+    # `_SynthError` so the optimize paths report a `failure` instead of letting
+    # it escape as an "Internal error" with a temp path in it; the message is
+    # built by `_os_error_detail` and carries no absolute path.
+    try:
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="abc_synth_", ignore_cleanup_errors=True)
+    except OSError as exc:
+        raise _SynthError(f"could not create ABC temp directory: {_os_error_detail(exc)}") from exc
+    with tmp_ctx as tmpdir:
         in_blif_path = os.path.join(tmpdir, "in.blif")
         lib_path = os.path.join(tmpdir, "basis.genlib")
         blif_path = os.path.join(tmpdir, "out.blif")
@@ -276,9 +295,15 @@ def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_s
         # first stage of every `opt_script` below) accepts either input form
         # identically, so nothing downstream (opt_script, map, write_blif,
         # this function's own `parse_blif` read-back) needed to change.
-        write_blif(view, in_blif_path)
-        with open(lib_path, "w") as f:
-            f.write(genlib_text)
+        try:
+            write_blif(view, in_blif_path)
+        except OSError as exc:
+            raise _SynthError(f"could not write ABC input file: {_os_error_detail(exc)}") from exc
+        try:
+            with open(lib_path, "w") as f:
+                f.write(genlib_text)
+        except OSError as exc:
+            raise _SynthError(f"could not write ABC library file: {_os_error_detail(exc)}") from exc
         script = (
             f'read_blif "{in_blif_path}"; {opt_script}; '
             f'read_genlib "{lib_path}"; map; write_blif "{blif_path}"'
@@ -291,17 +316,33 @@ def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_s
             result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise _SynthError(f"ABC synthesis timed out after {timeout}s") from exc
+        except OSError as exc:
+            raise _SynthError(f"could not run ABC: {_os_error_detail(exc)}") from exc
         if result.returncode != 0:
             # Covers both a clean ABC-reported error and a hard crash (e.g. a
             # segfault, seen for real during development before finding 2
             # above was understood) -- either way, treated identically as a
             # failed synthesis attempt, never propagated as a crash.
-            detail = _scrub_abc_output(result.stderr or result.stdout or "", tmpdir).strip()
-            raise _SynthError(f"ABC synthesis process exited with code {result.returncode}: {detail}")
+            detail = _scrub_abc_output(result.stderr or "", tmpdir).strip()
+            if not detail:
+                detail = _scrub_abc_output(result.stdout or "", tmpdir).strip()
+            detail = detail[-500:]
+            suffix = f": {detail}" if detail else ""
+            raise _SynthError(f"ABC synthesis process exited with code {result.returncode}{suffix}")
         if not os.path.exists(blif_path) or os.path.getsize(blif_path) == 0:
-            raise _SynthError(f"ABC synthesis produced no BLIF output: {_scrub_abc_output(result.stdout, tmpdir).strip()}")
-        with open(blif_path) as f:
-            blif_text = f.read()
+            # rc == 0 with no output: ABC reports most errors (e.g. a missing
+            # genlib) on stderr, with stdout holding only the echo line.
+            detail = _scrub_abc_output(result.stderr or "", tmpdir).strip()
+            if not detail:
+                detail = _scrub_abc_output(result.stdout or "", tmpdir).strip()
+            detail = detail[-500:]
+            suffix = f": {detail}" if detail else ""
+            raise _SynthError(f"ABC synthesis produced no BLIF output{suffix}")
+        try:
+            with open(blif_path) as f:
+                blif_text = f.read()
+        except OSError as exc:
+            raise _SynthError(f"could not read ABC output file: {_os_error_detail(exc)}") from exc
     return parse_blif(blif_text)
 
 
@@ -467,13 +508,13 @@ class DepthOptResult:
     depth_before: int
     depth_after: int
     note: str
-    # None: optimization RAN TO COMPLETION (ABC succeeded and, if it ran,
-    # equivalence verified) but simply found nothing better -- a genuine
-    # "already optimal" outcome. Non-None: optimization did NOT complete
-    # (ABC crashed/errored/timed out, produced an unparseable BLIF, or the
-    # post-synthesis equivalence check itself raised or found a mismatch) --
-    # a short, human-readable reason, never derived from `note` (router
-    # reads this field, not `note`, to decide how to phrase failure).
+    # Non-None: optimization did NOT complete (ABC crashed/errored/timed out,
+    # produced an unparseable BLIF, or the post-synthesis equivalence check
+    # itself raised or found a mismatch) -- a short, human-readable reason,
+    # never derived from `note` (router reads this field, not `note`, to
+    # decide how to phrase failure). None says nothing about whether
+    # anything ran: it is also the value of the depth-0 early return, where
+    # ABC never ran. It only means "no failure was recorded".
     failure: Optional[str] = None
 
 
@@ -537,13 +578,17 @@ def optimize_depth(
     try:
         eq = verify_equivalence(design, work, timeout=verify_timeout)
     except ABCBridgeError as exc:
+        # "Inconclusive" (timeout / undecided) is not "failed": ABC gave no
+        # verdict, which must not read as a mismatch. Any other bridge error
+        # stays loud under the old prefix.
+        prefix = _verify_failure_prefix(exc)
         return DepthOptResult(
             design,
             False,
             depth_before,
             depth_before,
-            f"ABC could not improve depth (equivalence check failed: {exc}); kept the original design.",
-            failure=f"equivalence check failed: {exc}",
+            f"ABC could not improve depth ({prefix}: {exc}); kept the original design.",
+            failure=f"{prefix}: {exc}",
         )
     if not eq.equivalent:
         return DepthOptResult(
@@ -627,13 +672,17 @@ def optimize_cone_depth(
     try:
         eq = verify_equivalence(design, work, timeout=verify_timeout)
     except ABCBridgeError as exc:
+        # "Inconclusive" (timeout / undecided) is not "failed": ABC gave no
+        # verdict, which must not read as a mismatch. Any other bridge error
+        # stays loud under the old prefix.
+        prefix = _verify_failure_prefix(exc)
         return DepthOptResult(
             design,
             False,
             depth_before,
             depth_before,
-            f"ABC could not improve depth (equivalence check failed: {exc}); kept the original design.",
-            failure=f"equivalence check failed: {exc}",
+            f"ABC could not improve depth ({prefix}: {exc}); kept the original design.",
+            failure=f"{prefix}: {exc}",
         )
     if not eq.equivalent:
         return DepthOptResult(
@@ -772,7 +821,7 @@ def optimize_gate_count(
         try:
             eq = verify_equivalence(design, work, timeout=verify_timeout)
         except ABCBridgeError as exc:
-            incomplete.append(f"equivalence check failed: {exc}")
+            incomplete.append(f"{_verify_failure_prefix(exc)}: {exc}")
             continue
         if not eq.equivalent:
             incomplete.append(f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}")
@@ -873,7 +922,7 @@ def optimize_cone_gate_count(
         try:
             eq = verify_equivalence(design, work, timeout=verify_timeout)
         except ABCBridgeError as exc:
-            incomplete.append(f"equivalence check failed: {exc}")
+            incomplete.append(f"{_verify_failure_prefix(exc)}: {exc}")
             continue
         if not eq.equivalent:
             incomplete.append(f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}")

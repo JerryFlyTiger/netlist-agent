@@ -891,6 +891,9 @@ def find_signal_pair_for_operator(session: Session, target: str, op: str) -> dic
         "pair": list(result.pair) if result.pair is not None else None,
         "explanation": result.explanation,
         "stats": result.stats,
+        # False = "Undetermined.": no pair found but the search was not
+        # exhaustive, so `found: false` does not mean no such pair exists.
+        "conclusive": result.conclusive,
     }
 
 
@@ -1485,8 +1488,9 @@ def do_optimize_depth(session: Session, basis: Optional[str] = None) -> dict[str
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
-        # None = the optimization ran and found nothing better; a string = it
-        # could not run (ABC crash/timeout, verification error).
+        # A string = it could not run (ABC crash/timeout, verification error).
+        # None does NOT mean the optimization ran: a depth-0 early exit is
+        # also None, so read `changed`/`note` for what actually happened.
         "failure": result.failure,
     }
 
@@ -1502,8 +1506,9 @@ def do_optimize_cone_depth(session: Session, net: str, basis: Optional[str] = No
         "depth_before": result.depth_before,
         "depth_after": result.depth_after,
         "note": result.note,
-        # None = the optimization ran and found nothing better; a string = it
-        # could not run (ABC crash/timeout, verification error).
+        # A string = it could not run (ABC crash/timeout, verification error).
+        # None does NOT mean the optimization ran: a depth-0 early exit is
+        # also None, so read `changed`/`note` for what actually happened.
         "failure": result.failure,
     }
 

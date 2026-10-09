@@ -2354,3 +2354,30 @@ def test_hand_written_return_keys_still_exist(name: str, tmp_path) -> None:
         f"{name}'s description promises key(s) {missing} that the tool does not return; "
         f"it actually returns {sorted(result)}"
     )
+
+
+def test_find_signal_pair_tool_dict_carries_conclusive(tmp_path, monkeypatch) -> None:
+    """Batch 14: found=false alone cannot distinguish 'no pair' from 'could not
+    decide'; the tool dict must expose `conclusive`."""
+    from netlist_agent import signal_pair_search as sps
+    from netlist_agent.abc_bridge import CecUndecidedError
+    from netlist_agent.llm.tools_schema import find_signal_pair_for_operator
+
+    src = tmp_path / "pair.v"
+    src.write_text(
+        "module top(a, b, z, w);\n  input a, b;\n  output z, w;\n"
+        "  and g0(z, a, b);\n  and g1(w, a, b);\nendmodule\n"
+    )
+    session = Session()
+    session.current_design = parse_verilog(str(src))
+
+    ok = find_signal_pair_for_operator(session, "z", "AND")
+    assert ok["found"] is True and ok["conclusive"] is True
+
+    def _undecided(*a, **k):
+        raise CecUndecidedError("Networks are undecided (SAT solver timed out).")
+
+    monkeypatch.setattr(sps, "_verify_pair", _undecided)
+    out = find_signal_pair_for_operator(session, "z", "AND")
+    assert out["found"] is False and out["conclusive"] is False
+    assert out["explanation"].startswith("Undetermined.")

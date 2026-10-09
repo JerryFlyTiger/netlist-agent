@@ -467,5 +467,131 @@ def test_run_abc_nonzero_exit_raises_with_stderr(monkeypatch) -> None:
     monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
     monkeypatch.setattr(subprocess_module, "run", lambda *a, **k: _FakeResult())
 
-    with pytest.raises(ABCBridgeError, match="Assertion"):
+    from netlist_agent.abc_bridge import ABCInconclusiveError
+
+    with pytest.raises(ABCBridgeError, match="Assertion") as exc:
         _run_abc("some script", timeout=5.0)
+    # A crash is not "no verdict": it must stay loud.
+    assert not isinstance(exc.value, ABCInconclusiveError)
+
+
+# ----------------------------------------------------------------------
+# Batch 14: "ABC gave no verdict" is its own exception family
+# ----------------------------------------------------------------------
+
+
+def test_parse_cec_output_verdicts_and_failures() -> None:
+    import pytest
+
+    from netlist_agent.abc_bridge import (
+        ABCBridgeError,
+        ABCInconclusiveError,
+        CecUndecidedError,
+        _parse_cec_output,
+    )
+
+    assert _parse_cec_output("Networks are equivalent after structural hashing.  Time = 0.00 sec").equivalent is True
+    assert _parse_cec_output("Networks are NOT EQUIVALENT.  Time = 0.00 sec\nINPUT: ...").equivalent is False
+
+    with pytest.raises(ABCBridgeError, match="could not compare") as miter:
+        _parse_cec_output("Miter computation has failed.")
+    assert not isinstance(miter.value, ABCInconclusiveError)
+
+    with pytest.raises(CecUndecidedError, match="SAT solver timed out") as und:
+        _parse_cec_output("Networks are undecided (SAT solver timed out).")
+    assert type(und.value) is CecUndecidedError
+    assert isinstance(und.value, ABCInconclusiveError) and isinstance(und.value, ABCBridgeError)
+
+    with pytest.raises(CecUndecidedError):
+        _parse_cec_output("Networks are UNDECIDED. Time = 1.00 sec")
+
+    with pytest.raises(ABCBridgeError, match="unrecognized") as unk:
+        _parse_cec_output("some totally unexpected banner")
+    assert type(unk.value) is ABCBridgeError
+    assert not isinstance(unk.value, ABCInconclusiveError)
+
+
+def test_run_abc_timeout_raises_abc_timeout_error(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    import pytest
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCInconclusiveError, ABCTimeoutError, _run_abc
+
+    def _boom(*a, **k):
+        raise subprocess_module.TimeoutExpired(cmd="abc", timeout=5.0)
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+
+    with pytest.raises(ABCTimeoutError, match="timed out after 5.0s") as exc:
+        _run_abc("some script", timeout=5.0)
+    assert isinstance(exc.value, ABCInconclusiveError)
+
+    # 14b: the message names the ABC command but not the temp-file paths.
+    with pytest.raises(ABCTimeoutError, match="timed out after 5.0s") as exc2:
+        _run_abc('cec "/var/folders/zz/a.blif" "/var/folders/zz/b.blif"', timeout=5.0)
+    assert "'cec'" in str(exc2.value)
+    assert "/var/folders" not in str(exc2.value)
+    assert ".blif" not in str(exc2.value)
+
+
+def test_run_abc_nonzero_exit_message_has_command_code_stderr_but_no_paths(monkeypatch) -> None:
+    import subprocess as subprocess_module
+    import types
+
+    import pytest
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError, _run_abc
+
+    def _fake_run(*a, **k):
+        return types.SimpleNamespace(returncode=134, stdout="", stderr="Assertion failed: boom")
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _fake_run)
+
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_abc('cec "/var/folders/zz/a.blif" "/var/folders/zz/b.blif"', timeout=5.0)
+    msg = str(exc.value)
+    assert not isinstance(exc.value, ABCInconclusiveError)
+    assert "code 134" in msg and "'cec'" in msg and "Assertion failed: boom" in msg
+    assert "/var/folders" not in msg and ".blif" not in msg
+
+
+def test_parse_cec_output_order_decided_verdicts_beat_undecided_word() -> None:
+    import pytest
+
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError, _parse_cec_output
+
+    # A definite verdict wins even if the word "undecided" also appears.
+    res = _parse_cec_output("Networks are NOT EQUIVALENT.  (1 output undecided)")
+    assert res.equivalent is False
+    res = _parse_cec_output("Networks are equivalent.  (0 outputs undecided)")
+    assert res.equivalent is True
+    # A failed miter stays a loud, non-inconclusive error even with "undecided" in the text.
+    with pytest.raises(ABCBridgeError) as miter:
+        _parse_cec_output("Miter computation has failed. Result is undecided.")
+    assert not isinstance(miter.value, ABCInconclusiveError)
+
+
+def test_resolve_abc_timeout_is_not_inconclusive(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    import pytest
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError, _resolve_abc
+
+    def _boom(*a, **k):
+        raise subprocess_module.TimeoutExpired(cmd="bash", timeout=1.0)
+
+    # Reset the global cache through monkeypatch so it is restored afterwards.
+    monkeypatch.setattr(abc_bridge_module, "_abc_path", None)
+    monkeypatch.setattr(subprocess_module, "run", _boom)
+
+    with pytest.raises(ABCBridgeError, match="timed out resolving") as exc:
+        _resolve_abc()
+    # Not finding the tool is not "ABC gave no verdict".
+    assert not isinstance(exc.value, ABCInconclusiveError)

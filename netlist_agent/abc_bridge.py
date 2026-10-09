@@ -29,8 +29,13 @@ binary before this module was written -- do not re-derive, just rely on it):
      equivalent, or parse/miter failure) -- never trust returncode, always
      parse stdout text. Failure patterns seen: "Miter computation has failed"
      (PI/PO count or name mismatch) and "Reading network from file has
-     failed" (unreadable file). This module raises `ABCBridgeError` if stdout
-     matches none of the known patterns, rather than silently guessing.
+     failed" (unreadable file). A third, non-verdict outcome is "Networks are
+     undecided (SAT solver timed out)." (verbatim, exit code 0): ABC gave no
+     answer either way; this raises `CecUndecidedError` (an
+     `ABCInconclusiveError`). A subprocess timeout raises `ABCTimeoutError`
+     (also an `ABCInconclusiveError`). This module raises plain
+     `ABCBridgeError` if stdout matches none of the known patterns, rather
+     than silently guessing.
      Unused/extra PI ports declared on both sides are harmless as long as
      both sides declare the identical PI (and PO) name *sets* -- this module
      guarantees that by construction (it builds both files) and additionally
@@ -102,12 +107,30 @@ DffQMode = Literal["free_pi", "const_zero"]
 
 class ABCBridgeError(Exception):
     """Raised whenever this module cannot proceed with confidence: the ABC
-    binary can't be resolved/invoked (including a timeout), ABC's stdout
-    matches none of the known equivalent/not-equivalent/failure patterns, ABC
-    itself reports it could not build the miter (e.g. mismatched PI/PO sets
-    -- caught pre-flight in Python instead, see `verify_equivalence`), or an
-    internal invariant of this module is violated (e.g. a net reported
-    equivalent to both constant 0 and constant 1)."""
+    binary can't be resolved/invoked, ABC crashes (nonzero exit), ABC's stdout
+    matches none of the known equivalent/not-equivalent/undecided/failure
+    patterns, ABC itself reports it could not build the miter (e.g. mismatched
+    PI/PO sets -- caught pre-flight in Python instead, see `verify_equivalence`),
+    or an internal invariant of this module is violated (e.g. a net reported
+    equivalent to both constant 0 and constant 1). `ABCInconclusiveError`
+    (and its subclasses `ABCTimeoutError`, `CecUndecidedError`) means "ABC gave
+    no verdict" -- the only outcomes callers may degrade to "undetermined";
+    everything else must stay loud."""
+
+
+class ABCInconclusiveError(ABCBridgeError):
+    """ABC did not give a verdict (timed out, or reported the miter
+    undecided). Never to be mapped onto `EquivResult(equivalent=False)`:
+    "could not decide" is not "not equivalent"."""
+
+
+class ABCTimeoutError(ABCInconclusiveError):
+    """The ABC subprocess exceeded its time budget."""
+
+
+class CecUndecidedError(ABCInconclusiveError):
+    """`cec` itself reported the networks undecided (e.g. "Networks are
+    undecided (SAT solver timed out).")."""
 
 
 _abc_path: Optional[str] = None
@@ -130,12 +153,22 @@ def _resolve_abc() -> str:
     return _abc_path
 
 
+def _script_command(script: str) -> str:
+    """The ABC command name only (e.g. `cec`) -- the rest of `script` is
+    temp-file paths, kept out of the timeout / nonzero-exit messages (those
+    end up in user-facing responses via the optimize paths). This does not
+    cover ABC's stdout: its first line echoes the full command line, paths
+    included, and messages built from stdout still carry it."""
+    words = script.split()
+    return words[0] if words else ""
+
+
 def _run_abc(script: str, timeout: float) -> str:
     abc_path = _resolve_abc()
     try:
         result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise ABCBridgeError(f"ABC invocation timed out after {timeout}s running {script!r}") from exc
+        raise ABCTimeoutError(f"ABC invocation timed out after {timeout}s running {_script_command(script)!r}") from exc
     if result.returncode != 0:
         # A nonzero exit is ABC crashing (e.g. an internal assert/SIGABRT),
         # distinct from the "always 0" guarantee documented above for the
@@ -144,7 +177,9 @@ def _run_abc(script: str, timeout: float) -> str:
         # relied on reading `stdout` when the process crashed, so raising
         # here instead of returning is safe.
         stderr_tail = result.stderr.strip()[-500:]
-        raise ABCBridgeError(f"ABC exited with code {result.returncode} running {script!r}: {stderr_tail}")
+        raise ABCBridgeError(
+            f"ABC exited with code {result.returncode} running {_script_command(script)!r}: {stderr_tail}"
+        )
     return result.stdout
 
 
@@ -155,6 +190,8 @@ def _parse_cec_output(stdout: str) -> "EquivResult":
         return EquivResult(False, stdout.strip())
     if "Miter computation has failed" in stdout or "Reading network from file has failed" in stdout:
         raise ABCBridgeError(f"ABC could not compare the two networks: {stdout.strip()}")
+    if "undecided" in stdout.lower():
+        raise CecUndecidedError(f"ABC `cec` could not reach a verdict: {stdout.strip()}")
     raise ABCBridgeError(
         f"unrecognized ABC `cec` output (matched neither the equivalent nor the "
         f"not-equivalent pattern) -- failing loudly instead of guessing: {stdout.strip()}"

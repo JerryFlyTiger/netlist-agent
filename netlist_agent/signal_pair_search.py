@@ -17,7 +17,12 @@ instead runs a three-stage pipeline:
      pair is checked for real via `abc_bridge.are_equivalent` (which is
      exact, not probabilistic) on a throwaway copy of the design with one
      extra OP gate spliced in; the first one that formally holds is
-     returned.
+     returned. The search has three possible conclusions: "Yes." (a pair
+     formally holds), a clean "No." (every candidate was formally refuted, the
+     candidate set was not truncated), or "Undetermined." (a candidate was
+     undecided by ABC, left unverified by a limit, the set was truncated, or no
+     signature could be computed for the target -- a matching pair may still
+     exist).
 
 DFF boundary handling is delegated entirely to
 `abc_bridge.extract_combinational_view(..., "free_pi", ...)` (each DFF's Q
@@ -35,7 +40,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-from netlist_agent.abc_bridge import DEFAULT_ABC_TIMEOUT, are_equivalent, extract_combinational_view
+from netlist_agent.abc_bridge import (
+    DEFAULT_ABC_TIMEOUT,
+    ABCInconclusiveError,
+    are_equivalent,
+    extract_combinational_view,
+)
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, OUTPUT_PIN
 from netlist_agent.netref import netbit_token
 
@@ -55,8 +65,14 @@ DEFAULT_MAX_CANDIDATES_FOR_PAIRING = 4000
 # verification, independent of how the candidate set was built.
 DEFAULT_PAIR_COLLECT_CAP = 200
 # Cap on how many candidate pairs are actually run through ABC (the
-# expensive step) before giving up and answering "no".
+# expensive step) before giving up. Hitting this cap with candidates left
+# over is NOT a "no": the result is "Undetermined." (see `find_pair_for_op`).
 DEFAULT_MAX_VERIFY = 20
+# Cap on how many pairs ABC may fail to decide (timeout / undecided) before the
+# search stops sending further pairs. Each undecided pair can cost a full ABC
+# timeout, so without this cap the worst case is max_verify * timeout. The
+# pairs not yet sent are counted as unverified (never as refuted).
+DEFAULT_MAX_UNDECIDED = 2
 
 
 @dataclass(frozen=True)
@@ -67,6 +83,12 @@ class PairSearchResult:
     pair: Optional[tuple[str, str]]
     explanation: str
     stats: dict[str, int] = field(default_factory=dict)
+    # True when the answer is definite: a verified pair was found, or the
+    # search was exhaustive with every candidate formally refuted. False means
+    # "Undetermined." -- a matching pair may still exist (some candidate pair
+    # was undecided / not verified, the candidate set was truncated, or no
+    # signature could be computed for the target so nothing was checked).
+    conclusive: bool = True
 
 
 # ----------------------------------------------------------------------
@@ -208,6 +230,7 @@ def find_pair_for_op(
     max_candidates_for_pairing: int = DEFAULT_MAX_CANDIDATES_FOR_PAIRING,
     pair_collect_cap: int = DEFAULT_PAIR_COLLECT_CAP,
     max_verify: int = DEFAULT_MAX_VERIFY,
+    max_undecided: int = DEFAULT_MAX_UNDECIDED,
     seed: Optional[int] = 0,
     timeout: float = DEFAULT_ABC_TIMEOUT,
 ) -> PairSearchResult:
@@ -227,10 +250,24 @@ def find_pair_for_op(
     rate per random sample set, negligible at N=2048 but not zero) -- every
     surviving candidate pair is re-checked by exact formal verification
     (`_verify_pair`) before being reported as a real answer.
+
+    Conclusions: "Yes. ..." (`found`, conclusive), a clean "No. ..." (not
+    `found`, conclusive: nothing truncated, nothing undecided, nothing left
+    unverified), or "Undetermined. ..." (not `found`, `conclusive` False).
+    ABC timeouts / undecided verdicts on a pair are counted, not raised;
+    other `ABCBridgeError`s still propagate. The search stops sending pairs
+    once `max_verify` pairs were sent or `max_undecided` of them were
+    undecided; the remaining pairs count as `pairs_unverified`.
+
+    Note: `stats["pairs_verified"]` is the number of pairs sent to ABC
+    (including undecided ones), while the "formally verified" figure in
+    messages excludes undecided pairs.
     """
     op = op.upper()
     if op not in SUPPORTED_OPS:
         raise ValueError(f"unsupported operator {op!r}; choose one of {SUPPORTED_OPS}")
+    if max_undecided < 1:
+        raise ValueError(f"max_undecided must be >= 1, got {max_undecided}")
 
     comb = extract_combinational_view(design, "free_pi")
     sig = _simulate_signatures(comb, num_samples, seed)
@@ -241,9 +278,11 @@ def find_pair_for_op(
             op,
             netbit_token(target),
             None,
-            f"No: could not compute a signature for {netbit_token(target)} in the combinational view "
-            "(check that the net name/bit exists in the design).",
-            {"nets_scanned": 0, "signature_survivors": 0, "candidate_pairs_considered": 0, "pairs_verified": 0, "truncated": 0},
+            f"Undetermined. Could not compute a signature for {netbit_token(target)} in the combinational "
+            "view, so no candidate pair was checked; a matching pair may still exist.",
+            {"nets_scanned": 0, "signature_survivors": 0, "candidate_pairs_considered": 0, "pairs_verified": 0, "truncated": 0,
+             "pairs_undecided": 0, "pairs_unverified": 0},
+            False,
         )
 
     mask = (1 << num_samples) - 1
@@ -311,17 +350,35 @@ def find_pair_for_op(
                     else:
                         truncated = True
 
-    verified_count = 0
+    # stats["pairs_verified"] is verified_count, so it includes undecided pairs;
+    # the "formally verified" figure in messages excludes them.
+    verified_count = 0  # pairs actually sent to ABC (decided or not); counts against max_verify
+    undecided_count = 0  # of those, pairs where ABC timed out / reported undecided
+    unverified_count = 0  # pairs never sent to ABC (max_verify or max_undecided reached, or unresolvable)
     found_pair: Optional[tuple[str, str]] = None
-    for a_nb, b_nb in pairs:
-        if verified_count >= max_verify:
+    stopped_for_verify = False  # the loop broke because verified_count reached max_verify
+    stopped_for_undecided = False  # the loop broke because undecided_count reached max_undecided
+    for idx, (a_nb, b_nb) in enumerate(pairs):
+        # Both limits can be reached at the same break point; record each one.
+        if verified_count >= max_verify or undecided_count >= max_undecided:
+            unverified_count += len(pairs) - idx
+            stopped_for_verify = verified_count >= max_verify
+            stopped_for_undecided = undecided_count >= max_undecided
             break
         orig_a = _resolve_to_original(a_nb)
         orig_b = _resolve_to_original(b_nb)
         if orig_a is None or orig_b is None:
+            # Not reachable today (synthetic nets are never candidates), but a
+            # pair that was skipped was not refuted, so it must not count toward a clean "No".
+            unverified_count += 1
             continue
         verified_count += 1
-        if _verify_pair(design, orig_a, orig_b, op, target, timeout):
+        try:
+            holds = _verify_pair(design, orig_a, orig_b, op, target, timeout)
+        except ABCInconclusiveError:
+            undecided_count += 1
+            continue
+        if holds:
             found_pair = (netbit_token(orig_a), netbit_token(orig_b))
             break
 
@@ -331,6 +388,11 @@ def find_pair_for_op(
         "candidate_pairs_considered": len(pairs),
         "pairs_verified": verified_count,
         "truncated": int(truncated),
+        "pairs_undecided": undecided_count,
+        # Pairs left unchecked when the search stopped without a Yes (verification
+        # limit, undecided limit, or unresolvable). Candidates after a found pair
+        # are never counted here: a Yes is definite, so they do not matter.
+        "pairs_unverified": unverified_count,
     }
 
     if found_pair is not None:
@@ -338,15 +400,39 @@ def find_pair_for_op(
         explanation = (
             f"Yes. {op}({a_tok}, {b_tok}) is formally verified equivalent to {netbit_token(target)} "
             f"(scanned {nets_scanned} net(s), {signature_survivors} passed the {num_samples}-sample "
-            f"signature filter, {verified_count} pair(s) formally verified)."
+            f"signature filter, {verified_count - undecided_count} pair(s) formally verified)."
         )
-        return PairSearchResult(True, op, netbit_token(target), found_pair, explanation, stats)
+        if undecided_count:
+            explanation += (
+                f" {undecided_count} earlier candidate pair(s) could not be decided by ABC "
+                f"(timeout/undecided); that does not affect this result."
+            )
+        return PairSearchResult(True, op, netbit_token(target), found_pair, explanation, stats, True)
 
+    if not truncated and unverified_count == 0 and undecided_count == 0:
+        explanation = (
+            f"No. Scanned {nets_scanned} net(s); {signature_survivors} signal(s)/pair(s) passed the "
+            f"{num_samples}-sample signature filter, {verified_count} candidate pair(s) were formally "
+            f"verified and none held."
+        )
+        return PairSearchResult(False, op, netbit_token(target), None, explanation, stats, True)
+
+    refuted = verified_count - undecided_count
+    reasons = []
+    if stopped_for_undecided:
+        reasons.append(
+            f"The search stopped once {undecided_count} pair(s) could not be decided "
+            f"(max_undecided={max_undecided}), to bound the time spent in ABC."
+        )
+    if stopped_for_verify:
+        reasons.append(f"The verification limit was reached (max_verify={max_verify}).")
+    reason = " ".join(reasons) + (" " if reasons else "")
     explanation = (
-        f"No. Scanned {nets_scanned} net(s); {signature_survivors} signal(s)/pair(s) passed the "
-        f"{num_samples}-sample signature filter, {verified_count} candidate pair(s) were formally "
-        f"verified and none held."
+        f"Undetermined. Scanned {nets_scanned} net(s); {signature_survivors} signal(s)/pair(s) passed the "
+        f"{num_samples}-sample signature filter; {refuted} candidate pair(s) were formally verified and "
+        f"none held; {undecided_count} pair(s) could not be decided (ABC timeout or undecided); "
+        f"{unverified_count} pair(s) were not checked; the candidate set was "
+        f"{'truncated' if truncated else 'not truncated'}. "
+        f"{reason}So a matching pair may still exist."
     )
-    if truncated:
-        explanation += " The candidate set exceeded the search cap and was truncated."
-    return PairSearchResult(False, op, netbit_token(target), None, explanation, stats)
+    return PairSearchResult(False, op, netbit_token(target), None, explanation, stats, False)

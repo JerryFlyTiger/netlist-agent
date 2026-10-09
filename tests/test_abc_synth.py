@@ -816,3 +816,54 @@ def test_area_opt_depth_zero_early_return_has_no_candidates() -> None:
     result = optimize_gate_count(design)
     assert result.candidates == 0
     assert result.incomplete == ()
+
+
+# ----------------------------------------------------------------------
+# Batch 15 (F3): temp-dir paths from ABC must not reach _SynthError text
+# ----------------------------------------------------------------------
+
+
+def _patch_synth_abc(monkeypatch, returncode, stdout_fmt, stderr_fmt):
+    import re
+    import subprocess as subprocess_module
+    import types
+
+    def _fake_run(argv, **k):
+        d = re.search(r'read_blif "(.*?)/in\.blif"', argv[2]).group(1)
+        return types.SimpleNamespace(
+            returncode=returncode, stdout=stdout_fmt.format(d=d), stderr=stderr_fmt.format(d=d)
+        )
+
+    monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _fake_run)
+
+
+def test_synth_error_nonzero_exit_stderr_has_no_tmpdir(monkeypatch) -> None:
+    _patch_synth_abc(monkeypatch, 1, "", 'Cannot open input file "{d}/basis.genlib". ')
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "code 1" in msg and "Cannot open input file" in msg
+    assert "abc_synth_" not in msg
+
+
+def test_synth_error_nonzero_exit_falls_back_to_scrubbed_stdout(monkeypatch) -> None:
+    # Empty stderr: the message falls back to stdout, which carries the echo
+    # line and the paths, so the fallback must be scrubbed too.
+    out = '======== ABC command line "read_blif "{d}/in.blif"; strash"\nCannot open input file "{d}/in.blif". \n'
+    _patch_synth_abc(monkeypatch, 1, out, "")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "code 1" in msg and 'Cannot open input file "in.blif"' in msg
+    assert "abc_synth_" not in msg and "ABC command line" not in msg
+
+
+def test_synth_error_no_blif_output_stdout_has_no_tmpdir(monkeypatch) -> None:
+    out = '======== ABC command line "read_blif "{d}/in.blif"; strash"\nCannot open input file "{d}/in.blif". \n'
+    _patch_synth_abc(monkeypatch, 0, out, "")
+    with pytest.raises(_SynthError) as exc:
+        abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
+    msg = str(exc.value)
+    assert "no BLIF output" in msg and "Cannot open input file" in msg
+    assert "abc_synth_" not in msg and "ABC command line" not in msg

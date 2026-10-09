@@ -76,6 +76,7 @@ from netlist_agent.abc_bridge import (
     _is_declared_bit,
     _restrict_to_fanin_cone,
     _resolve_abc,
+    _scrub_abc_output,
     extract_combinational_view,
     verify_equivalence,
     write_blif,
@@ -295,10 +296,10 @@ def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_s
             # segfault, seen for real during development before finding 2
             # above was understood) -- either way, treated identically as a
             # failed synthesis attempt, never propagated as a crash.
-            detail = (result.stderr or result.stdout or "").strip()
+            detail = _scrub_abc_output(result.stderr or result.stdout or "", tmpdir).strip()
             raise _SynthError(f"ABC synthesis process exited with code {result.returncode}: {detail}")
         if not os.path.exists(blif_path) or os.path.getsize(blif_path) == 0:
-            raise _SynthError(f"ABC synthesis produced no BLIF output: {result.stdout.strip()}")
+            raise _SynthError(f"ABC synthesis produced no BLIF output: {_scrub_abc_output(result.stdout, tmpdir).strip()}")
         with open(blif_path) as f:
             blif_text = f.read()
     return parse_blif(blif_text)

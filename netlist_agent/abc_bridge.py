@@ -156,14 +156,35 @@ def _resolve_abc() -> str:
 def _script_command(script: str) -> str:
     """The ABC command name only (e.g. `cec`) -- the rest of `script` is
     temp-file paths, kept out of the timeout / nonzero-exit messages (those
-    end up in user-facing responses via the optimize paths). This does not
-    cover ABC's stdout: its first line echoes the full command line, paths
-    included, and messages built from stdout still carry it."""
+    end up in user-facing responses via the optimize paths). ABC's own
+    stdout / stderr carry the paths too (the command-line echo line, and
+    `Cannot open input file "<tmp>/x.blif"`); those are cleaned by
+    `_scrub_abc_output`."""
     words = script.split()
     return words[0] if words else ""
 
 
-def _run_abc(script: str, timeout: float) -> str:
+_ABC_ECHO_PREFIX = "======== ABC command line"
+
+
+def _scrub_abc_output(text: str, tmpdir: Optional[str]) -> str:
+    """Remove temp-dir paths from ABC's stdout / stderr before the text can
+    reach a user-facing message. Drops the `======== ABC command line ...`
+    echo line wherever it appears, turns `<tmpdir>/x.blif` into `x.blif`
+    (keeps the file name for diagnosis) and any bare `<tmpdir>` into `<tmp>`."""
+    kept = [ln for ln in text.splitlines(keepends=True) if not ln.startswith(_ABC_ECHO_PREFIX)]
+    out = "".join(kept)
+    if tmpdir:
+        out = out.replace(tmpdir + os.sep, "").replace(tmpdir, "<tmp>")
+    return out
+
+
+def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> str:
+    """Production callers must pass `tmpdir` (the directory `script`'s files
+    live in): without it only the command-line echo is dropped, and paths in
+    other lines (e.g. `Cannot open input file "..."`) pass through. It is
+    optional only because tests call this directly against a fake ABC whose
+    output carries no temp dir."""
     abc_path = _resolve_abc()
     try:
         result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
@@ -176,11 +197,11 @@ def _run_abc(script: str, timeout: float) -> str:
         # `cec` -- this module's only caller of `_run_abc` (`_run_cec`) never
         # relied on reading `stdout` when the process crashed, so raising
         # here instead of returning is safe.
-        stderr_tail = result.stderr.strip()[-500:]
+        stderr_tail = _scrub_abc_output(result.stderr, tmpdir).strip()[-500:]
         raise ABCBridgeError(
             f"ABC exited with code {result.returncode} running {_script_command(script)!r}: {stderr_tail}"
         )
-    return result.stdout
+    return _scrub_abc_output(result.stdout, tmpdir)
 
 
 def _parse_cec_output(stdout: str) -> "EquivResult":
@@ -364,7 +385,7 @@ def _run_cec(design_a: Design, design_b: Design, timeout: float) -> "EquivResult
         path_b = os.path.join(tmpdir, "b.blif")
         write_blif(design_a, path_a)
         write_blif(design_b, path_b)
-        stdout = _run_abc(f'cec "{path_a}" "{path_b}"', timeout=timeout)
+        stdout = _run_abc(f'cec "{path_a}" "{path_b}"', timeout=timeout, tmpdir=tmpdir)
     return _parse_cec_output(stdout)
 
 

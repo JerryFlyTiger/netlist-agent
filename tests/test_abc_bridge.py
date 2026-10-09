@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
 from netlist_agent.abc_bridge import (
     are_equivalent,
     check_symmetry,
@@ -595,3 +597,129 @@ def test_resolve_abc_timeout_is_not_inconclusive(monkeypatch) -> None:
         _resolve_abc()
     # Not finding the tool is not "ABC gave no verdict".
     assert not isinstance(exc.value, ABCInconclusiveError)
+
+
+# ----------------------------------------------------------------------
+# Batch 15 (F3): ABC's temp-dir paths must not reach user-facing text
+# ----------------------------------------------------------------------
+
+_ECHO = '======== ABC command line "cec "{d}/a.blif" "{d}/b.blif""'
+
+
+def test_scrub_abc_output_unit() -> None:
+    from netlist_agent.abc_bridge import _scrub_abc_output
+
+    d = "/var/folders/xx/T/abc_bridge_q1"
+    # Echo line removed, first line or not.
+    assert _scrub_abc_output(_ECHO.format(d=d) + "\nNetworks are NOT EQUIVALENT.\n", d) == "Networks are NOT EQUIVALENT.\n"
+    assert _scrub_abc_output("banner\n" + _ECHO.format(d=d) + "\nInput pattern: 01\n", d) == "banner\nInput pattern: 01\n"
+    # Error line keeps the file name, loses the directory.
+    assert _scrub_abc_output(f'Cannot open input file "{d}/x.blif". \n', d) == 'Cannot open input file "x.blif". \n'
+    # Bare directory becomes <tmp>.
+    assert _scrub_abc_output(f"dir is {d}\n", d) == "dir is <tmp>\n"
+    # Lines without the directory are untouched.
+    text = "Networks are NOT EQUIVALENT.  Time = 0.00 sec\nInput pattern: 101\n"
+    assert _scrub_abc_output(text, d) == text
+
+
+def _patch_abc(monkeypatch, make_result):
+    """Patch ABC out; `make_result(tmpdir)` builds the fake CompletedProcess
+    from the real temp dir recovered out of the script string."""
+    import re
+    import subprocess as subprocess_module
+    import types
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+
+    def _fake_run(argv, **k):
+        tmpdir = re.search(r'"(.*?)/a\.blif"', argv[2]).group(1)
+        rc, out, err = make_result(tmpdir)
+        return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+
+    monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(subprocess_module, "run", _fake_run)
+
+
+def _tiny_designs(tmp_path):
+    path = _write(tmp_path, "t.v", "module top(a, b, y);\n input a, b;\n output y;\n and g0(y, a, b);\nendmodule\n")
+    return parse_verilog(path), parse_verilog(path)
+
+
+def test_run_cec_detail_has_no_tmpdir_or_echo_line(monkeypatch, tmp_path) -> None:
+    from netlist_agent.abc_bridge import _run_cec
+
+    def _res(d):
+        return 0, _ECHO.format(d=d) + "\nNetworks are NOT EQUIVALENT.  Time = 0.00 sec\nInput pattern: 10\n", ""
+
+    _patch_abc(monkeypatch, _res)
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 5.0)
+    assert not res.equivalent
+    assert "NOT EQUIVALENT" in res.detail and "Input pattern: 10" in res.detail
+    assert "abc_bridge_" not in res.detail and "ABC command line" not in res.detail
+
+
+@pytest.mark.parametrize(
+    ("body", "expect_in"),
+    [
+        ("Miter computation has failed.", "Miter computation has failed"),
+        ("Networks are undecided (SAT solver timed out).", "undecided (SAT solver"),
+        ("some totally unexpected banner", "some totally unexpected banner"),
+        ('Cannot open input file "{d}/nope.blif". ', 'Cannot open input file "nope.blif"'),
+    ],
+)
+def test_run_cec_exception_messages_have_no_tmpdir(monkeypatch, tmp_path, body, expect_in) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    def _res(d):
+        return 0, _ECHO.format(d=d) + "\n" + body.format(d=d) + "\n", ""
+
+    _patch_abc(monkeypatch, _res)
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    msg = str(exc.value)
+    assert expect_in in msg
+    assert "abc_bridge_" not in msg and "ABC command line" not in msg and "/a.blif" not in msg
+
+
+def test_run_cec_nonzero_exit_stderr_is_scrubbed(monkeypatch, tmp_path) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    _patch_abc(monkeypatch, lambda d: (1, "", f'Cannot open input file "{d}/a.blif". '))
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    msg = str(exc.value)
+    assert "code 1" in msg and "Cannot open input file" in msg
+    assert "abc_bridge_" not in msg
+
+
+def test_run_cec_long_stderr_is_scrubbed_before_it_is_truncated(monkeypatch, tmp_path) -> None:
+    # The message keeps only the last 500 chars of stderr. Truncating first
+    # would cut the temp dir in half, and the half left over no longer
+    # matches `tmpdir`, so it would survive the scrub (long macOS temp dirs).
+    # With a short temp dir the cut falls before the path instead; then the
+    # positive `"a.blif"` assertion is the one that fails.
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    _patch_abc(monkeypatch, lambda d: (1, "", f'Cannot open input file "{d}/a.blif". ' + "x" * 460))
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 5.0)
+    msg = str(exc.value)
+    assert 'Cannot open input file "a.blif"' in msg
+    assert "abc_bridge_" not in msg and "/a.blif" not in msg
+
+
+def test_real_abc_not_equivalent_detail_has_no_tmpdir_and_keeps_counterexample(tmp_path) -> None:
+    original, mutated = _tiny_designs(tmp_path)
+    mutated.gates[0].gate_type = GateType.OR
+    res = verify_equivalence(original, mutated)
+    assert not res.equivalent
+    assert "NOT EQUIVALENT" in res.detail
+    assert "abc_bridge_" not in res.detail and "ABC command line" not in res.detail
+    # AND vs OR differ exactly when one input is 1; either is a valid witness.
+    from netlist_agent.property_check import parse_counterexample
+
+    assert parse_counterexample(res.detail) in ({"a": 1, "b": 0}, {"a": 0, "b": 1})

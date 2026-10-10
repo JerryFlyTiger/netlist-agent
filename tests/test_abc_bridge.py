@@ -587,8 +587,10 @@ def test_resolve_abc_timeout_is_not_inconclusive(monkeypatch) -> None:
     from netlist_agent import abc_bridge as abc_bridge_module
     from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError, _resolve_abc
 
+    injected = subprocess_module.TimeoutExpired(cmd="bash", timeout=1.0)
+
     def _boom(*a, **k):
-        raise subprocess_module.TimeoutExpired(cmd="bash", timeout=1.0)
+        raise injected
 
     # Reset the global cache through monkeypatch so it is restored afterwards.
     monkeypatch.setattr(abc_bridge_module, "_abc_path", None)
@@ -598,6 +600,10 @@ def test_resolve_abc_timeout_is_not_inconclusive(monkeypatch) -> None:
         _resolve_abc()
     # Not finding the tool is not "ABC gave no verdict".
     assert not isinstance(exc.value, ABCInconclusiveError)
+    assert abc_bridge_module.REPO_ROOT not in str(exc.value)
+    assert "scripts/find_abc.sh" in str(exc.value)
+    assert f"after {abc_bridge_module._RESOLVE_TIMEOUT}s" in str(exc.value)
+    assert exc.value.__cause__ is injected
 
 
 # ----------------------------------------------------------------------
@@ -963,3 +969,381 @@ def test_run_abc_nonzero_exit_scrubs_before_truncating(monkeypatch, tmp_path) ->
         _run_abc("cec x y", timeout=5.0, tmpdir=d)
     msg = str(exc.value)
     assert "in.blif" in msg and "/" not in msg
+
+
+# ----------------------------------------------------------------------
+# Batch 17 (F10): the locator's failure text is one clean line, no paths
+# ----------------------------------------------------------------------
+def _fake_locator(monkeypatch, rc, stdout, stderr) -> None:
+    import subprocess as subprocess_module
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+
+    def _run(args, *a, **k):
+        return subprocess_module.CompletedProcess(args, rc, stdout, stderr)
+
+    monkeypatch.setattr(abc_bridge_module, "_abc_path", None)
+    monkeypatch.setattr(subprocess_module, "run", _run)
+
+
+def _not_found_stderr() -> str:
+    from netlist_agent import abc_bridge as abc_bridge_module
+
+    root = abc_bridge_module.REPO_ROOT
+    home = os.path.expanduser("~")
+    return (
+        "error: could not find an ABC binary for platform 'darwin-arm64'.\n\n"
+        "Checked, in order:\n"
+        "  $ABC_BIN (unset)\n"
+        f"  {root}/vendor/darwin-arm64/abc\n"
+        f"  {home}/abc-install/current/darwin-arm64/bin/abc\n"
+        "  abc on $PATH\n\n"
+        f"Run scripts/setup_abc.sh ... ({root}/scripts/find_abc.sh)\n"
+    )
+
+
+def _assert_clean_not_found(msg: str) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+
+    assert abc_bridge_module.REPO_ROOT not in msg
+    assert os.path.basename(abc_bridge_module.REPO_ROOT) not in msg
+    assert os.path.expanduser("~") not in msg
+    assert "\n" not in msg
+    assert "could not find an ABC binary for platform" in msg
+    assert "setup_abc.sh" in msg
+    assert "exited with code 1" in msg
+    assert "Checked, in order" not in msg
+    assert "$ABC_BIN" in msg
+    assert ".;" not in msg
+
+
+def test_resolve_abc_not_found_message_is_one_line_without_paths(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", _not_found_stderr())
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert type(exc.value) is ABCBridgeError
+    _assert_clean_not_found(str(exc.value))
+
+
+@pytest.mark.parametrize("stderr", ["", "  \n \n", "error:\n", "  error:   \n"])
+def test_resolve_abc_empty_stderr_has_no_dangling_colon(monkeypatch, stderr) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 3, "", stderr)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert ": ;" not in msg and not msg.endswith(":") and not msg.endswith(": ")
+    assert "no message" in msg and "exited with code 3" in msg
+    assert "\n" not in msg
+
+
+def test_resolve_abc_bash_own_error_keeps_relative_script_name(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(
+        monkeypatch, 127, "", f"{abc_bridge_module.FIND_ABC_SCRIPT}: line 22: uname: command not found\n"
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert "): scripts/find_abc.sh: line 22: uname: command not found;" in msg
+    assert abc_bridge_module.REPO_ROOT not in msg
+    assert os.path.basename(abc_bridge_module.REPO_ROOT) not in msg
+
+
+def test_resolve_abc_abc_bin_diagnosis_keeps_value_with_home_shortened(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    home = os.path.expanduser("~")
+    _fake_locator(
+        monkeypatch, 1, "", f"error: $ABC_BIN is set to '{home}/x/abc' but it is not an executable file\n"
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert "'~/x/abc'" in msg
+    assert home not in msg
+    assert "error: $ABC_BIN" not in msg and "$ABC_BIN is set to" in msg
+
+
+def test_resolve_abc_home_slash_does_not_mangle_paths(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setenv("HOME", "/")
+    stderr = "error: $ABC_BIN is set to '/usr/bin/x' but '/usr/bin/' and /tmp/ are not it, nor /\n"
+    _fake_locator(monkeypatch, 1, "", stderr)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "'/usr/bin/x' but '/usr/bin/' and /tmp/ are not it, nor /;" in str(exc.value)
+
+
+def test_resolve_abc_blank_stdout_is_an_error_and_not_cached(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 0, "\n", "")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert type(exc.value) is ABCBridgeError
+    assert "printed no path" in str(exc.value)
+    assert abc_bridge_module._abc_path is None
+
+
+def test_resolve_abc_real_script_not_found_message(monkeypatch, tmp_path) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    if (
+        os.path.exists("/usr/bin/abc")
+        or os.path.exists("/bin/abc")
+        or os.path.exists(os.path.join(abc_bridge_module.REPO_ROOT, "vendor"))
+    ):
+        pytest.skip("an ABC binary is reachable; the not-found path cannot be exercised")
+    monkeypatch.delenv("ABC_BIN", raising=False)
+    monkeypatch.setenv("ABC_INSTALL_ROOT", str(tmp_path / "nonexistent"))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(abc_bridge_module, "_abc_path", None)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    _assert_clean_not_found(str(exc.value))
+
+
+def test_resolve_abc_detail_is_first_non_blank_stderr_line(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", "\n  \nerror: first problem\nsecond line\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert "): first problem;" in msg and "second line" not in msg
+
+
+def test_resolve_abc_success_is_cached(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import _resolve_abc
+
+    _fake_locator(monkeypatch, 0, "/some/abc\n", "")
+    assert _resolve_abc() == "/some/abc"
+
+    def _no_more(*a, **k):
+        raise AssertionError("locator re-run despite cached path")
+
+    monkeypatch.setattr(subprocess_module, "run", _no_more)
+    assert _resolve_abc() == "/some/abc"
+
+
+def test_resolve_abc_bare_repo_root_becomes_placeholder(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", f"error: searched {abc_bridge_module.REPO_ROOT} and {abc_bridge_module.REPO_ROOT}/vendor/x\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert "searched <repo> and vendor/x;" in msg
+    assert abc_bridge_module.REPO_ROOT not in msg
+
+
+def test_resolve_abc_detail_prefers_error_line_over_earlier_warning(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(
+        monkeypatch, 1, "", "bash: warning: setlocale: LC_ALL: cannot change locale\n  error: the real problem.\n"
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert "): the real problem;" in msg and "setlocale" not in msg
+
+
+def test_resolve_abc_detail_strips_indent_and_extra_spaces_after_error(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", "   error:   foo  \n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): foo;" in str(exc.value)
+
+    _fake_locator(monkeypatch, 1, "", "   plain line  \nerror:\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    # an `error:` line that is empty after stripping does not hide real text
+    assert "): plain line;" in str(exc.value)
+
+    _fake_locator(monkeypatch, 1, "", "warn\nerror:\nerror: real\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): real;" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "stderr, expected",
+    [("first\nsecond\n", "first"), ("error: a\nerror: b\n", "a"), ("error: foo .\n", "foo")],
+)
+def test_resolve_abc_detail_takes_first_line_and_trims_before_semicolon(monkeypatch, stderr, expected) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", stderr)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert f"): {expected};" in str(exc.value)
+
+
+def test_resolve_abc_detail_strips_only_one_trailing_dot(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", "error: gone...\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): gone..;" in str(exc.value)
+
+
+def test_resolve_abc_detail_strips_only_one_error_prefix(monkeypatch) -> None:
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", "error: error: x\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): error: x;" in str(exc.value)
+
+
+def test_resolve_abc_path_replacement_respects_path_boundaries(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setenv("HOME", "/Users/a")
+    root = abc_bridge_module.REPO_ROOT
+    _fake_locator(
+        monkeypatch,
+        1,
+        "",
+        f"error: x /Users/ab/y {root}2/z '/Users/a' {root}: /Users/a /Users/a.b/c {root}.bak\n",
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert "/Users/ab/y" in msg
+    assert f"{root}2/z" in msg
+    assert "/Users/a.b/c" in msg and f"{root}.bak" in msg
+    assert " '~' <repo>: ~ /Users/a.b/c" in msg
+
+
+def test_resolve_abc_path_replacement_ignores_trailing_punctuation_and_quotes(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setenv("HOME", "/Users/a")
+    root = abc_bridge_module.REPO_ROOT
+    stderr = f'error: {root}. ({root}) {root}, x "/Users/a" ({"/Users/a"}) /Users/a.\n'
+    _fake_locator(monkeypatch, 1, "", stderr)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): <repo>. (<repo>) <repo>, x \"~\" (~) ~;" in str(exc.value)
+
+
+def test_resolve_abc_path_replacement_never_leaks_when_glued_to_other_text(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setenv("HOME", "/Users/a")
+    root = abc_bridge_module.REPO_ROOT
+    stderr = f"error: -L{root}/lib x.{root}/sub x-{root}/sub -I/Users/a/inc 路徑/Users/a/x /mnt{root}/y -L{root} x.{root} y-{root} x./Users/a/z x-/Users/a end\n"
+    _fake_locator(monkeypatch, 1, "", stderr)
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert root not in msg
+    assert "/Users/a" not in msg
+    assert "-Llib" in msg and "-I~/inc" in msg and "路徑~/x" in msg
+    assert "-L<repo> x.<repo> y-<repo> x.~/z x-~ end;" in msg
+
+
+@pytest.mark.parametrize("tail, expected", [("/Users/a", "~"), ("{R}", "<repo>")])
+def test_resolve_abc_path_replacement_at_end_of_line(monkeypatch, tail, expected) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setenv("HOME", "/Users/a")
+    tail = tail.replace("{R}", abc_bridge_module.REPO_ROOT)
+    _fake_locator(monkeypatch, 1, "", f"error: no abc under {tail}\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert f"): no abc under {expected};" in str(exc.value)
+
+
+def test_resolve_abc_repo_root_is_replaced_before_home(monkeypatch) -> None:
+    # Pins the order without relying on where the real repo or $HOME live: both
+    # repo steps (`<root>/` and bare `<root>`) must run before home is shortened,
+    # or the line keeps `~/proj/...` / `~/proj`.
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setattr(abc_bridge_module, "REPO_ROOT", "/home/u/proj")
+    monkeypatch.setenv("HOME", "/home/u")
+    _fake_locator(
+        monkeypatch,
+        127,
+        "",
+        "/home/u/proj/scripts/find_abc.sh: line 22: uname: command not found; searched /home/u/proj\n",
+    )
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): scripts/find_abc.sh: line 22: uname: command not found; searched <repo>;" in str(exc.value)
+
+
+def test_resolve_abc_path_replacement_keeps_names_with_dash_suffix(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setenv("HOME", "/Users/a")
+    root = abc_bridge_module.REPO_ROOT
+    _fake_locator(monkeypatch, 1, "", f"error: {root}-x /Users/a-b\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert f"{root}-x" in msg and "/Users/a-b" in msg
+
+
+@pytest.mark.parametrize(
+    "stderr, expected",
+    [
+        ("error:\nplain line\n", "plain line"),
+        ("error: {R}/\nerror: real\n", "real"),
+    ],
+)
+def test_resolve_abc_detail_is_chosen_after_cleaning(monkeypatch, stderr, expected) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", stderr.replace("{R}", abc_bridge_module.REPO_ROOT))
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert f"): {expected};" in str(exc.value)
+
+
+def test_resolve_abc_detail_strips_dot_left_by_path_removal(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    _fake_locator(monkeypatch, 1, "", f"error: cannot read config. {abc_bridge_module.REPO_ROOT}/\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    msg = str(exc.value)
+    assert ".;" not in msg and "config;" in msg
+
+
+def test_resolve_abc_path_replacement_escapes_regex_metacharacters(monkeypatch) -> None:
+    from netlist_agent import abc_bridge as abc_bridge_module
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    monkeypatch.setattr(abc_bridge_module, "REPO_ROOT", "/tmp/a.b+c")
+    _fake_locator(monkeypatch, 1, "", "error: /tmp/aXb+c/x /tmp/a.b+c/y /tmp/a.b+c done /tmp/aXbbc end\n")
+    with pytest.raises(ABCBridgeError) as exc:
+        _resolve_abc()
+    assert "): /tmp/aXb+c/x y <repo> done /tmp/aXbbc end;" in str(exc.value)

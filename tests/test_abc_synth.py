@@ -1133,3 +1133,25 @@ def test_synth_exec_oserror_cause_is_the_injected_error(monkeypatch) -> None:
     with pytest.raises(_SynthError) as exc:
         abc_synth_module._run_abc_synthesis(_build_and_chain(), None, 5.0)
     assert exc.value.__cause__ is injected
+
+
+def test_optimize_depth_locator_failure_is_one_clean_line(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    root = abc_bridge_module.REPO_ROOT
+    stderr = (
+        "error: could not find an ABC binary for platform 'darwin-arm64'.\n\n"
+        f"Checked, in order:\n  {root}/vendor/darwin-arm64/abc\n  abc on $PATH\n"
+    )
+
+    def _run(args, *a, **k):
+        assert list(args) == ["bash", abc_bridge_module.FIND_ABC_SCRIPT]
+        return subprocess_module.CompletedProcess(args, 1, "", stderr)
+
+    monkeypatch.setattr(abc_bridge_module, "_abc_path", None)
+    monkeypatch.setattr(subprocess_module, "run", _run)
+    design = _build_and_chain()
+    result = optimize_depth(design)
+    assert result.failure is not None
+    assert "could not locate the ABC binary" in result.failure
+    assert root not in result.failure and "\n" not in result.failure

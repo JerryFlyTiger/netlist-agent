@@ -67,6 +67,7 @@ binary before this module was written -- do not re-derive, just rely on it):
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -136,6 +137,48 @@ class CecUndecidedError(ABCInconclusiveError):
 _abc_path: Optional[str] = None
 
 
+_FIND_ABC_DISPLAY = "scripts/find_abc.sh"
+_LOCATE_HINT = "run scripts/setup_abc.sh or set $ABC_BIN"
+
+
+def _replace_path(text: str, path: str, repl: str) -> str:
+    """Replace `path` unless it is the prefix of a sibling such as `/Users/ab`
+    for home `/Users/a` (a word char, `-`, or `.` + word char may not follow).
+    Punctuation such as `.` `)` `,` around it does not protect it. No left
+    boundary on purpose: leaking an absolute path is worse than mangling a
+    longer one, so `/mnt{path}/x` gets rewritten (cosmetic) rather than kept."""
+    return re.sub(re.escape(path) + r"(?![\w\-]|\.\w)", lambda _m: repl, text)
+
+
+def _locator_detail(stderr: str) -> str:
+    """Detail line of the locator's stderr: the first `error:` line that is
+    non-empty once cleaned (else the first non-empty cleaned line, else "").
+    Cleaning = strip, drop one `error:` prefix, remove the repo / home paths
+    (the text reaches user-facing responses; the repo root goes first since it
+    lives under the home directory), drop one trailing `.`."""
+    home = os.path.expanduser("~")
+    first_plain = ""
+    for raw in (stderr or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        is_error = line.startswith("error:")
+        if is_error:
+            line = line[len("error:"):].strip()
+        line = line.replace(REPO_ROOT + os.sep, "")
+        line = _replace_path(line, REPO_ROOT, "<repo>")
+        if len(home) > 1:
+            line = _replace_path(line, home, "~")
+        line = line.rstrip().removesuffix(".").rstrip()
+        if not line:
+            continue
+        if is_error:
+            return line
+        if not first_plain:
+            first_plain = line
+    return first_plain
+
+
 def _resolve_abc() -> str:
     global _abc_path
     if _abc_path is None:
@@ -144,14 +187,23 @@ def _resolve_abc() -> str:
                 ["bash", FIND_ABC_SCRIPT], capture_output=True, text=True, timeout=_RESOLVE_TIMEOUT
             )
         except subprocess.TimeoutExpired as exc:
-            raise ABCBridgeError(f"timed out resolving ABC binary via {FIND_ABC_SCRIPT}") from exc
+            raise ABCBridgeError(
+                f"timed out resolving the ABC binary via {_FIND_ABC_DISPLAY} after {_RESOLVE_TIMEOUT}s"
+            ) from exc
         except OSError as exc:
             raise ABCBridgeError(f"could not run ABC locator: {_os_error_detail(exc)}") from exc
         if result.returncode != 0:
+            detail = _locator_detail(result.stderr)
+            head = f"could not locate the ABC binary ({_FIND_ABC_DISPLAY} exited with code {result.returncode}"
+            if detail:
+                raise ABCBridgeError(f"{head}): {detail}; {_LOCATE_HINT}")
+            raise ABCBridgeError(f"{head}, no message); {_LOCATE_HINT}")
+        path = result.stdout.strip()
+        if not path:
             raise ABCBridgeError(
-                f"failed to resolve ABC binary via {FIND_ABC_SCRIPT}: {result.stderr.strip()}"
+                f"could not locate the ABC binary: {_FIND_ABC_DISPLAY} printed no path"
             )
-        _abc_path = result.stdout.strip()
+        _abc_path = path
     return _abc_path
 
 

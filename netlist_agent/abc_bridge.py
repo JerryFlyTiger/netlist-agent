@@ -342,6 +342,9 @@ def _blif_token(value: Pin, const_names: dict[Const, str], design: Design, uncon
     return value.name if value.bit is None else f"{value.name}[{value.bit}]"
 
 
+_BLIF_MODEL_NAME = "top"
+
+
 def write_blif(design: Design, path: str) -> None:
     """Write `design` (must already be free of `dff` instances, e.g. via
     `extract_combinational_view` -- raises `ABCBridgeError` if one is found)
@@ -402,7 +405,10 @@ def write_blif(design: Design, path: str) -> None:
     pi_tokens = port_tokens(Direction.INPUT)
     po_tokens = port_tokens(Direction.OUTPUT)
 
-    lines: list[str] = [f".model {design.module_name}"]
+    # Fixed name, not `design.module_name`: ABC crashes (SIGTRAP) on a .model
+    # name of >= 497 bytes, and nothing reads the name back (`parse_blif`
+    # skips `.model`; `cec` output carries no model name).
+    lines: list[str] = [f".model {_BLIF_MODEL_NAME}"]
     lines.append(".inputs " + " ".join(pi_tokens))
     lines.append(".outputs " + " ".join(po_tokens))
 

@@ -31,6 +31,33 @@ def _write(tmp_path, name: str, content: str) -> str:
     return str(path)
 
 
+def test_write_blif_model_name_is_fixed(tmp_path) -> None:
+    from netlist_agent.abc_bridge import write_blif
+
+    long_name = "m" * 600
+    src = f"module {long_name}(a, b, y);\n input a, b;\n output y;\n and g0(y, a, b);\nendmodule\n"
+    design = parse_verilog(_write(tmp_path, "long.v", src))
+    out = tmp_path / "o.blif"
+    write_blif(design, str(out))
+    model_lines = [ln for ln in out.read_text().splitlines() if ln.startswith(".model")]
+    assert model_lines == [".model top"]
+    assert design.module_name == long_name  # the user-visible name is untouched
+
+
+def test_verify_equivalence_survives_600_byte_module_name(tmp_path) -> None:
+    # ABC used to SIGTRAP on a .model name of >= 497 bytes.
+    from netlist_agent.abc_bridge import ABCBridgeError, _resolve_abc
+
+    try:
+        _resolve_abc()
+    except ABCBridgeError:
+        pytest.skip("ABC binary not available")
+    src = f"module {'m' * 600}(a, b, y);\n input a, b;\n output y;\n and g0(y, a, b);\nendmodule\n"
+    path = _write(tmp_path, "long.v", src)
+    result = verify_equivalence(parse_verilog(path), parse_verilog(path))
+    assert result.equivalent, result.detail
+
+
 # ----------------------------------------------------------------------
 # verify_equivalence
 # ----------------------------------------------------------------------

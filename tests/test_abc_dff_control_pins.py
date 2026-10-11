@@ -137,14 +137,15 @@ def test_unconnected_control_pin_is_skipped(tmp_path) -> None:
 
 
 def test_legend_line_when_only_a_control_pin_differs(tmp_path) -> None:
-    # No .D() and no .Q(): the only __dff_*__ token that can appear in the
+    # .D() and .Q() are explicitly unconnected (the parser requires all five
+    # pins to be listed): the only __dff_*__ token that can appear in the
     # detail is __dff_SN__r1, so the legend must be triggered by the control
     # pin tokens alone.
     tmpl = (
         "module top(a, b, clk, y);\n"
         "  input a, b, clk;\n"
         "  output y;\n"
-        "  dff r1(.SN({sn}), .CK(clk));\n"
+        "  dff r1(.RN(), .SN({sn}), .CK(clk), .D(), .Q());\n"
         "  and g1(y, a, b);\n"
         "endmodule\n"
     )
@@ -196,17 +197,20 @@ def test_control_pin_connected_on_one_side_only_raises(tmp_path, pin) -> None:
 
 def test_extra_pin_in_dff_pin_order_is_tapped(tmp_path, monkeypatch) -> None:
     # The tap is derived from DFF_PIN_ORDER, not a hard-coded RN/SN/CK list.
+    # The parser (rightly) refuses an unknown pin name, so parse the normal
+    # five-pin DFF and attach the extra pin to the parsed gate directly.
     monkeypatch.setattr(abc_bridge, "DFF_PIN_ORDER", ["RN", "SN", "CK", "EN", "D", "Q"])
     src = (
         "module top(a, b, clk, y);\n"
         "  input a, b, clk;\n"
         "  output y;\n"
         "  wire q;\n"
-        "  dff r1(.RN(1'b1), .SN(1'b1), .CK(clk), .EN(a), .D(b), .Q(q));\n"
+        "  dff r1(.RN(1'b1), .SN(1'b1), .CK(clk), .D(b), .Q(q));\n"
         "  and g1(y, q, b);\n"
         "endmodule\n"
     )
     d = _parse(tmp_path, src, "en.v")
+    d.gates[0].pins["EN"] = NetBit("a", None)
     view = extract_combinational_view(d, "free_pi", tap_control_pins=True)
     assert "__dff_EN__r1" in {p.name for p in view.ports}
 
@@ -411,8 +415,8 @@ def test_duplicate_dff_instance_names_are_not_skipped_and_raise(tmp_path) -> Non
         "module top(a, b, clk, y);\n"
         "  input a, b, clk;\n"
         "  output y;\n"
-        "  dff r1(.SN({s1}));\n"
-        "  dff r1(.SN({s2}));\n"
+        "  dff r1(.RN(), .SN({s1}), .CK(), .D(), .Q());\n"
+        "  dff r1(.RN(), .SN({s2}), .CK(), .D(), .Q());\n"
         "  and g1(y, a, b);\n"
         "endmodule\n"
     )
@@ -434,11 +438,12 @@ def test_duplicate_dff_instance_name_on_one_side_only_raises(tmp_path, swap) -> 
         "module top(a, b, clk, y);\n"
         "  input a, b, clk;\n"
         "  output y;\n"
-        "  dff r1(.SN(a));\n"
+        "  dff r1(.RN(), .SN(a), .CK(), .D(), .Q());\n"
         "  and g1(y, a, b);\n"
         "endmodule\n"
     )
-    double = single.replace("  dff r1(.SN(a));\n", "  dff r1(.SN(a));\n  dff r1(.SN(a));\n")
+    line = "  dff r1(.RN(), .SN(a), .CK(), .D(), .Q());\n"
+    double = single.replace(line, line + line)
     d1 = _parse(tmp_path, single, "a.v")
     d2 = _parse(tmp_path, double, "b.v")
     x, y = (d2, d1) if swap else (d1, d2)
@@ -459,11 +464,11 @@ def test_dff_with_only_control_pins_missing_on_one_side_raises(tmp_path, swap) -
         "module top(a, b, clk, y);\n"
         "  input a, b, clk;\n"
         "  output y;\n"
-        "  dff r1(.SN(a), .CK(clk));\n"
+        "  dff r1(.RN(), .SN(a), .CK(clk), .D(), .Q());\n"
         "  and g1(y, a, b);\n"
         "endmodule\n"
     )
-    without = with_dff.replace("  dff r1(.SN(a), .CK(clk));\n", "")
+    without = with_dff.replace("  dff r1(.RN(), .SN(a), .CK(clk), .D(), .Q());\n", "")
     d1 = _parse(tmp_path, with_dff, "a.v")
     d2 = _parse(tmp_path, without, "b.v")
     x, y = (d2, d1) if swap else (d1, d2)

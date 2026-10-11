@@ -96,6 +96,30 @@ def _parse_instance(design: Design, gate_type_s: str, inst_name: str, body: str)
     design.gates.append(gate)
 
 
+_MODULE_NAME_RE = re.compile(r"^module\s+(\w+)")
+
+
+def _multiple_modules_error(first_name: str, stmt: str) -> NetlistParseError:
+    """The one rejection for a second `module` in the same file.
+
+    Hierarchy has no downstream support (gate counts, cones and equivalence
+    checks all assume one flat module), so a second module is refused rather
+    than merged or silently dropped. The second name is best-effort: if the
+    header is too malformed for `_MODULE_NAME_RE` the message just omits it.
+    No file path here -- see the note on "no module declaration found" below.
+    """
+    m = _MODULE_NAME_RE.match(stmt)
+    second = f" and {m.group(1)!r}" if m else ""
+    return NetlistParseError(
+        f"multiple modules in one file are not supported (found {first_name!r}{second})"
+    )
+
+
+def _after_endmodule_error(stmt: str) -> NetlistParseError:
+    shown = stmt if len(stmt) <= 80 else stmt[:77] + "..."
+    return NetlistParseError(f"unexpected content after endmodule: {shown!r}")
+
+
 def parse_verilog(path: str) -> Design:
     with open(path, "r") as f:
         text = f.read()
@@ -103,6 +127,13 @@ def parse_verilog(path: str) -> Design:
 
     design: Design | None = None
     port_order: list[str] = []
+    # `endmodule` has no `;`, so after the `;` split it arrives glued to
+    # whatever follows it (the next `module` header, a stray gate, ...) as one
+    # segment. The old `first_word == "endmodule": continue` swallowed that
+    # whole segment, so a second module's header was never processed and its
+    # declarations and gates landed silently in the first module. Track
+    # whether we have seen it so anything after it is rejected loudly.
+    seen_endmodule = False
 
     for raw_stmt in text.split(";"):
         stmt = raw_stmt.strip()
@@ -110,7 +141,18 @@ def parse_verilog(path: str) -> Design:
             continue
         first_word = stmt.split(None, 1)[0]
 
+        if seen_endmodule:
+            # Any non-empty statement after the module closed (this also
+            # covers `endmodule;` followed by a fresh `module b(...)`).
+            if first_word == "module":
+                raise _multiple_modules_error(design.module_name if design else "?", stmt)
+            raise _after_endmodule_error(stmt)
+
         if first_word == "module":
+            if design is not None:
+                # A second header with no `endmodule` in between: the old code
+                # replaced `design` here and dropped the first module.
+                raise _multiple_modules_error(design.module_name, stmt)
             m = MODULE_RE.match(stmt)
             if not m:
                 raise NetlistParseError(f"malformed module header: {stmt!r}")
@@ -147,6 +189,13 @@ def parse_verilog(path: str) -> Design:
             continue
 
         if first_word == "endmodule":
+            seen_endmodule = True
+            rest = stmt[len("endmodule"):].strip()
+            if rest:
+                # Glued remainder, e.g. `endmodule\nmodule other (...)`.
+                if rest.split(None, 1)[0] == "module":
+                    raise _multiple_modules_error(design.module_name, rest)
+                raise _after_endmodule_error(rest)
             continue
 
         raise NetlistParseError(f"unrecognized statement: {stmt!r}")
@@ -156,6 +205,10 @@ def parse_verilog(path: str) -> Design:
         # the path and prefixes it onto the message; repeating it here would
         # just duplicate it in the user-facing string.
         raise NetlistParseError("no module declaration found")
+    if not seen_endmodule:
+        # Checked after the no-module case on purpose. A file cut off at a
+        # statement boundary would otherwise load with gates silently missing.
+        raise NetlistParseError(f"missing endmodule for module {design.module_name!r}")
 
     ports = []
     for name in port_order:

@@ -151,6 +151,10 @@ class Session:
     # formally proved exactly zero".
     last_enable_hold_count: Optional[int] = None
 
+    # `EnableHoldResult.not_examined` from the same check: flops its time budget cut off, so
+    # `last_enable_hold_count` is then only a lower bound. Always written together with it.
+    last_enable_hold_not_examined: int = 0
+
     # Running total of gates rewritten by a transform that is a deliberate
     # FUNCTIONAL change (not equivalence-preserving) -- currently only the
     # name-pattern BUF->AND rewrite family. Read by scripts/run_corpus.py to

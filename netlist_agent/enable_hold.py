@@ -57,11 +57,21 @@ load : Q). Concretely: `x == 0` here is a sample-count artifact, not a
 distinct circuit category -- see `_degenerate_candidates`'s docstring for
 the fix, and the module docstring's own note on why `degenerate_sim` is
 reported purely as a diagnostic, not a verdict bucket.
+
+Bounded cost (batch 20a): at most `MAX_ABC_ROUTE_CALLS_TOTAL` ABC calls per
+`detect_enable_hold` call, and an optional `deadline` (absolute
+`time.monotonic()`) that the router sets from `ENABLE_HOLD_TIME_BUDGET`.
+Work runs in two phases: phase 1 does Stage 0-2 and the truth-table route for
+every flop, deferring any attempt that needs ABC; phase 2 resumes the deferred
+flops, so ABC time never starves the cheap stages. Flops phase 1 had no time
+to reach are counted in `EnableHoldResult.not_examined`, never silently
+dropped; `findings` stay in flop order either way.
 """
 
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Union, cast
 
@@ -121,13 +131,51 @@ TRUTH_TABLE_SUPPORT_LIMIT = 20
 # (`proven_hold` itself never changed -- no NEW hold was ever found past the
 # first candidate tried, only additional DISPROOFS of ones already correctly
 # excluded from `proven_hold`). Not worth 3x the cost, so reverted to one
-# shared budget; see `detect_enable_hold`'s own Stage 3 comment for how the
+# shared budget; see `settle_stage3`'s own docstring for how the
 # labeling-precision fix (a candidate proven definitively FALSE, not merely
 # timed out, must not be reported as "unresolved") was kept anyway, at zero
 # extra cost, since it only changes how the SAME already-budgeted attempt(s)
 # are interpreted afterward.
 MAX_ABC_CANDIDATES_PER_FLOP = 1
 ABC_CANDIDATE_TIMEOUT = 5.0
+#
+# (The timings quoted in the paragraphs above -- 40s, +20s, 122s, +~17s -- were
+# all measured BEFORE batch 20a's total cap below existed.)
+#
+# The per-flop cap above bounds each flop, not the whole call. Measured
+# 2026-10-14 (batch 20a, test40, load ~8): `_prove_via_abc` ran 316 times for
+# 25.1s of a 39.9s `detect_enable_hold`, and ALL 316 returned False -- on this
+# corpus the ABC route proves no hold at all. What it changes is the label: a
+# single-candidate flop whose one candidate is disproven moves from
+# `forced_simulated_only` to `forced_no_candidate` (a flop with more candidates
+# than the per-flop cap keeps `exhausted = False` whatever ABC says, so there a
+# False changes nothing -- measured 278 of the 316 calls were of that kind).
+# Hence a deterministic
+# total cap on ABC-route calls per `detect_enable_hold` call (a count, not a
+# time, so the output does not vary with machine load). Past the cap the
+# attempt is skipped and treated as "ABC could not settle it"
+# (`forced_simulated_only`). The truth-table route is unaffected and uncounted.
+# The ABC route also runs LAST: `detect_enable_hold` works in two phases, the
+# first doing every cheap stage (constprop, truth tables) for all flops and
+# deferring the ABC attempts, the second spending the cap / wall clock on the
+# deferred ones. So slow ABC calls can never starve the cheap stages of the
+# flops behind them, and `deadline` can only cost ABC labels or unexamined
+# flops, never a hold the cheap stages would have proven. (It can still lose a
+# hold only ABC could prove: an ABC attempt skipped for lack of time means
+# `proven_hold` comes out low while `not_examined` may be 0, so there is no
+# Incomplete note.)
+MAX_ABC_ROUTE_CALLS_TOTAL = 64
+# Wall-clock backstop (the `deadline` argument of `detect_enable_hold`): an
+# ABC call is not started with less than this many seconds left.
+ABC_MIN_REMAINING = 0.5
+# Budget the router gives one enable/hold request. QA A89 allows 60s for an
+# analysis question INCLUDING the work after the handler (structural
+# constraints check, writing the log, printing `#END`), so the handler gets
+# 45s and 15s are left for the rest.
+ENABLE_HOLD_TIME_BUDGET = 45.0
+
+# Indirection so tests can monkeypatch the clock.
+_monotonic = time.monotonic
 
 # Symbolic constant-propagation values: either a constant, or a named net
 # with a polarity (its own gate's output net names itself when the
@@ -155,7 +203,10 @@ class HoldFinding:
 class EnableHoldResult:
     """See the module docstring for the full pipeline. Every count below is
     disjoint from every other -- summing the leaf categories reproduces
-    `total_flops`.
+    `total_flops`. `not_examined` (flops a `deadline` cut off before they were
+    looked at) is one of those leaves:
+    `self_referencing == forced_proven + forced_no_candidate +
+    forced_simulated_only + not_examined`.
 
     Control-net non-uniqueness (measured on test40: a flop that has ANY
     valid control net has a median of ~25 that all individually satisfy the
@@ -169,10 +220,12 @@ class EnableHoldResult:
     no_self_reference: int  # D's fanin cone never reaches this flop's own Q: hold is structurally impossible
 
     # Flops where D's fanin cone DOES reach its own Q (`total_flops -
-    # no_self_reference` of them), split into three disjoint groups. Every
-    # self-referencing flop -- including the `x == 0` ones (see
-    # `degenerate_sim` below) -- goes through the SAME proof pipeline and
-    # lands in exactly one of these three; there is no separate "degenerate"
+    # no_self_reference` of them), split into four disjoint groups: the
+    # three `forced_*` verdicts below plus `not_examined` (cut off by a
+    # `deadline`; always 0 without one). Every self-referencing flop that is
+    # examined -- including the `x == 0` ones (see `degenerate_sim` below) --
+    # goes through the SAME proof pipeline and lands in exactly one of the
+    # three `forced_*` groups; there is no separate "degenerate"
     # verdict bucket (see the module docstring for why an earlier version
     # having one was a bug).
     forced_proven: int  # a control net (c, v), or no forcing at all, formally proven to make D == Q
@@ -199,6 +252,14 @@ class EnableHoldResult:
     degenerate_sim: int
     degenerate_proven: int
     degenerate_unresolved: int
+
+    # Self-referencing flops never examined because `detect_enable_hold`'s
+    # `deadline` expired first. Non-zero means the self-referencing breakdown
+    # (`forced_*` and the `degenerate_*` diagnostics) covers only the flops
+    # that WERE examined; `total_flops` and `no_self_reference` are still
+    # whole-design counts. (Placed after the fields without
+    # defaults, since a dataclass cannot have a default before a non-default.)
+    not_examined: int = 0
 
     findings: list[HoldFinding] = field(default_factory=list)
 
@@ -750,7 +811,10 @@ def _prove_via_abc(
 # ----------------------------------------------------------------------
 
 
-def detect_enable_hold(design: Design) -> EnableHoldResult:
+def detect_enable_hold(design: Design, *, deadline: Optional[float] = None) -> EnableHoldResult:
+    """`deadline` is an absolute `time.monotonic()` value (None = no limit).
+    Past it, remaining self-referencing flops are counted in `not_examined`
+    rather than examined; see `ABC_MIN_REMAINING` for the finer ABC check."""
     dffs = [g for g in design.gates if g.gate_type == GateType.DFF]
     comb_gates = [g for g in design.gates if g.gate_type != GateType.DFF]
 
@@ -809,15 +873,116 @@ def detect_enable_hold(design: Design) -> EnableHoldResult:
         gs.sort(key=rank.__getitem__)
         cone_gates[name] = [by_name[n] for n in gs]
 
-    findings: list[HoldFinding] = []
+    # (position in self_ref, finding): sorted back into self_ref order at the
+    # end, because phase 2 settles deferred flops after the others.
+    indexed_findings: list[tuple[int, HoldFinding]] = []
     degenerate_sim = 0
     degenerate_proven = 0
     degenerate_unresolved = 0
     forced_proven = 0
     forced_no_candidate = 0
     forced_simulated_only = 0
+    not_examined = 0
+    abc_calls = 0
 
-    for name in self_ref:
+    def settle_stage3(
+        idx: int,
+        cands: list[tuple[NetBit, int]],
+        pos: int,
+        attempts: int,
+        exhausted: bool,
+        is_degenerate_sim: bool,
+        defer_abc: bool,
+    ) -> Optional[tuple[int, list[tuple[NetBit, int]], int, int, bool, bool]]:
+        """Stage 3 attempt loop for one flop, resumable at candidate `pos`.
+
+        ONE combined attempt budget (see MAX_ABC_CANDIDATES_PER_FLOP's own
+        comment for why this is NOT split into a separate, larger
+        truth-table budget -- measured going that route: test40's per-query
+        time roughly tripled, 40s -> 122s, for zero change in `proven_hold`
+        -- purely a `forced_simulated_only` -> `forced_no_candidate`
+        labeling-precision shift that isn't worth 3x the cost). `exhausted`
+        tracks whether the candidate(s) actually attempted (within budget)
+        all got a DEFINITIVE verdict (the truth table always gives one; ABC
+        gives one unless it timed out/errored/was skipped) -- if so, and none
+        of them proved True, that is a real proof of no hold via those
+        candidates, not merely "ran out of budget", EVEN THOUGH the budget
+        cap means untested candidates may remain (that is the same
+        limitation `forced_no_candidate`'s docstring already describes for
+        the Stage-1-vacuity route).
+
+        With `defer_abc` (phase 1), an attempt that needs the ABC route is
+        not made: the loop state is returned so phase 2 can resume exactly
+        there, and the flop is left unclassified for now. Otherwise the flop
+        is settled (counted, finding recorded) and None is returned.
+        """
+        nonlocal forced_proven, forced_no_candidate, forced_simulated_only
+        nonlocal degenerate_proven, degenerate_unresolved, abc_calls
+        name = self_ref[idx]
+        d, q = d_ref[name], q_ref[name]
+        gates = cone_gates[name]
+        proven_here = False
+        for i in range(pos, len(cands)):
+            c, v = cands[i]
+            if attempts >= MAX_ABC_CANDIDATES_PER_FLOP:
+                exhausted = False  # real, untried candidates remain -- genuinely budget-limited
+                break
+            leaves = _leaves_for_candidate(gates, comb_ins, out_of, d, c)
+            if len(leaves) <= TRUTH_TABLE_SUPPORT_LIMIT:
+                attempts += 1
+                proof: Optional[bool] = _truth_table_proof(gates, comb_ins, out_of, d, q, {c: v}, leaves)
+                proof_kind = "truth_table"
+            else:
+                if defer_abc:
+                    return (idx, cands, i, attempts, exhausted, is_degenerate_sim)
+                attempts += 1
+                proof_kind = "abc"
+                remaining = None if deadline is None else deadline - _monotonic()
+                if abc_calls >= MAX_ABC_ROUTE_CALLS_TOTAL or (remaining is not None and remaining < ABC_MIN_REMAINING):
+                    # Total ABC budget spent, or too little wall-clock left:
+                    # skipped, same as ABC failing to settle it.
+                    proof = None
+                else:
+                    abc_calls += 1
+                    timeout = ABC_CANDIDATE_TIMEOUT if remaining is None else min(ABC_CANDIDATE_TIMEOUT, remaining)
+                    proof = _prove_via_abc(design, gates, comb_ins, out_of, d, q, (c, v), timeout=timeout)
+                if proof is None:
+                    exhausted = False  # ABC itself couldn't settle this one (timeout/error/skipped)
+            if proof is True:
+                forced_proven += 1
+                if is_degenerate_sim:
+                    degenerate_proven += 1
+                and_gated = _classify_and_gated(gates, comb_ins, out_of, d, c, v)
+                indexed_findings.append((idx, HoldFinding(name, q, d, c, v, proof_kind, and_gated)))
+                proven_here = True
+                break
+        if not proven_here:
+            if exhausted:
+                # Every Stage-1 survivor was individually, DEFINITIVELY
+                # disproven (never just timed out, never skipped for
+                # budget) -- a complete proof of no hold via any candidate
+                # this search identified, same verdict category as an
+                # empty candidate list (`forced_no_candidate` above), just
+                # reached by exhaustive disproof instead of Stage 1
+                # vacuity.
+                forced_no_candidate += 1
+            else:
+                forced_simulated_only += 1
+                if is_degenerate_sim:
+                    degenerate_unresolved += 1
+        return None
+
+    # Two phases (batch 20a): phase 1 runs everything cheap (Steps 1-2 and the
+    # truth-table route) over every flop; an attempt that needs the ABC route
+    # is deferred, not run. Phase 2 then spends whatever ABC calls / wall
+    # clock remain on the deferred flops. So slow ABC calls can never starve
+    # the cheap stages of the flops behind them in `self_ref`.
+    deferred: list[tuple[int, list[tuple[NetBit, int]], int, int, bool, bool]] = []
+
+    for idx, name in enumerate(self_ref):
+        if deadline is not None and _monotonic() >= deadline:
+            not_examined = len(self_ref) - idx
+            break
         d, q = d_ref[name], q_ref[name]
         gates = cone_gates[name]
         x = (sig[d] ^ sig[q]) & mask
@@ -840,7 +1005,7 @@ def detect_enable_hold(design: Design) -> EnableHoldResult:
             forced_proven += 1
             if is_degenerate_sim:
                 degenerate_proven += 1
-            findings.append(HoldFinding(name, q, d, None, None, "constprop", None))
+            indexed_findings.append((idx, HoldFinding(name, q, d, None, None, "constprop", None)))
             continue
 
         # Step 2: forced-candidate search. `_candidates`'s necessary-
@@ -873,64 +1038,25 @@ def detect_enable_hold(design: Design) -> EnableHoldResult:
                 if is_degenerate_sim:
                     degenerate_proven += 1
                 and_gated = _classify_and_gated(gates, comb_ins, out_of, d, c, v)
-                findings.append(HoldFinding(name, q, d, c, v, "constprop", and_gated))
+                indexed_findings.append((idx, HoldFinding(name, q, d, c, v, "constprop", and_gated)))
                 proven_here = True
                 break
         if proven_here:
             continue
 
-        # Stage 3, ONE combined attempt budget (see MAX_ABC_CANDIDATES_PER_FLOP's
-        # own comment for why this is NOT split into a separate, larger
-        # truth-table budget -- measured going that route: test40's
-        # per-query time roughly tripled, 40s -> 122s, for zero change in
-        # `proven_hold` -- purely a `forced_simulated_only` ->
-        # `forced_no_candidate` labeling-precision shift that isn't worth
-        # 3x the cost). `exhausted` tracks whether the candidate(s) actually
-        # attempted (within budget) all got a DEFINITIVE verdict (the truth
-        # table always gives one; ABC gives one unless it timed out/errored)
-        # -- if so, and none of them proved True, that is a real proof of no
-        # hold via those candidates, not merely "ran out of budget", EVEN
-        # THOUGH the budget cap means untested candidates may remain (that
-        # is the same limitation `forced_no_candidate`'s docstring already
-        # describes for the Stage-1-vacuity route).
-        attempts = 0
-        exhausted = True
-        for c, v in cands:
-            if attempts >= MAX_ABC_CANDIDATES_PER_FLOP:
-                exhausted = False  # real, untried candidates remain -- genuinely budget-limited
-                break
-            attempts += 1
-            leaves = _leaves_for_candidate(gates, comb_ins, out_of, d, c)
-            if len(leaves) <= TRUTH_TABLE_SUPPORT_LIMIT:
-                proof: Optional[bool] = _truth_table_proof(gates, comb_ins, out_of, d, q, {c: v}, leaves)
-                proof_kind = "truth_table"
-            else:
-                proof = _prove_via_abc(design, gates, comb_ins, out_of, d, q, (c, v))
-                proof_kind = "abc"
-                if proof is None:
-                    exhausted = False  # ABC itself couldn't settle this one (timeout/error)
-            if proof is True:
-                forced_proven += 1
-                if is_degenerate_sim:
-                    degenerate_proven += 1
-                and_gated = _classify_and_gated(gates, comb_ins, out_of, d, c, v)
-                findings.append(HoldFinding(name, q, d, c, v, proof_kind, and_gated))
-                proven_here = True
-                break
-        if not proven_here:
-            if exhausted:
-                # Every Stage-1 survivor was individually, DEFINITIVELY
-                # disproven (never just timed out, never skipped for
-                # budget) -- a complete proof of no hold via any candidate
-                # this search identified, same verdict category as an
-                # empty candidate list (`forced_no_candidate` above), just
-                # reached by exhaustive disproof instead of Stage 1
-                # vacuity.
-                forced_no_candidate += 1
-            else:
-                forced_simulated_only += 1
-                if is_degenerate_sim:
-                    degenerate_unresolved += 1
+        pending = settle_stage3(idx, cands, 0, 0, True, is_degenerate_sim, defer_abc=True)
+        if pending is not None:
+            deferred.append(pending)
+
+    # Phase 2: deferred flops always get here, even when phase 1 broke on the
+    # deadline (they were already examined by the cheap stages, so they are
+    # not `not_examined`); the ABC checks inside `settle_stage3` skip ABC when
+    # no time is left.
+    for idx, cands, pos, attempts, exhausted, is_degenerate_sim in deferred:
+        settle_stage3(idx, cands, pos, attempts, exhausted, is_degenerate_sim, defer_abc=False)
+
+    indexed_findings.sort(key=lambda t: t[0])
+    findings = [f for _, f in indexed_findings]
 
     return EnableHoldResult(
         total_flops=len(dffs),
@@ -941,6 +1067,7 @@ def detect_enable_hold(design: Design) -> EnableHoldResult:
         degenerate_sim=degenerate_sim,
         degenerate_proven=degenerate_proven,
         degenerate_unresolved=degenerate_unresolved,
+        not_examined=not_examined,
         findings=findings,
     )
 

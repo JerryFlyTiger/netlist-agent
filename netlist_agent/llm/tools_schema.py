@@ -972,6 +972,7 @@ def get_last_operation_summary(session: Session) -> dict[str, Any]:
         "last_query_gate_names": list(session.last_query_gate_names),
         "last_floating_count": session.last_floating_count,
         "last_enable_hold_count": session.last_enable_hold_count,
+        "last_enable_hold_not_examined": session.last_enable_hold_not_examined,
         "functional_change_ops": session.functional_change_ops,
         _UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY: True,
     }

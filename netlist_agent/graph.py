@@ -237,12 +237,22 @@ class NetlistGraph:
         `start` (the transitive fanin cone), respecting the DFF backward
         boundary.
         """
+        return self.backward_reachable_gates_from((start,))
+
+    def backward_reachable_gates_from(self, starts: Iterable[NetBit]) -> set[str]:
+        """Instance names of every non-DFF gate backward-reachable from any
+        of `starts`. Equals the union of `backward_reachable_gates(s)` over
+        `starts`, but every gate is expanded at most once (one shared
+        `visited`), so cost is linear in the netlist rather than in
+        `len(starts)` times the cone size.
+        """
         visited: set[str] = set()
         frontier: deque[str] = deque()
-        driver = self._fed_by_gate(start)
-        if driver is not None:
-            visited.add(driver.inst_name)
-            frontier.append(driver.inst_name)
+        for start in starts:
+            driver = self._fed_by_gate(start)
+            if driver is not None and driver.inst_name not in visited:
+                visited.add(driver.inst_name)
+                frontier.append(driver.inst_name)
         while frontier:
             name = frontier.popleft()
             for pred in self._pred.get(name, ()):

@@ -174,14 +174,13 @@ def remove_dangling_gates(design: Design) -> int:
     never itself analyzed for further reachability).
     """
     graph = NetlistGraph(design)
-    live: set[str] = set()
-    for po in graph.po_bits:
-        live |= graph.backward_reachable_gates(po)
+    starts: list[NetBit] = list(graph.po_bits)
     for dff in graph.dff_gates:
         for pin in ("D", "CK", "RN", "SN"):
             v = dff.pins.get(pin)
             if isinstance(v, NetBit):
-                live |= graph.backward_reachable_gates(v)
+                starts.append(v)
+    live = graph.backward_reachable_gates_from(starts)
     dangling = [g for g in design.gates if g.gate_type != GateType.DFF and g.inst_name not in live]
     for g in dangling:
         design.remove_gate(g)

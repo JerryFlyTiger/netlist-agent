@@ -5,6 +5,11 @@ structural outcome is known exactly.
 
 from __future__ import annotations
 
+import random
+from collections import deque
+
+import pytest
+
 from netlist_agent.analysis import fanout_count, iter_fanout_counts
 from netlist_agent.graph import NetlistGraph
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, Port, Signal
@@ -193,6 +198,221 @@ def test_dangling_removal_respects_dff_boundary() -> None:
     removed = remove_dangling_gates(design)
     assert removed == 0  # feeds a DFF's D pin -> not dangling; DFF itself never removed
     assert {g.inst_name for g in design.gates} == {"g_feed_d", "dff0"}
+
+
+def _random_design(seed: int) -> Design:
+    """Seeded random small design: shared cones, true dangling gates, DFFs
+    whose D/CK/RN/SN hang off combinational logic, and a PI wired straight
+    to a PO (no gate)."""
+    rng = random.Random(seed)
+    design = Design(module_name="t")
+    pis = [f"a{i}" for i in range(4)]
+    for n in pis:
+        _sig(design, n, Direction.INPUT)
+    _sig(design, "pio", Direction.OUTPUT)  # PO with no driving gate
+    nets = list(pis)
+    n_gates = rng.randint(12, 30)
+    for i in range(n_gates):
+        out = f"n{i}"
+        is_po = rng.random() < 0.15
+        _sig(design, out, Direction.OUTPUT if is_po else Direction.INTERNAL)
+        gt = rng.choice([GateType.AND, GateType.OR, GateType.XOR, GateType.NOT, GateType.BUF])
+        pins = {"O": _nb(out), "I0": _nb(rng.choice(nets))}
+        if gt in (GateType.AND, GateType.OR, GateType.XOR):
+            pins["I1"] = _nb(rng.choice(nets))
+        design.gates.append(Gate(f"g{i}", gt, pins))
+        nets.append(out)
+    for j in range(rng.randint(1, 3)):
+        _sig(design, f"q{j}", Direction.INTERNAL)
+        pins = {"D": _nb(rng.choice(nets)), "CK": _nb(rng.choice(nets)), "Q": _nb(f"q{j}")}
+        for pin in ("RN", "SN"):
+            pins[pin] = _nb(rng.choice(nets)) if rng.random() < 0.5 else Const.ONE
+        design.gates.append(Gate(f"dff{j}", GateType.DFF, pins))
+        nets.append(f"q{j}")
+    design.build_indices()
+    return design
+
+
+def _ref_cone(graph: NetlistGraph, start: NetBit) -> set[str]:
+    """Independent single-start backward BFS (does not call the product's
+    backward_reachable_gates)."""
+    visited: set[str] = set()
+    frontier: deque[str] = deque()
+    driver = graph._fed_by_gate(start)
+    if driver is not None:
+        visited.add(driver.inst_name)
+        frontier.append(driver.inst_name)
+    while frontier:
+        name = frontier.popleft()
+        for pred in graph._pred.get(name, ()):
+            if pred not in visited:
+                visited.add(pred)
+                frontier.append(pred)
+    return visited
+
+
+def _ref_starts(graph: NetlistGraph) -> list[NetBit]:
+    starts = list(graph.po_bits)
+    for dff in graph.dff_gates:
+        for pin in ("D", "CK", "RN", "SN"):
+            v = dff.pins.get(pin)
+            if isinstance(v, NetBit):
+                starts.append(v)
+    return starts
+
+
+def _ref_remove_dangling(design: Design) -> int:
+    """The pre-21e algorithm, verbatim: one BFS per start, unioned."""
+    graph = NetlistGraph(design)
+    live: set[str] = set()
+    for po in graph.po_bits:
+        live |= _ref_cone(graph, po)
+    for dff in graph.dff_gates:
+        for pin in ("D", "CK", "RN", "SN"):
+            v = dff.pins.get(pin)
+            if isinstance(v, NetBit):
+                live |= _ref_cone(graph, v)
+    dangling = [g for g in design.gates if g.gate_type != GateType.DFF and g.inst_name not in live]
+    for g in dangling:
+        design.remove_gate(g)
+    return len(dangling)
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_backward_reachable_gates_from_equals_union_of_single_start(seed: int) -> None:
+    design = _random_design(seed)
+    graph = NetlistGraph(design)
+    starts = _ref_starts(graph)
+    expected: set[str] = set()
+    for s in starts:
+        expected |= _ref_cone(graph, s)
+    assert graph.backward_reachable_gates_from(starts) == expected
+    # A one-shot iterator must work too (the signature takes any Iterable).
+    assert graph.backward_reachable_gates_from(iter(starts)) == expected
+    # Empty / single-start edge cases.
+    assert graph.backward_reachable_gates_from([]) == set()
+    for s in sorted(set(starts), key=str):
+        assert graph.backward_reachable_gates_from([s]) == _ref_cone(graph, s)
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_remove_dangling_gates_matches_reference_algorithm(seed: int) -> None:
+    new_design = _random_design(seed)
+    ref_design = _random_design(seed)
+    n_before = len(new_design.gates)
+    removed_new = remove_dangling_gates(new_design)
+    removed_ref = _ref_remove_dangling(ref_design)
+    assert removed_new == removed_ref
+    assert [g.inst_name for g in new_design.gates] == [g.inst_name for g in ref_design.gates]
+    assert len(new_design.gates) == n_before - removed_new
+
+
+def test_remove_dangling_random_corpus_exercises_removal() -> None:
+    removed = [remove_dangling_gates(_random_design(seed)) for seed in range(25)]
+    assert any(r > 0 for r in removed)  # the equivalence tests are not vacuous
+
+
+@pytest.mark.parametrize("pin", ["D", "CK", "RN", "SN"])
+def test_dangling_removal_keeps_gate_that_only_feeds_one_dff_pin(pin: str) -> None:
+    design = Design(module_name="t")
+    _sig(design, "a", Direction.INPUT)
+    _sig(design, "q_out", Direction.INTERNAL)
+    pins: dict = {"RN": Const.ONE, "SN": Const.ONE, "CK": _nb("a"), "D": _nb("a"), "Q": _nb("q_out")}
+    pins[pin] = _nb("only")
+    _sig(design, "only", Direction.INTERNAL)
+    _sig(design, "dead", Direction.INTERNAL)
+    design.gates.append(Gate("g_only", GateType.NOT, {"O": _nb("only"), "I0": _nb("a")}))
+    design.gates.append(Gate("g_dead", GateType.NOT, {"O": _nb("dead"), "I0": _nb("a")}))
+    design.gates.append(Gate("dff0", GateType.DFF, pins))
+    design.build_indices()
+
+    assert remove_dangling_gates(design) == 1
+    assert {g.inst_name for g in design.gates} == {"g_only", "dff0"}
+
+
+def test_remove_dangling_expands_each_gate_at_most_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Work sentinel (no wall clock): 50 POs share one 500-gate chain, and
+    40 DFFs hang their D/RN off the chain and all share one CK net (43
+    duplicate starts: 39 from CK, 4 where a D and an RN land on the same net). A per-start BFS, or one BFS per DFF, would look up
+    `_pred` far more than once per gate.
+
+    The contract is "`_pred` is looked up exactly once per expanded non-DFF
+    gate", so the bound is the non-DFF gate count with zero slack, on
+    purpose: any slack lets duplicate start seeds slip through. If a
+    refactor changes the number of lookups per expansion, change this bound
+    with it."""
+
+    class _CountingDict(dict):
+        lookups = 0
+
+        def get(self, key, default=None):  # type: ignore[override]
+            _CountingDict.lookups += 1
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            _CountingDict.lookups += 1
+            return super().__getitem__(key)
+
+    orig_init = NetlistGraph.__init__
+
+    def counting_init(self, design):  # type: ignore[no-untyped-def]
+        orig_init(self, design)
+        self._pred = _CountingDict(self._pred)
+
+    design = Design(module_name="t")
+    _sig(design, "a", Direction.INPUT)
+    prev = "a"
+    n_chain = 500
+    for i in range(n_chain):
+        _sig(design, f"c{i}", Direction.INTERNAL)
+        design.gates.append(Gate(f"gc{i}", GateType.BUF, {"O": _nb(f"c{i}"), "I0": _nb(prev)}))
+        prev = f"c{i}"
+    n_po = 50
+    for k in range(n_po):
+        _sig(design, f"y{k}", Direction.OUTPUT)
+        design.gates.append(Gate(f"gy{k}", GateType.BUF, {"O": _nb(f"y{k}"), "I0": _nb(prev)}))
+    n_dff = 40
+    for k in range(n_dff):
+        _sig(design, f"q{k}", Direction.INTERNAL)
+        pins = {
+            "D": _nb(f"c{12 * k}"),
+            "CK": _nb(f"c{n_chain - 1}"),
+            "RN": _nb(f"c{k}"),
+            "SN": Const.ONE,
+            "Q": _nb(f"q{k}"),
+        }
+        design.gates.append(Gate(f"dff{k}", GateType.DFF, pins))
+    design.build_indices()
+    n_comb = sum(g.gate_type != GateType.DFF for g in design.gates)
+
+    monkeypatch.setattr(NetlistGraph, "__init__", counting_init)
+    _CountingDict.lookups = 0
+    assert remove_dangling_gates(design) == 0
+    assert 0 < _CountingDict.lookups <= n_comb
+
+
+def test_backward_reachable_gates_from_stops_at_dff_driven_start() -> None:
+    """A start net driven by a DFF seeds nothing (the DFF is a boundary),
+    and the DFF never shows up in the result."""
+    design = Design(module_name="t")
+    _sig(design, "a", Direction.INPUT)
+    _sig(design, "z", Direction.OUTPUT)
+    _sig(design, "y", Direction.OUTPUT)
+    design.gates.append(
+        Gate(
+            "dff0",
+            GateType.DFF,
+            {"D": _nb("a"), "CK": _nb("a"), "RN": Const.ONE, "SN": Const.ONE, "Q": _nb("z")},
+        )
+    )
+    design.gates.append(Gate("g1", GateType.NOT, {"O": _nb("y"), "I0": _nb("z")}))
+    design.build_indices()
+    graph = NetlistGraph(design)
+
+    assert graph.backward_reachable_gates_from([_nb("z")]) == set()
+    both = graph.backward_reachable_gates_from([_nb("z"), _nb("y")])
+    assert both == {"g1"}
+    assert "dff0" not in both
 
 
 # ----------------------------------------------------------------------

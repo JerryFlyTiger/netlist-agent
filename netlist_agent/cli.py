@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, TextIO
 
 import yaml
 
+from netlist_agent import deadline
 from netlist_agent.io_protocol import respond
 from netlist_agent.router import BEGIN_RE, Fallback, _extract_log_filename, handle_request
 from netlist_agent.session import Session
@@ -334,7 +335,12 @@ def run(
         # (bare `except Exception`, not a bare `except:`) so the process can
         # still be interrupted/exited normally.
         try:
-            body = handle_request(session, line, resolved_fallback)
+            with deadline.request_scope(deadline.ANALYSIS_BUDGET):
+                body = handle_request(session, line, resolved_fallback)
+        except deadline.DeadlineExceeded as exc:
+            # Last-resort net (DeadlineExceeded is a BaseException, so the
+            # clause below cannot see it); `respond` stays outside the scope.
+            body = deadline.incomplete_message(exc)
         except Exception as exc:  # noqa: BLE001 -- intentionally broad, see above
             body = _internal_error_body(exc)
         respond(session, body, stdout=stdout)

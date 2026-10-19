@@ -194,7 +194,7 @@ artifact, and git history is forever. Instead:
 
 [![CI](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml)
 
-`pytest` — **992 passing, 78 skipped** on a clean checkout with no testcases
+`pytest` — **1013 passing, 78 skipped** on a clean checkout with no testcases
 present. The skips are not hidden: `addopts = ["-rs"]` makes pytest print the
 reason for every one, and every reason names what is missing: an
 "Alpha_Testcase corpus not present" or "Beta_Testcase corpus not present" for
@@ -202,7 +202,7 @@ the two benchmark releases, and "requires the private rule-based router" for
 the part that stays private. Nothing fails, and nothing silently vanishes.
 
 Drop both releases in and the corpus-backed tests activate, taking the suite to
-**1445 passing, 15 skipped** — measured, not estimated.
+**1466 passing, 15 skipped** — measured, not estimated.
 
 CI builds ABC from scratch at the pinned commit on a clean Ubuntu runner and
 runs the suite there — the actual proof that the dependency is reproducible on a
@@ -213,6 +213,7 @@ machine that has never seen this project, not just a claim in a README.
 ```
 netlist_agent/
   cli.py                stdin/stdout request loop, config, LLM fallback wiring
+  deadline.py           per-request wall-clock budget (cooperative, no signals or threads)
   router.py             stub — the real router is not in this repository
   ir.py parser.py writer.py    netlist representation, Verilog in and out
   graph.py analysis.py  connectivity, cones, paths, depth, fanout

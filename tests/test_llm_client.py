@@ -12,8 +12,12 @@ import json
 import types
 from typing import Any, Callable, Optional
 
+import pytest
+
+from netlist_agent import deadline
 from netlist_agent.ir import Design, Direction, Gate, GateType, NetBit, Port, Signal
-from netlist_agent.llm.client import DEFAULT_MAX_ITERATIONS, LLMClient, _INCOMPLETE_MESSAGE
+from netlist_agent.llm.client import DEFAULT_MAX_ITERATIONS, LLMClient, ToolCallRequest, _INCOMPLETE_MESSAGE, _execute_tool
+from netlist_agent.llm.tools_schema import TOOL_REGISTRY
 from netlist_agent.session import Session
 
 RespondFn = Callable[[int, list], dict]
@@ -485,3 +489,134 @@ def test_on_event_exception_does_not_break_the_loop() -> None:
     llm = LLMClient(provider="openai", client=client, model="fake-model", on_event=bad_hook)
     answer = llm.answer(_session(), "how many gates are there really")
     assert answer == "The design has 1 gate."
+
+
+# ----------------------------------------------------------------------
+# Request deadline: mutating tools get the transform budget (batch 21b)
+# ----------------------------------------------------------------------
+
+_NON_MUTATING_TOOLS = frozenset(
+    {
+        "check_dffs_same_clock_domain",
+        "check_equivalence_to_snapshot",
+        "check_floating_signals",
+        "check_gate_on_max_depth_path",
+        "check_is_cut_signal",
+        "check_path_exists",
+        "check_property_asserted_only_when",
+        "check_signal_equivalence",
+        "check_symmetry_tool",
+        "count_gates_by_type",
+        "count_outputs_over_depth",
+        "count_paths",
+        "count_primary_ports",
+        "enumerate_paths",
+        "find_gates_by_name",
+        "find_signal_pair_for_operator",
+        "get_boolean_function",
+        "get_cone_gate_type_breakdown",
+        "get_constant_value",
+        "get_cut_nets_between",
+        "get_depth_between",
+        "get_depth_of_cone",
+        "get_direct_pi_po_connections",
+        "get_fanin_cone_gates",
+        "get_fanin_cone_size",
+        "get_fanout_cone_gates",
+        "get_gate_direct_fanout",
+        "get_gate_fanout_count",
+        "get_gate_info",
+        "get_gates_connected_to_signal",
+        "get_largest_fanin_cone",
+        "get_last_operation_summary",
+        "get_max_design_depth",
+        "get_max_fanout_of_signal",
+        "get_max_fanout_primary_input",
+        "get_max_pi_to_dff_d_depth",
+        "get_max_reg_to_reg_depth",
+        "get_net_fanout",
+        "get_reg_to_reg_path_stats",
+        "get_shared_fanin_gates",
+        "list_dffs_on_clock",
+        "list_gates_of_type",
+        "list_gates_with_constant_input",
+        "list_primary_outputs_over_cone_size",
+        "list_primary_ports",
+        "load_design",
+        "set_testcase",
+        "write_design",
+    }
+)
+
+
+@pytest.fixture
+def _fake_clock(monkeypatch):
+    now = {"t": 0.0}
+    monkeypatch.setattr(deadline, "_monotonic", lambda: now["t"])
+    return now
+
+
+def _remaining_seen_by(monkeypatch, name: str) -> float:
+    seen: list = []
+
+    def tool(session, **kwargs):
+        seen.append(deadline.remaining())
+        return {"ok": True}
+
+    monkeypatch.setitem(TOOL_REGISTRY, name, tool)
+    with deadline.request_scope(deadline.ANALYSIS_BUDGET):
+        out = _execute_tool(_session(), ToolCallRequest(id="1", name=name, arguments={}))
+    assert json.loads(out) == {"ok": True}
+    return seen[0]
+
+
+@pytest.mark.parametrize("name", ["do_fake_transform", "rename_fake"])
+def test_execute_tool_extends_for_mutating_prefixes(monkeypatch, _fake_clock, name) -> None:
+    """kills: no extend() in _execute_tool; a prefix (`do_` / `rename_`) dropped from the tuple."""
+    assert _remaining_seen_by(monkeypatch, name) == deadline.TRANSFORM_BUDGET
+
+
+_REAL_MUTATING_TOOLS = sorted(k for k in TOOL_REGISTRY if k.startswith(("do_", "rename_")))
+
+
+def test_real_tool_name_lists_are_not_empty() -> None:
+    """A zero-length parametrization passes silently; fail here instead."""
+    assert len(_NON_MUTATING_TOOLS) > 0
+    assert len(_REAL_MUTATING_TOOLS) > 0
+
+
+@pytest.mark.parametrize("name", sorted(_NON_MUTATING_TOOLS))
+def test_execute_tool_does_not_extend_other_tools(monkeypatch, _fake_clock, name) -> None:
+    """kills: extend() applied to every tool (every real non-mutating registry name)."""
+    assert _remaining_seen_by(monkeypatch, name) == deadline.ANALYSIS_BUDGET
+
+
+@pytest.mark.parametrize("name", _REAL_MUTATING_TOOLS)
+def test_execute_tool_extends_for_every_real_mutating_tool(monkeypatch, _fake_clock, name) -> None:
+    """kills: a real do_*/rename_* tool that does not get the transform budget."""
+    assert _remaining_seen_by(monkeypatch, name) == deadline.TRANSFORM_BUDGET
+
+
+def test_execute_tool_unknown_do_tool_does_not_extend(_fake_clock) -> None:
+    """kills: extend() placed before the TOOL_REGISTRY lookup."""
+    with deadline.request_scope(deadline.ANALYSIS_BUDGET):
+        out = _execute_tool(_session(), ToolCallRequest(id="1", name="do_not_a_tool", arguments={}))
+        left = deadline.remaining()
+    assert "unknown tool" in json.loads(out)["error"]
+    assert left == deadline.ANALYSIS_BUDGET
+
+
+def test_execute_tool_parse_error_does_not_extend(_fake_clock) -> None:
+    """kills: extend() placed before the parse_error check."""
+    with deadline.request_scope(deadline.ANALYSIS_BUDGET):
+        out = _execute_tool(_session(), ToolCallRequest(id="1", name="do_optimize_depth", arguments={}, parse_error="x"))
+        left = deadline.remaining()
+    assert "could not parse" in json.loads(out)["error"]
+    assert left == deadline.ANALYSIS_BUDGET
+
+
+def test_registry_names_without_mutating_prefix_are_pinned() -> None:
+    """A new tool whose name does not start with do_/rename_ fails here, so someone decides on
+    purpose whether it needs the transform budget (rename it, or add it to the set below)."""
+    actual = frozenset(k for k in TOOL_REGISTRY if not k.startswith(("do_", "rename_")))
+    assert actual == _NON_MUTATING_TOOLS

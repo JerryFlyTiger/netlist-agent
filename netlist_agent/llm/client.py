@@ -23,10 +23,14 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from netlist_agent import deadline
 from netlist_agent.llm.tools_schema import TOOL_REGISTRY, TOOL_SCHEMA, ToolSpec
 from netlist_agent.session import Session
 
 DEFAULT_MAX_ITERATIONS = 8
+# The registry has no "mutating" flag, so this goes by name; tests/test_llm_client.py pins the
+# set of tool names without these prefixes so a new tool has to be classified on purpose.
+_MUTATING_TOOL_PREFIXES = ("do_", "rename_")
 _INCOMPLETE_MESSAGE = (
     "I was unable to finish gathering the information needed to answer this within the "
     "allotted number of tool-call rounds. Please try rephrasing the request or breaking it "
@@ -63,6 +67,8 @@ def _execute_tool(session: Session, call: ToolCallRequest) -> str:
     fn = TOOL_REGISTRY.get(call.name)
     if fn is None:
         return json.dumps({"error": f"unknown tool {call.name!r}"})
+    if call.name.startswith(_MUTATING_TOOL_PREFIXES):
+        deadline.extend(deadline.TRANSFORM_BUDGET)
     try:
         result = fn(session, **call.arguments)
     except Exception as exc:  # noqa: BLE001 -- deliberately broad: any tool failure becomes a tool-result error

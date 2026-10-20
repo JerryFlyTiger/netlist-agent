@@ -1,8 +1,9 @@
-"""Per-request wall-clock deadline (batch 21a: the skeleton only).
+"""Per-request wall-clock deadline (core, plus the ABC leaf clamp helpers).
 
 `cli.run` opens one `request_scope` per request line; code that can run long
-calls `check()` / `clamp()` against it. 21a places no checkpoints, so nothing
-here changes a normal-path answer yet.
+calls `check()` / `clamp()` against it. Since 21b the ABC subprocess leaves
+(`abc_bridge._resolve_abc` / `_run_abc`, `abc_synth._run_abc_synthesis`) clamp their
+timeouts with `spawn_timeout()`; pure-Python code still has no checkpoints (21d).
 
 No signal, thread or subprocess is used: the deadline is cooperative. State
 lives in one immutable object in a single `ContextVar`, so leaving a scope
@@ -115,6 +116,23 @@ def clamp(timeout: float) -> float:
     if left is None:
         return timeout
     return min(timeout, max(0.0, left))
+
+
+# An ABC subprocess is not started with less than this many seconds left
+# (the same 0.5s as 20a's enable_hold.ABC_MIN_REMAINING).
+MIN_SPAWN_REMAINING = 0.5
+
+
+def spawn_timeout(timeout: float) -> Optional[float]:
+    """The timeout to give a subprocess whose own limit is `timeout`, or None when
+    the request has less than MIN_SPAWN_REMAINING seconds left (do not start it).
+    With no active scope (or under `disabled()`) returns `timeout` itself."""
+    left = remaining()
+    if left is None:
+        return timeout
+    if left < MIN_SPAWN_REMAINING:
+        return None
+    return min(timeout, left)
 
 
 @contextlib.contextmanager

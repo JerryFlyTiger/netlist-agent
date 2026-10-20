@@ -69,6 +69,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from netlist_agent import deadline
 from netlist_agent.abc_bridge import (
     ABCBridgeError,
     ABCInconclusiveError,
@@ -276,6 +277,15 @@ def _verify_failure_prefix(exc: ABCBridgeError) -> str:
 
 
 def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_script: str = _OPT_SCRIPT) -> _BlifNetlist:
+    # Clamp to the request's remaining time (batch 21b). Checked first so a spent
+    # budget skips the temp dir and the BLIF write; checked again after the
+    # resolve below, which can use up time on a cold cache.
+    t = deadline.spawn_timeout(timeout)
+    if t is None:
+        raise _SynthError(
+            f"ABC synthesis was not started: this request had less than "
+            f"{deadline.MIN_SPAWN_REMAINING:g}s of its time budget left"
+        )
     genlib_text = _genlib_text(basis)
     # Every OSError below (disk full, unwritable temp dir, exec failure) becomes
     # `_SynthError` so the optimize paths report a `failure` instead of letting
@@ -312,9 +322,19 @@ def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_s
             abc_path = _resolve_abc()
         except ABCBridgeError as exc:
             raise _SynthError(str(exc)) from exc
+        t = deadline.spawn_timeout(timeout)
+        if t is None:
+            raise _SynthError(
+                f"ABC synthesis was not started: this request had less than "
+                f"{deadline.MIN_SPAWN_REMAINING:g}s of its time budget left"
+            )
         try:
-            result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=t)
         except subprocess.TimeoutExpired as exc:
+            if t < timeout:
+                raise _SynthError(
+                    f"ABC synthesis timed out after {t:.1f}s (the time left in this request's budget)"
+                ) from exc
             raise _SynthError(f"ABC synthesis timed out after {timeout}s") from exc
         except OSError as exc:
             raise _SynthError(f"could not run ABC: {_os_error_detail(exc)}") from exc

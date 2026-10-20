@@ -73,6 +73,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+from netlist_agent import deadline
 from netlist_agent.graph import NetlistGraph
 from netlist_agent.ir import (
     Const,
@@ -93,7 +94,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIND_ABC_SCRIPT = os.path.join(REPO_ROOT, "scripts", "find_abc.sh")
 
 # Generous default for a single ABC invocation; a pathological/hung ABC run
-# raises ABCBridgeError (via subprocess.TimeoutExpired) rather than hanging
+# raises ABCTimeoutError (via subprocess.TimeoutExpired) rather than hanging
 # silently. Callers of the public functions below may override per call.
 DEFAULT_ABC_TIMEOUT = 120.0
 # Separate, larger budget for the post-synthesis equivalence check (`cec`).
@@ -126,7 +127,8 @@ class ABCInconclusiveError(ABCBridgeError):
 
 
 class ABCTimeoutError(ABCInconclusiveError):
-    """The ABC subprocess exceeded its time budget."""
+    """The ABC subprocess exceeded its time budget, or was never started because the
+    request had too little of its time budget left."""
 
 
 class CecUndecidedError(ABCInconclusiveError):
@@ -182,11 +184,22 @@ def _locator_detail(stderr: str) -> str:
 def _resolve_abc() -> str:
     global _abc_path
     if _abc_path is None:
-        try:
-            result = subprocess.run(
-                ["bash", FIND_ABC_SCRIPT], capture_output=True, text=True, timeout=_RESOLVE_TIMEOUT
+        # Clamp to the request's remaining time (batch 21b); a failure caused by
+        # the clamp is an ABCTimeoutError (no time, not "tool not found").
+        t = deadline.spawn_timeout(_RESOLVE_TIMEOUT)
+        if t is None:
+            raise ABCTimeoutError(
+                f"the ABC locator was not run: this request had less than "
+                f"{deadline.MIN_SPAWN_REMAINING:g}s of its time budget left"
             )
+        try:
+            result = subprocess.run(["bash", FIND_ABC_SCRIPT], capture_output=True, text=True, timeout=t)
         except subprocess.TimeoutExpired as exc:
+            if t < _RESOLVE_TIMEOUT:
+                raise ABCTimeoutError(
+                    f"timed out resolving the ABC binary via {_FIND_ABC_DISPLAY} after {t:.1f}s "
+                    f"(the time left in this request's budget)"
+                ) from exc
             raise ABCBridgeError(
                 f"timed out resolving the ABC binary via {_FIND_ABC_DISPLAY} after {_RESOLVE_TIMEOUT}s"
             ) from exc
@@ -252,9 +265,22 @@ def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> st
     optional only because tests call this directly against a fake ABC whose
     output carries no temp dir."""
     abc_path = _resolve_abc()
+    # Clamp to the request's remaining time (batch 21b). Computed after the
+    # resolve above, which can itself use up time on a cold cache.
+    t = deadline.spawn_timeout(timeout)
+    if t is None:
+        raise ABCTimeoutError(
+            f"ABC was not started for {_script_command(script)!r}: this request had less than "
+            f"{deadline.MIN_SPAWN_REMAINING:g}s of its time budget left"
+        )
     try:
-        result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=t)
     except subprocess.TimeoutExpired as exc:
+        if t < timeout:
+            raise ABCTimeoutError(
+                f"ABC invocation timed out after {t:.1f}s running {_script_command(script)!r} "
+                f"(the time left in this request's budget)"
+            ) from exc
         raise ABCTimeoutError(f"ABC invocation timed out after {timeout}s running {_script_command(script)!r}") from exc
     except OSError as exc:
         # Loud failure, not "inconclusive": ABC never ran, so there is no

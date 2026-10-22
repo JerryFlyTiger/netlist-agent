@@ -105,6 +105,14 @@ def remaining() -> Optional[float]:
     return st.deadline - _monotonic()
 
 
+def current_budget() -> Optional[float]:
+    """The active scope's budget in seconds (after any extend()), or None with no scope or inside disabled()."""
+    st = _active()
+    if st is None:
+        return None
+    return st.budget
+
+
 def check() -> None:
     st = _active()
     if st is not None and st.deadline - _monotonic() <= 0:

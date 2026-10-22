@@ -185,7 +185,7 @@ def test_build_provider_client_openai_passes_base_url_and_max_retries(monkeypatc
     _build_provider_client("openai", "sk-test", base_url="https://example.invalid/v1beta/openai/")
     assert captured["api_key"] == "sk-test"
     assert captured["base_url"] == "https://example.invalid/v1beta/openai/"
-    assert captured["max_retries"] == 5
+    assert captured["max_retries"] == 0
 
 
 def test_build_provider_client_openai_no_base_url_when_unset(monkeypatch) -> None:
@@ -200,7 +200,7 @@ def test_build_provider_client_openai_no_base_url_when_unset(monkeypatch) -> Non
     monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
     _build_provider_client("openai", "sk-test")
     assert "base_url" not in captured
-    assert captured["max_retries"] == 5
+    assert captured["max_retries"] == 0
 
 
 def test_build_provider_client_openai_resolves_env_api_key(monkeypatch) -> None:
@@ -231,6 +231,23 @@ def test_build_provider_client_anthropic_passes_base_url(monkeypatch) -> None:
     _build_provider_client("anthropic", "ant-test", base_url="https://example.invalid/")
     assert captured["api_key"] == "ant-test"
     assert captured["base_url"] == "https://example.invalid/"
+    # SDK retries are off: LLMClient retries inside the request deadline (SPEC_21c D6).
+    assert captured["max_retries"] == 0
+
+
+def test_build_provider_client_anthropic_no_base_url_when_unset(monkeypatch) -> None:
+    captured = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import anthropic
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+    _build_provider_client("anthropic", "ant-test")
+    assert "base_url" not in captured
+    assert captured["max_retries"] == 0
 
 
 # ----------------------------------------------------------------------

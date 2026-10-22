@@ -188,14 +188,15 @@ def _build_provider_client(provider: str, api_key: str, base_url: Optional[str] 
     if provider == "openai":
         import openai
 
-        kwargs: dict[str, Any] = {"api_key": resolved_key, "max_retries": 5}
+        # SDK retries are off for both providers: LLMClient retries within the request deadline (llm/client.py).
+        kwargs: dict[str, Any] = {"api_key": resolved_key, "max_retries": 0}
         if base_url is not None:
             kwargs["base_url"] = base_url
         return openai.OpenAI(**kwargs)
     if provider == "anthropic":
         import anthropic
 
-        kwargs = {"api_key": resolved_key}
+        kwargs = {"api_key": resolved_key, "max_retries": 0}
         if base_url is not None:
             kwargs["base_url"] = base_url
         return anthropic.Anthropic(**kwargs)

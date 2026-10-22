@@ -20,6 +20,7 @@ clear "could not complete" message -- never a hang or a crash.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -31,6 +32,19 @@ DEFAULT_MAX_ITERATIONS = 8
 # The registry has no "mutating" flag, so this goes by name; tests/test_llm_client.py pins the
 # set of tool names without these prefixes so a new tool has to be classified on purpose.
 _MUTATING_TOOL_PREFIXES = ("do_", "rename_")
+# Indirection so tests can monkeypatch the sleep (nothing else in the repo sleeps).
+_sleep = time.sleep
+# A request is not sent with less than this many seconds left (SPEC_21c D3).
+_MIN_REQUEST_REMAINING = 3.0
+# Per-request timeout = time left minus this margin for the connect phase (D4).
+_TIMEOUT_MARGIN = 2.0
+# The SDKs' own retries are off (cli.py max_retries=0); LLMClient retries up to this many times (D9).
+_MAX_RETRIES = 5
+# Exponential backoff 0.5, 1, 2, 4, 8 s, no jitter (D8).
+_BACKOFF_BASE = 0.5
+_BACKOFF_CAP = 8.0
+# A Retry-After longer than this means do not retry, as the SDKs do (D8).
+_MAX_RETRY_AFTER = 60.0
 _INCOMPLETE_MESSAGE = (
     "I was unable to finish gathering the information needed to answer this within the "
     "allotted number of tool-call rounds. Please try rephrasing the request or breaking it "
@@ -90,6 +104,26 @@ def _anthropic_tools(schema: list[ToolSpec]) -> list[dict[str, Any]]:
     return [{"name": t.name, "description": t.description, "input_schema": t.parameters} for t in schema]
 
 
+def _is_retryable(exc: Exception) -> bool:
+    """Same rules as the SDKs' `_should_retry` (D7), without importing either SDK:
+    connection/timeout errors (matched by class name) and statuses 408, 409, 429, >= 500."""
+    if any(cls.__name__ == "APIConnectionError" for cls in type(exc).__mro__):
+        return True
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        return False
+    return status in (408, 409, 429) or status >= 500
+
+
+def _retry_after(exc: Exception) -> Optional[float]:
+    """Seconds from the response's Retry-After header, or None if absent or not a plain number (D8)."""
+    try:
+        value = float(exc.response.headers.get("retry-after"))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 -- any missing step means "no header"
+        return None
+    return None if value != value else value  # NaN -> ignore
+
+
 class OpenAIAdapter:
     """Talks to an OpenAI-SDK-shaped client: `client.chat.completions.create(...)`
     returning an object with `.choices[0].message.content` / `.tool_calls`.
@@ -108,13 +142,15 @@ class OpenAIAdapter:
             {"role": "user", "content": user_message},
         ]
 
-    def request(self, history: list[dict[str, Any]]) -> ModelTurn:
+    def request(self, history: list[dict[str, Any]], timeout: Optional[float] = None) -> ModelTurn:
+        extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
         response = self.client.chat.completions.create(
             model=self.model,
             messages=history,
             tools=self._tools,
             temperature=self.temperature,
             max_tokens=self.max_output_tokens,
+            **extra,
         )
         message = response.choices[0].message
         raw_tool_calls = list(getattr(message, "tool_calls", None) or [])
@@ -180,7 +216,8 @@ class AnthropicAdapter:
         self._system_prompt = system_prompt
         return [{"role": "user", "content": user_message}]
 
-    def request(self, history: list[dict[str, Any]]) -> ModelTurn:
+    def request(self, history: list[dict[str, Any]], timeout: Optional[float] = None) -> ModelTurn:
+        extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
         response = self.client.messages.create(
             model=self.model,
             system=self._system_prompt,
@@ -188,6 +225,7 @@ class AnthropicAdapter:
             tools=self._tools,
             temperature=self.temperature,
             max_tokens=self.max_output_tokens,
+            **extra,
         )
         blocks = list(response.content)
         history.append({"role": "assistant", "content": blocks})
@@ -270,31 +308,60 @@ class LLMClient:
         except Exception:  # noqa: BLE001 -- deliberately broad: tracing must never break the loop
             pass
 
+    def _request(self, adapter: Any, history: list[dict[str, Any]]) -> ModelTurn:
+        """One model call with retries bounded by the request deadline (SPEC_21c D3-D10)."""
+        attempt = 0
+        while True:
+            left = deadline.remaining()
+            if left is not None and left < _MIN_REQUEST_REMAINING:
+                raise deadline.DeadlineExceeded(deadline.current_budget())
+            try:
+                return adapter.request(history, timeout=None if left is None else left - _TIMEOUT_MARGIN)
+            except Exception as exc:  # noqa: BLE001 -- retry decision is made by _is_retryable
+                if not _is_retryable(exc) or attempt >= _MAX_RETRIES:
+                    raise
+                delay = min(_BACKOFF_BASE * 2**attempt, _BACKOFF_CAP)
+                ra = _retry_after(exc)
+                if ra is not None:
+                    if ra > _MAX_RETRY_AFTER:
+                        raise
+                    delay = max(delay, ra)
+                left = deadline.remaining()
+                if left is not None and left - delay < _MIN_REQUEST_REMAINING:
+                    raise deadline.DeadlineExceeded(deadline.current_budget()) from exc
+                attempt += 1
+                self._emit({"type": "retry", "attempt": attempt, "error": type(exc).__name__, "delay": delay})
+                _sleep(delay)
+
     def answer(self, session: Session, user_message: str) -> str:
         adapter = _ADAPTERS[self.provider](self.client, self.model, self.temperature, self.max_output_tokens)
         history = adapter.initial_history(build_system_prompt(session), user_message)
 
         last_text: Optional[str] = None
-        for iteration in range(self.max_iterations):
-            turn = adapter.request(history)
-            if turn.text:
-                last_text = turn.text
-            if not turn.tool_calls:
-                final_text = turn.text if turn.text is not None else (last_text or "")
-                self._emit({"type": "final", "text": final_text})
-                return final_text
-            results = {call.id: _execute_tool(session, call) for call in turn.tool_calls}
-            for call in turn.tool_calls:
-                self._emit(
-                    {
-                        "type": "tool_call",
-                        "iteration": iteration,
-                        "name": call.name,
-                        "arguments": call.arguments,
-                        "result": results[call.id][:500],
-                    }
-                )
-            adapter.add_tool_results(history, turn.tool_calls, results)
+        try:
+            for iteration in range(self.max_iterations):
+                turn = self._request(adapter, history)
+                if turn.text:
+                    last_text = turn.text
+                if not turn.tool_calls:
+                    final_text = turn.text if turn.text is not None else (last_text or "")
+                    self._emit({"type": "final", "text": final_text})
+                    return final_text
+                results = {call.id: _execute_tool(session, call) for call in turn.tool_calls}
+                for call in turn.tool_calls:
+                    self._emit(
+                        {
+                            "type": "tool_call",
+                            "iteration": iteration,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                            "result": results[call.id][:500],
+                        }
+                    )
+                adapter.add_tool_results(history, turn.tool_calls, results)
 
-        self._emit({"type": "max_iterations"})
-        return last_text or _INCOMPLETE_MESSAGE
+            self._emit({"type": "max_iterations"})
+            return last_text or _INCOMPLETE_MESSAGE
+        except deadline.DeadlineExceeded as exc:
+            self._emit({"type": "deadline", "budget": exc.budget})
+            return deadline.incomplete_message(exc)

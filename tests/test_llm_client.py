@@ -54,10 +54,14 @@ class FakeOpenAIClient:
     def __init__(self, respond_fn: RespondFn) -> None:
         self.respond_fn = respond_fn
         self.rounds = 0
+        self.timeouts: list = []
         self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self._create))
 
-    def _create(self, model: str, messages: list, tools: list, temperature: float, max_tokens: int) -> Any:
+    def _create(
+        self, model: str, messages: list, tools: list, temperature: float, max_tokens: int, timeout: Any = None
+    ) -> Any:
         self.rounds += 1
+        self.timeouts.append(timeout)
         step = self.respond_fn(self.rounds, messages)
         tool_calls = None
         if step.get("tool_calls"):
@@ -620,3 +624,374 @@ def test_registry_names_without_mutating_prefix_are_pinned() -> None:
     purpose whether it needs the transform budget (rename it, or add it to the set below)."""
     actual = frozenset(k for k in TOOL_REGISTRY if not k.startswith(("do_", "rename_")))
     assert actual == _NON_MUTATING_TOOLS
+
+
+# ----------------------------------------------------------------------
+# SPEC_21c: request deadline in the LLM loop (retries, per-request timeout, Incomplete exit)
+# ----------------------------------------------------------------------
+
+import netlist_agent.llm.client as _client_module  # noqa: E402
+from netlist_agent.llm.client import _is_retryable  # noqa: E402
+
+_NO_TIMEOUT = object()  # the fake's default: "the caller did not pass timeout= at all"
+
+
+class _StatusError(Exception):
+    """A fake SDK error: just a status_code, optionally a response with headers."""
+
+    def __init__(self, status_code: int, headers: Optional[dict] = None) -> None:
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+        if headers is not None:
+            self.response = types.SimpleNamespace(headers=headers)
+
+
+class APIConnectionError(Exception):
+    """Same class name as the SDKs' (the retry check matches by name, not by import)."""
+
+
+class APITimeoutError(APIConnectionError):
+    pass
+
+
+class _ScriptedClient:
+    """A fake SDK client of either provider. Each create() call: records whether/what timeout= was
+    passed, runs on_call(), then plays steps[i] (the last repeats): an exception is raised,
+    a dict is turned into a response ({"text"} / {"tool_calls": [...]})."""
+
+    def __init__(self, provider: str, steps: list, on_call: Optional[Callable[[], None]] = None) -> None:
+        self.steps = steps
+        self.on_call = on_call
+        self.calls = 0
+        self.timeouts: list = []
+        if provider == "openai":
+            self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self._openai_create))
+        else:
+            self.messages = types.SimpleNamespace(create=self._anthropic_create)
+        self.provider = provider
+
+    def _step(self, timeout: Any) -> Any:
+        self.timeouts.append(timeout)
+        i = self.calls
+        self.calls += 1
+        if self.on_call is not None:
+            self.on_call()
+        step = self.steps[min(i, len(self.steps) - 1)]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def _openai_create(self, model, messages, tools, temperature, max_tokens, timeout=_NO_TIMEOUT) -> Any:
+        step = self._step(timeout)
+        tool_calls = None
+        if step.get("tool_calls"):
+            tool_calls = [
+                types.SimpleNamespace(
+                    id=tc["id"], function=types.SimpleNamespace(name=tc["name"], arguments=json.dumps(tc.get("arguments", {})))
+                )
+                for tc in step["tool_calls"]
+            ]
+        message = types.SimpleNamespace(content=step.get("text"), tool_calls=tool_calls)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+
+    def _anthropic_create(self, model, system, messages, tools, temperature, max_tokens, timeout=_NO_TIMEOUT) -> Any:
+        step = self._step(timeout)
+        blocks = []
+        if step.get("text"):
+            blocks.append(types.SimpleNamespace(type="text", text=step["text"]))
+        for tc in step.get("tool_calls", []):
+            blocks.append(types.SimpleNamespace(type="tool_use", id=tc["id"], name=tc["name"], input=tc.get("arguments", {})))
+        return types.SimpleNamespace(content=blocks, stop_reason="tool_use" if step.get("tool_calls") else "end_turn")
+
+
+class _Env:
+    def __init__(self, clock: dict) -> None:
+        self.clock = clock
+        self.sleeps: list = []
+        self.events: list = []
+
+
+@pytest.fixture
+def _env(monkeypatch):
+    """Fake clock + a `_sleep` that records the delay and advances the fake clock.
+    No test in this section may ever really sleep."""
+    clock = {"t": 0.0}
+    env = _Env(clock)
+    monkeypatch.setattr(deadline, "_monotonic", lambda: clock["t"])
+
+    def fake_sleep(delay: float) -> None:
+        env.sleeps.append(delay)
+        clock["t"] += delay
+
+    monkeypatch.setattr(_client_module, "_sleep", fake_sleep)
+    return env
+
+
+def _llm(client: _ScriptedClient, env: _Env) -> LLMClient:
+    return LLMClient(provider=client.provider, client=client, model="fake-model", on_event=env.events.append)
+
+
+_OK = {"text": "done"}
+
+
+def _incomplete(budget: float) -> str:
+    return deadline.incomplete_message(deadline.DeadlineExceeded(budget))
+
+
+def _cls(name: str, base: type = Exception) -> type:
+    return type(name, (base,), {})
+
+
+def test_t2_is_retryable_by_name_and_status() -> None:
+    """SPEC_21c T2 (fake classes). kills: dropped APIConnectionError name branch / MRO walk; wrong status set."""
+    assert _is_retryable(APIConnectionError())
+    assert _is_retryable(APITimeoutError())
+    # the name must be equal to, not merely contain, "APIConnectionError" (F9)
+    assert not _is_retryable(_cls("FooAPIConnectionErrorBar")())
+    for status in (408, 409, 429, 500, 503):
+        assert _is_retryable(_StatusError(status)), status
+    for status in (400, 401, 403, 404, 422):
+        assert not _is_retryable(_StatusError(status)), status
+    assert not _is_retryable(ValueError("x"))
+
+
+@pytest.mark.parametrize("sdk", ["openai", "anthropic"])
+def test_t2_is_retryable_real_sdk_classes(sdk: str) -> None:
+    """SPEC_21c T2 (real SDK classes, built with __new__). Pins that both SDKs really use these class names."""
+    mod = pytest.importorskip(sdk)
+    for name, status, expected in (
+        ("RateLimitError", 429, True),
+        ("InternalServerError", 500, True),
+        ("BadRequestError", 400, False),
+    ):
+        cls = getattr(mod, name)
+        exc = cls.__new__(cls)
+        exc.status_code = status
+        assert _is_retryable(exc) is expected, (sdk, name)
+    for name in ("APIConnectionError", "APITimeoutError"):
+        cls = getattr(mod, name)
+        assert _is_retryable(cls.__new__(cls)) is True, (sdk, name)
+
+
+def test_t3_timeout_is_remaining_minus_margin(_env) -> None:
+    """SPEC_21c T3. kills: wrong margin; timeout computed once outside the loop; timeout not passed."""
+    client = _ScriptedClient(
+        "openai",
+        [{"tool_calls": [{"id": "c1", "name": "count_gates_by_type", "arguments": {}}]}, _OK],
+        on_call=lambda: _env.clock.__setitem__("t", _env.clock["t"] + (10.0 if client.calls == 1 else 0.0)),
+    )
+    with deadline.request_scope(45.0):
+        assert _llm(client, _env).answer(_session(), "q") == "done"
+    # round 1 sees 45 - 2; the call itself takes 10 s; round 2 sees 45 - 10 - 2.
+    assert client.timeouts == [43.0, 33.0]
+
+
+def test_t4_threshold_exactly_3_sends_below_does_not(_env) -> None:
+    """SPEC_21c T4. kills: `<` -> `<=`; missing pre-send check; wrong Incomplete text."""
+    client = _ScriptedClient("openai", [_OK])
+    with deadline.request_scope(45.0):
+        _env.clock["t"] = 42.0
+        assert _llm(client, _env).answer(_session(), "q") == "done"
+    assert client.timeouts == [1.0]
+
+    client = _ScriptedClient("openai", [_OK])
+    _env.clock["t"] = 0.0  # a new scope starts at the clock's current reading
+    with deadline.request_scope(45.0):
+        _env.clock["t"] = 42.01
+        out = _llm(client, _env).answer(_session(), "q")
+    assert client.calls == 0
+    assert out == _incomplete(45)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_t5_no_scope_passes_no_timeout_kwarg(provider: str) -> None:
+    """SPEC_21c T5. kills: adapter always passing timeout=None (or a value) outside any scope."""
+    client = _ScriptedClient(provider, [_OK])
+    assert LLMClient(provider=provider, client=client, model="m").answer(_session(), "q") == "done"
+    assert client.timeouts == [_NO_TIMEOUT]
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_t5_scope_passes_timeout_kwarg(provider: str, _env) -> None:
+    """SPEC_21c T5 (positive control). kills: an adapter that never forwards timeout= even inside a scope."""
+    client = _ScriptedClient(provider, [_OK])
+    with deadline.request_scope(45.0):
+        _llm(client, _env).answer(_session(), "q")
+    assert client.timeouts == [43.0]
+
+
+def test_t6_retry_then_success(_env) -> None:
+    """SPEC_21c T6. kills: wrong first delay (2 ** (attempt+1)); wrong/missing retry event; no retry."""
+    client = _ScriptedClient("openai", [_StatusError(429), _OK])
+    assert _llm(client, _env).answer(_session(), "q") == "done"
+    assert client.calls == 2
+    assert _env.sleeps == [0.5]
+    retries = [e for e in _env.events if e["type"] == "retry"]
+    assert retries == [{"type": "retry", "attempt": 1, "error": "_StatusError", "delay": 0.5}]
+
+
+def test_t7_retry_cut_by_deadline(_env) -> None:
+    """SPEC_21c T7. kills: missing `left - delay` check; sleeping before checking."""
+    client = _ScriptedClient(
+        "openai", [_StatusError(503)], on_call=lambda: _env.clock.__setitem__("t", _env.clock["t"] + 1.0)
+    )
+    with deadline.request_scope(5.0):
+        out = _llm(client, _env).answer(_session(), "q")
+    # send 1: left 5.0 -> timeout 3.0, fails with 4.0 left, delay 0.5, 3.5 >= 3 -> sleep, 3.5 left.
+    # send 2: timeout 1.5, fails with 2.5 left, delay 1.0, 1.5 < 3 -> no sleep.
+    assert client.calls == 2
+    assert client.timeouts == [3.0, 1.5]
+    assert _env.sleeps == [0.5]
+    assert out == _incomplete(5)
+    assert len([e for e in _env.events if e["type"] == "deadline"]) == 1
+    assert len([e for e in _env.events if e["type"] == "retry"]) == 1
+
+
+def test_t8_retry_cap_without_scope(_env) -> None:
+    """SPEC_21c T8. kills: `>=` -> `>` on the cap; backoff cap/base changes; raising a new exception."""
+    errors: list = []
+
+    def make() -> _StatusError:
+        e = _StatusError(429)
+        errors.append(e)
+        return e
+
+    client = _ScriptedClient("openai", [_OK])
+
+    def create(*args, **kwargs):
+        client.calls += 1
+        raise make()
+
+    client.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+    with pytest.raises(_StatusError) as info:
+        _llm(client, _env).answer(_session(), "q")
+    assert client.calls == 6
+    assert _env.sleeps == [0.5, 1.0, 2.0, 4.0, 8.0]
+    assert len(errors) == 6
+    assert info.value is errors[-1]
+
+
+def test_t9_non_retryable_raises_immediately(_env) -> None:
+    """SPEC_21c T9. kills: retrying 4xx; swallowing/replacing the original exception."""
+    err = _StatusError(400)
+    client = _ScriptedClient("openai", [err])
+    with pytest.raises(_StatusError) as info:
+        _llm(client, _env).answer(_session(), "q")
+    assert info.value is err
+    assert client.calls == 1
+    assert _env.sleeps == []
+
+
+@pytest.mark.parametrize(
+    "header, expected_delay",
+    [("3", 3.0), ("Wed, 21 Oct 2026 07:28:00 GMT", 0.5), (None, 0.5)],
+)
+def test_t10_retry_after_header(_env, header, expected_delay) -> None:
+    """SPEC_21c T10. kills: `max` -> `min`; Retry-After ignored; HTTP-date crashing the parser;
+    missing .response not tolerated (header None means: exception has no response attribute)."""
+    err = _StatusError(429) if header is None else _StatusError(429, {"retry-after": header})
+    client = _ScriptedClient("openai", [err, _OK])
+    assert _llm(client, _env).answer(_session(), "q") == "done"
+    assert _env.sleeps == [expected_delay]
+
+
+def test_t10_retry_after_over_60_does_not_retry(_env) -> None:
+    """SPEC_21c T10. kills: missing `> 60 -> do not retry` branch."""
+    err = _StatusError(429, {"retry-after": "100"})
+    client = _ScriptedClient("openai", [err, _OK])
+    with pytest.raises(_StatusError) as info:
+        _llm(client, _env).answer(_session(), "q")
+    assert info.value is err
+    assert client.calls == 1
+    assert _env.sleeps == []
+
+
+def test_t11_tool_raising_deadline_exceeded_is_incomplete(_env, monkeypatch) -> None:
+    """SPEC_21c T11. kills: no outer `except DeadlineExceeded` in answer(); no deadline event; event budget hard-coded."""
+
+    def tool(session, **kwargs):
+        raise deadline.DeadlineExceeded(37)
+
+    monkeypatch.setitem(TOOL_REGISTRY, "fake_slow_tool", tool)
+    client = _ScriptedClient("openai", [{"tool_calls": [{"id": "c1", "name": "fake_slow_tool", "arguments": {}}]}, _OK])
+    with deadline.request_scope(45.0):
+        out = _llm(client, _env).answer(_session(), "q")
+    # budget 37 != the scope's 45: the exit must report the exception's budget, not a constant.
+    assert out == _incomplete(37)
+    assert client.calls == 1
+    assert [e for e in _env.events if e["type"] == "deadline"] == [{"type": "deadline", "budget": 37}]
+
+
+def test_t13_timeout_recomputed_after_extend(_env, monkeypatch) -> None:
+    """SPEC_21c T13. kills: `left` computed once outside the loop; extend() not reflected in the next timeout."""
+
+    def tool(session, **kwargs):
+        _env.clock["t"] += 5.0
+        return {"ok": True}
+
+    monkeypatch.setitem(TOOL_REGISTRY, "do_fake_slow", tool)
+    client = _ScriptedClient("openai", [{"tool_calls": [{"id": "c1", "name": "do_fake_slow", "arguments": {}}]}, _OK])
+    with deadline.request_scope(45.0):
+        assert _llm(client, _env).answer(_session(), "q") == "done"
+    # clock starts at 0; do_ tool extends 45 -> 270 and burns 5 s: round 2 timeout = 270 - 5 - 2.
+    assert client.timeouts == [43.0, 270.0 - 5.0 - 2.0]
+
+
+def test_t14_undo_prefix_is_not_a_do_tool(_fake_clock, monkeypatch) -> None:
+    """SPEC_21c T14 (SPEC_21b knife). kills: startswith -> `in` (`"do_" in "undo_fake"`)."""
+    assert _remaining_seen_by(monkeypatch, "undo_fake") <= deadline.ANALYSIS_BUDGET
+
+
+def _advance(env: _Env, seconds: float) -> Callable[[], None]:
+    return lambda: env.clock.__setitem__("t", env.clock["t"] + seconds)
+
+
+def test_c1_failure_that_burned_the_timeout_does_not_sleep(_env) -> None:
+    """Round-1 C1. kills: dropping the post-failure re-read of remaining() (client.py `left = deadline.remaining()`)."""
+    client = _ScriptedClient("openai", [APITimeoutError()], on_call=_advance(_env, 43.0))
+    with deadline.request_scope(45.0):
+        out = _llm(client, _env).answer(_session(), "q")
+    assert client.calls == 1
+    assert _env.sleeps == []
+    assert out == _incomplete(45)
+    assert [e for e in _env.events if e["type"] == "retry"] == []
+
+
+def test_c2_retry_allowed_when_exactly_at_threshold(_env) -> None:
+    """Round-1 C2. kills: `left - delay < 3` -> `<= 3`."""
+    client = _ScriptedClient("openai", [_StatusError(503), _OK], on_call=_advance(_env, 1.5))
+    with deadline.request_scope(5.0):
+        out = _llm(client, _env).answer(_session(), "q")
+    # send 1: timeout 3.0, fails with 3.5 left; delay 0.5 -> 3.0 left, exactly the threshold -> sleep.
+    # send 2: left 3.0 -> timeout 1.0 (the fake advances 1.5 more, harmless).
+    assert out == "done"
+    assert _env.sleeps == [0.5]
+    assert client.timeouts == [3.0, 1.0]
+
+
+def test_c3_retry_after_never_shortens_the_backoff(_env) -> None:
+    """Round-1 C3. kills: `delay = max(delay, ra)` -> `delay = ra`."""
+    steps = [_StatusError(429), _StatusError(429, {"retry-after": "0.1"}), _OK]
+    client = _ScriptedClient("openai", steps)
+    assert _llm(client, _env).answer(_session(), "q") == "done"
+    assert _env.sleeps == [0.5, 1.0]
+
+
+def test_c4_retry_event_is_emitted_before_sleeping(_env, monkeypatch) -> None:
+    """Round-1 C4. kills: swapping `_emit(retry)` and `_sleep(delay)`."""
+    log: list = []
+    monkeypatch.setattr(_client_module, "_sleep", lambda delay: log.append(("sleep", delay)))
+    client = _ScriptedClient("openai", [_StatusError(429), _OK])
+    llm = LLMClient(provider="openai", client=client, model="m", on_event=lambda e: log.append((e["type"], e.get("delay"))))
+    assert llm.answer(_session(), "q") == "done"
+    assert log.index(("retry", 0.5)) < log.index(("sleep", 0.5))
+
+
+def test_c5_pre_send_exit_reports_the_scope_budget(_env) -> None:
+    """Round-1 C5. kills: pre-send `DeadlineExceeded(current_budget())` -> a hard-coded 45."""
+    client = _ScriptedClient("openai", [_OK])
+    with deadline.request_scope(30.0):
+        _env.clock["t"] = 28.0
+        out = _llm(client, _env).answer(_session(), "q")
+    assert client.calls == 0
+    assert out == _incomplete(30)

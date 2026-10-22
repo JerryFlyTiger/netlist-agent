@@ -276,3 +276,16 @@ def test_nested_budget_field_when_outer_is_tighter(clock) -> None:
             with pytest.raises(deadline.DeadlineExceeded) as ei:
                 deadline.check()
             assert ei.value.budget == 35.0
+
+
+def test_t1_current_budget(clock) -> None:
+    """SPEC_21c T1. kills: current_budget() returning a constant, ignoring extend(), or not honouring disabled()."""
+    assert deadline.current_budget() is None
+    with deadline.request_scope(45.0):
+        assert deadline.current_budget() == 45.0
+        with deadline.disabled():
+            assert deadline.current_budget() is None
+        assert deadline.current_budget() == 45.0
+        deadline.extend(270.0)
+        assert deadline.current_budget() == 270.0
+    assert deadline.current_budget() is None

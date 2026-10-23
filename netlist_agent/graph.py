@@ -25,6 +25,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Optional, Union
 
+from netlist_agent import deadline
 from netlist_agent.ir import (
     Design,
     Direction,
@@ -685,11 +686,13 @@ class NetlistGraph:
         # Explicit-stack DFS: each frame is (gate_name, iterator over
         # successors-within-useful still to try). `path` mirrors the
         # stack's gate_name sequence for O(1) yield.
-        start_names = [
+        # `dict.fromkeys` dedupes in order: a gate fed by `source` on two pins
+        # (`and g1(w, a, a)`) is one start, not two identical paths.
+        start_names = list(dict.fromkeys(
             c.inst_name
             for c in self.design.net_fanout.get(source, ())
             if c.gate_type != GateType.DFF and c.inst_name in useful
-        ]
+        ))
         for start_name in start_names:
             path = [start_name]
             stack: list[Iterator[str]] = [
@@ -727,6 +730,7 @@ class NetlistGraph:
         # gate instance names) contains a gate directly fed by that PI.
         reaching_pis: set[NetBit] = set()
         for pi in self.pi_bits:
+            deadline.check()
             if pi == nb:
                 reaching_pis.add(pi)
                 continue
@@ -752,6 +756,7 @@ class NetlistGraph:
 
         for pi in reaching_pis:
             for po in reached_pos:
+                deadline.check()
                 if self.path_exists(pi, po) and not self.path_exists(pi, po, avoid=nb):
                     return True
         return False
@@ -786,6 +791,7 @@ class NetlistGraph:
         cuts: list[NetBit] = []
         cut_gates: list[str] = []
         for gname in candidates:
+            deadline.check()
             gate = self.gate_by_name[gname]
             out_nb = _gate_output_pin(gate)
             if not isinstance(out_nb, NetBit) or out_nb in (source, target_nb):
@@ -869,6 +875,7 @@ class NetlistGraph:
         direct_wire_count = 0
         direct_wire_examples: list[tuple[str, NetBit, str]] = []
         for sink in sorted(self.dff_gates, key=lambda dff: dff.inst_name):
+            deadline.check()
             d = sink.pins.get("D")
             if not isinstance(d, NetBit) or d not in self.dff_q_bits:
                 continue

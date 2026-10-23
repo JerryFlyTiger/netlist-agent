@@ -3,7 +3,8 @@
 `cli.run` opens one `request_scope` per request line; code that can run long
 calls `check()` / `clamp()` against it. Since 21b the ABC subprocess leaves
 (`abc_bridge._resolve_abc` / `_run_abc`, `abc_synth._run_abc_synthesis`) clamp their
-timeouts with `spawn_timeout()`; pure-Python code still has no checkpoints (21d).
+timeouts with `spawn_timeout()`. Since 21d the read-only analysis loops call `check()` too;
+the exact list of checkpoint sites is pinned by the checkpoint whitelist tests (private repo).
 
 No signal, thread or subprocess is used: the deadline is cooperative. State
 lives in one immutable object in a single `ContextVar`, so leaving a scope

@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional
 
+from netlist_agent import deadline
 from netlist_agent.graph import Load, NetlistGraph
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, OUTPUT_PIN, Pin
 from netlist_agent.netref import netbit_sort_key
@@ -262,7 +263,11 @@ def po_cone_sizes(graph: NetlistGraph) -> dict[NetBit, int]:
     (no DFF.D pins) -- callers asking specifically about "primary outputs"
     (as opposed to "outputs" in the looser depth-query sense) get exactly
     the PO ports, nothing else."""
-    return {nb: fanin_cone_size(graph, nb) for nb in graph.po_bits}
+    sizes: dict[NetBit, int] = {}
+    for nb in graph.po_bits:
+        deadline.check()
+        sizes[nb] = fanin_cone_size(graph, nb)
+    return sizes
 
 
 def largest_fanin_cone(graph: NetlistGraph) -> tuple[Optional[NetBit], int]:
@@ -275,6 +280,7 @@ def largest_fanin_cone(graph: NetlistGraph) -> tuple[Optional[NetBit], int]:
         if isinstance(d, NetBit):
             candidates.add(d)
     for nb in sorted(candidates, key=netbit_sort_key):
+        deadline.check()
         size = fanin_cone_size(graph, nb)
         if size > best_size:
             best_nb, best_size = nb, size

@@ -46,6 +46,7 @@ from netlist_agent.abc_bridge import (
     are_equivalent,
     extract_combinational_view,
 )
+from netlist_agent import deadline
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, OUTPUT_PIN
 from netlist_agent.netref import netbit_token
 
@@ -306,6 +307,7 @@ def find_pair_for_op(
             by_sig.setdefault(s, []).append(nb)
         seen: set[frozenset] = set()
         for a_nb, a_s in candidates.items():
+            deadline.check()
             b_s = a_s ^ delta
             for b_nb in by_sig.get(b_s, ()):
                 key = frozenset((netbit_token(a_nb), netbit_token(b_nb)))
@@ -340,6 +342,7 @@ def find_pair_for_op(
         n = len(s_capped)
         combine = (lambda a, b: a & b) if op in ("AND", "NAND") else (lambda a, b: a | b)
         for i in range(n):
+            deadline.check()
             a_nb = s_capped[i]
             a_s = candidates[a_nb]
             for j in range(i, n):

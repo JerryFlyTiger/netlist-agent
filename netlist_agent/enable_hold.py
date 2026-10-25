@@ -94,17 +94,13 @@ from netlist_agent.netref import netbit_sort_key
 NUM_SAMPLES = 2048
 SIM_SEED = 20260812
 
-# Stage 1 evidence threshold. MUST stay at 1: raising it drops real hold
-# structures (measured on test40: threshold 64 loses 295 genuine flops),
-# which would make the "no false negatives" guarantee this module leans on
-# in Stage 3 (see `_candidates`'s docstring) simply false.
-MIN_EVIDENCE = 1
-
 # Stage 3 cost controls. Neither of these is tuned to reproduce any
 # particular headline count (see module docstring) -- they are a bounded
 # amount of extra formal effort spent on whatever Stage 2's constant
 # propagation could not settle structurally.
 TRUTH_TABLE_SUPPORT_LIMIT = 20
+# (The numbers in this comment were measured BEFORE batch 23, which removed
+# MIN_EVIDENCE; they were not re-measured afterwards.)
 # Measured on test40: raising this from 1 to 2, 3, or 6 proves not a single
 # additional flop (every candidate past the top-evidence-ranked one that
 # Stage 3 ever succeeds on was already caught by Stage 2's constant
@@ -407,10 +403,22 @@ def _candidates(
     "candidate" is exactly "no such counterexample pattern was observed",
     i.e. `x & (c==v ? sig[c] : ~sig[c]) == 0`.
 
-    `MIN_EVIDENCE = 1` (not any higher -- see module constant) is the
-    weakest possible admission bar: at least one sampled pattern actually
-    has c == v, otherwise "no counterexample was observed" is vacuous (c
-    never took that value at all) rather than real supporting evidence.
+    There is deliberately NO minimum-evidence threshold: a (c, v) whose net
+    never took the value `v` in the sample (zero evidence) is still a
+    candidate, because "no counterexample was observed" is all the argument
+    above needs. An earlier version dropped such pairs (`MIN_EVIDENCE = 1`,
+    "at least one sample has c == v") and that was a false-negative bug: a
+    rare enable such as `stall = AND(p0..p10)` never fires in the default sample (NUM_SAMPLES / SIM_SEED),
+    so the real control was dropped, `_candidates` came back empty, and the
+    flop was counted as formally proven to have no hold (repro:
+    experiments/degenerate_prefix_2026-10-24/min_evidence_false_proof.py).
+    Zero-evidence candidates sort LAST (their ranking key is 0), so they never
+    use up Stage 3's small per-flop budget ahead of a candidate with evidence.
+    What that fix removes is the flop being treated as PROVEN to have no
+    hold. It does not guarantee the rare control is then proven: if only
+    Stage 3 can prove it and Stage 3's per-flop budget is used up by earlier
+    candidates that have evidence, the flop lands in `forced_simulated_only`
+    (an honest "unresolved", not a false proof).
 
     `d` and `q` are BOTH DELIBERATELY EXCLUDED from the candidate pool --
     this is a POLICY choice about what counts as a reportable control, NOT a
@@ -446,10 +454,10 @@ def _candidates(
         sc = sig.get(c)
         if sc is None:
             continue
-        if x & sc == 0 and sc.bit_count() >= MIN_EVIDENCE:
+        if x & sc == 0:
             hits.append((c, 1))
         nsc = (~sc) & mask
-        if x & nsc == 0 and nsc.bit_count() >= MIN_EVIDENCE:
+        if x & nsc == 0:
             hits.append((c, 0))
     # Try the most-often-asserted control first: a real enable/hold control
     # is active on a large fraction of samples, a coincidental survivor

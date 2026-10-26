@@ -155,6 +155,11 @@ class Session:
     # `last_enable_hold_count` is then only a lower bound. Always written together with it.
     last_enable_hold_not_examined: int = 0
 
+    # `EnableHoldResult.forced_simulated_only` from the same check (batch 23b): flops that may
+    # have a hold but could not be formally settled, so `last_enable_hold_count` may undercount.
+    # Always written together with it.
+    last_enable_hold_simulated_only: int = 0
+
     # Running total of gates rewritten by a transform that is a deliberate
     # FUNCTIONAL change (not equivalence-preserving) -- currently only the
     # name-pattern BUF->AND rewrite family. Read by scripts/run_corpus.py to

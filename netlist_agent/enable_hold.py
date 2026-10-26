@@ -234,7 +234,9 @@ class EnableHoldResult:
     # satisfies this module's literal top-of-file definition. A flop whose ONLY working control is
     # its own Q lands here too, correctly, since this module never reports that as a control anyway.
     forced_no_candidate: int
-    forced_simulated_only: int  # candidate(s) survived Stage 1 but none could be settled within budget
+    # Candidate(s) survived Stage 1 but none could be settled within budget. "Survived" means only
+    # that no sample was a counterexample: since batch 23 that includes zero-evidence candidates.
+    forced_simulated_only: int
 
     # PURELY DIAGNOSTIC, not a verdict, not a partition of `total_flops`, and
     # sensitive to `NUM_SAMPLES` (measured: 2048 samples found 96 of these on

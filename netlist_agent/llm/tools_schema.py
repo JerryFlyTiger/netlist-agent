@@ -973,6 +973,7 @@ def get_last_operation_summary(session: Session) -> dict[str, Any]:
         "last_floating_count": session.last_floating_count,
         "last_enable_hold_count": session.last_enable_hold_count,
         "last_enable_hold_not_examined": session.last_enable_hold_not_examined,
+        "last_enable_hold_simulated_only": session.last_enable_hold_simulated_only,
         "functional_change_ops": session.functional_change_ops,
         _UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY: True,
     }
@@ -2019,7 +2020,10 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "rerunning anything. Use this to answer a follow-up like 'how many gates did that merge?' -- do "
         "NOT call the original do_*/check_* tool again just to recover a number it already returned, "
         "since calling it again repeats its effect (e.g. re-running a merge/dedup mutates the design "
-        "again and reports a different, wrong count for what 'just happened'). A null field means NO "
+        "again and reports a different, wrong count for what 'just happened'). The enable/hold count "
+        "is formally PROVEN flip-flops only; last_enable_hold_simulated_only is how many more could not "
+        "be settled (may also have one) and last_enable_hold_not_examined how many the time budget cut "
+        "off, so when either is above 0 the true number may be higher. A null field means NO "
         "such operation has run yet this session -- it does NOT mean the operation ran and found zero; "
         f"an operation that found zero reports 0. Do not quote a null as a count. {_UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY!r} "
         f"is always true: these counters describe the user's PREVIOUS request, and are deliberately not "

@@ -213,13 +213,10 @@ def load_design(session: Session, filename: str, directory: str) -> dict[str, An
     session.load_dir = directory
     session.load_filename = filename
     # Same reset as router._h_load, and for the same reason -- see its
-    # comment. Without this, a design loaded via this tool inherits
-    # whatever "last operation" counters (and, now, rerun-disclosure
-    # fields) the PREVIOUS design left behind.
-    session.last_op_count = None
-    session.last_op_kind = None
-    session.last_op_args = None
-    session.last_gate_delta = {}
+    # comment and `Session.reset_per_design_state`. Without this, a design
+    # loaded via this tool inherits the "last result" fields the PREVIOUS
+    # design left behind.
+    session.reset_per_design_state()
     return {"module_name": session.current_design.module_name, "path": path}
 
 
@@ -289,7 +286,7 @@ def write_design(session: Session, filename: str) -> dict[str, Any]:
 # specifically "adding a field changed nothing else", not "refusing worked".
 #
 # The key NAMES do the work, because a model reads keys. They are absent when
-# no count-tracked transform has run this session, so their presence is itself
+# no count-tracked transform has run since the current design was loaded, so their presence is itself
 # the signal that a "how many did it change" question has a recorded answer.
 _CURRENT_TOTALS_NOT_A_CHANGE_KEY = "these_are_current_totals_not_how_many_an_operation_changed"
 _RECORDED_CHANGE_KEY = "how_many_the_last_operation_changed"
@@ -1302,7 +1299,8 @@ def do_replace_buf_with_and(
     original input on I0 and gets `ctrl_net` wired to I1; the output net is
     left completely untouched. This is a deliberate FUNCTIONAL change, not
     an equivalence-preserving transform. If `gate_names` is omitted, targets
-    whatever the most recent find_gates_by_name call found.
+    the most recently recorded gate names (written by find_gates_by_name, or by a
+    rule-routed find / insert-AND-before-buffers request).
 
     Three different things can put a 0 in `replaced`, and the payload has to
     tell them apart -- an earlier version of this docstring claimed there
@@ -1326,7 +1324,7 @@ def do_replace_buf_with_and(
         scope = "explicit gate_names list"
     else:
         names = list(session.last_query_gate_names)
-        scope = "gate names from the most recent find_gates_by_name query"
+        scope = "most recently recorded gate names (from find_gates_by_name or a rule-routed find / insert-AND-before-buffers request)"
     by_name = {g.inst_name: g for g in design.gates}
     buf_candidates_in_scope = sum(
         1 for n in names if by_name.get(n) is not None and by_name[n].gate_type == GateType.BUF
@@ -2014,9 +2012,10 @@ TOOL_SCHEMA: list[ToolSpec] = [
     ),
     ToolSpec(
         "get_last_operation_summary",
-        "Read back the counts the MOST RECENT operations in this session already reported (gates added/"
+        "Read back the counts the MOST RECENT operations since the current design was loaded already reported (gates added/"
         "removed/merged/eliminated by the last transform, the last found-gates list, the last floating-"
-        "signal count, the last enable/hold count, and the running functional-change-op total) WITHOUT "
+        "signal count, and the last enable/hold count; plus, NOT reset when a new design is loaded, the "
+        "running functional-change-op total across every design loaded so far) WITHOUT "
         "rerunning anything. Use this to answer a follow-up like 'how many gates did that merge?' -- do "
         "NOT call the original do_*/check_* tool again just to recover a number it already returned, "
         "since calling it again repeats its effect (e.g. re-running a merge/dedup mutates the design "
@@ -2024,7 +2023,7 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "is formally PROVEN flip-flops only; last_enable_hold_simulated_only is how many more could not "
         "be settled (may also have one) and last_enable_hold_not_examined how many the time budget cut "
         "off, so when either is above 0 the true number may be higher. A null field means NO "
-        "such operation has run yet this session -- it does NOT mean the operation ran and found zero; "
+        "such operation has run yet since the current design was loaded -- it does NOT mean the operation ran and found zero; "
         f"an operation that found zero reports 0. Do not quote a null as a count. {_UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY!r} "
         f"is always true: these counters describe the user's PREVIOUS request, and are deliberately not "
         f"refreshed by any tool call made THIS turn (including a do_* tool this same turn already called) "
@@ -2087,8 +2086,8 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "do_replace_buf_with_and",
         "Rewrite BUF gates in place into 2-input AND gates: each keeps its original input on I0 and gets "
         "ctrl_net wired to I1; the output net is left untouched (a functional change, not an "
-        "equivalence-preserving transform). If gate_names is omitted, targets whatever the most recent "
-        "find_gates_by_name call found. Returns {'replaced', 'scope', 'names_in_scope', "
+        "equivalence-preserving transform). If gate_names is omitted, targets the most recently recorded "
+        "gate names (written by find_gates_by_name, or by a rule-routed find / insert-AND-before-buffers request). Returns {'replaced', 'scope', 'names_in_scope', "
         "'buf_candidates_in_scope', 'skipped_self_loop'}: 'buf_candidates_in_scope' is how many of the "
         "named gates actually resolved to a BUF BEFORE rewriting -- 'replaced: 0' paired with "
         "'buf_candidates_in_scope: 0' means the requested scope was understood and genuinely has no BUF "
@@ -2100,8 +2099,9 @@ TOOL_SCHEMA: list[ToolSpec] = [
             {
                 "ctrl_net": _s(_NET_DESC),
                 "gate_names": _sa(
-                    "Exact gate instance names to rewrite (optional; defaults to the most recent "
-                    "find_gates_by_name result)."
+                    "Exact gate instance names to rewrite (optional; defaults to the most recently "
+                    "recorded gate names, written by find_gates_by_name or by a rule-routed find / "
+                    "insert-AND-before-buffers request)."
                 ),
                 "force": _b(_FORCE_DESC),
             },

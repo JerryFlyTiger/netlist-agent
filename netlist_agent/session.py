@@ -101,7 +101,7 @@ class Session:
     # experiments/count_question_reruns_2026-08-29/REPORT.md, where a model
     # asked for a past merge count re-ran do_deduplicate_gates instead and
     # reported the rerun's (wrong) number. `None` alongside `last_op_count`
-    # also `None` means no count-tracked transform has run yet this session.
+    # also `None` means no count-tracked transform has run since the current design was loaded.
     last_op_kind: Optional[str] = None
 
     # Normalized form of the (non-`design`) positional arguments the
@@ -116,7 +116,7 @@ class Session:
     # coarse (comparing it in isolation flagged an unrelated first-time call
     # as a "rerun" of a scope it never touched). `None` alongside
     # `last_op_kind` also `None` means no count-tracked transform has run
-    # yet this session; `None` while `last_op_kind` is set is not otherwise
+    # since the current design was loaded; `None` while `last_op_kind` is set is not otherwise
     # produced by the write sites below (they always pass a real, if empty,
     # args tuple), but is handled the same as any other non-match rather
     # than assumed impossible.
@@ -127,7 +127,8 @@ class Session:
     # "replace the found buffers..." follow-up request. Stored as plain name
     # strings, not Gate object references: a transform run between the query
     # and the follow-up can invalidate previously-held Gate references, so
-    # names are re-looked-up fresh each time they're used.
+    # names are re-looked-up fresh each time they're used. Reset when a new
+    # design is loaded (batch 24; `reset_per_design_state`).
     last_query_gate_names: list[str] = field(default_factory=list)
 
     # Headline floating-input/unconnected-output-port count from the most
@@ -135,8 +136,18 @@ class Session:
     # consumed by the floating-signals count follow-up (`_h_floating_signals_count`)
     # without recomputing anything. `None` (as opposed to `last_op_count`'s
     # docstring-specified transform-count semantics -- deliberately NOT
-    # reused here) distinguishes "no such query has run yet this session"
+    # reused here) distinguishes "no such query has run since the design was loaded"
     # from "the last query found exactly zero".
+    #
+    # Reset when a new design is loaded (batch 24; `reset_per_design_state`).
+    # Deliberately NOT reset after a transform: this count answers a
+    # past-tense question ("how many were found?") about what the last check
+    # already reported to the user, and recomputing it after e.g. a dangling
+    # removal would contradict the number just reported. Past-tense wording is
+    # deliberate; present-tense wording ("floating inputs are there") shares
+    # this cache and returns the old number after a transform -- known
+    # limitation (batch 24 cold-read F3, see
+    # experiments/stale_session_state_2026-10-27/SPEC.md).
     last_floating_count: Optional[int] = None
 
     # Headline "flip-flops formally proven to have an enable/hold structure
@@ -147,8 +158,16 @@ class Session:
     # `last_op_count` for the same reason `last_floating_count` isn't
     # reused either (see its docstring just above): `last_op_count` is
     # transform-count semantics, and `None` here specifically distinguishes
-    # "no such query has run yet this session" from "the last query
+    # "no such query has run since the design was loaded" from "the last query
     # formally proved exactly zero".
+    #
+    # Reset when a new design is loaded (batch 24; `reset_per_design_state`).
+    # Deliberately NOT reset after a transform, for the same reason as
+    # `last_floating_count`: it answers with what the last check reported.
+    # Present-tense wording ("how many flip-flops have ...") shares this cache
+    # too and returns the old number after a transform -- known limitation
+    # (batch 24 cold-read F3, see
+    # experiments/stale_session_state_2026-10-27/SPEC.md).
     last_enable_hold_count: Optional[int] = None
 
     # `EnableHoldResult.not_examined` from the same check: flops its time budget cut off, so
@@ -202,6 +221,53 @@ class Session:
     # they can't today, but the counters' job is to reflect the session's
     # history, not "history since the summary was last printed".
     _write_failure_summary_warned: bool = False
+
+    def reset_per_design_state(self) -> None:
+        """Reset every per-design "last result" field to a brand-new
+        `Session()`'s default. Call this when a NEW design is loaded (both
+        `router._h_load` and the tool layer's `load_design` do), so nothing
+        measured or remembered on the previous design can be read against
+        the new one (batch 24).
+
+        Resets: the transform counters (`last_op_count`, `last_gate_delta`,
+        `last_op_kind`, `last_op_args`) and the query results
+        (`last_query_gate_names`, `last_floating_count`,
+        `last_enable_hold_count`, `last_enable_hold_not_examined`,
+        `last_enable_hold_simulated_only`).
+
+        Not reset (yet): `structural_constraints` -- UNDECIDED, currently kept.
+        Whether they should be cleared on loading another design is open: QA
+        A63 only says later requests on the SAME design must not break them,
+        it says nothing about loading a different one. Measured (batch 24
+        cold-read F2): a net-specific constraint ("net x ...") carried over to
+        a design where `x` no longer resolves makes every later reply carry an
+        "x no longer resolves" WARNING. See
+        experiments/stale_session_state_2026-10-27/SPEC.md (F2). Also not
+        reset: `functional_change_ops` (a
+        cross-design running total), and the testcase/log-level fields
+        (`case_name`, `log_*`, `pending_log`, `next_response_id`, write
+        failure counters). Also does not touch `current_design`,
+        `original_snapshot`, `load_dir`, `load_filename`; the load paths
+        assign those themselves.
+
+        A transform does NOT call this: the count queries answer about what
+        the last check already reported, so they stay put after a transform.
+        Past-tense phrasings ("how many were found?") returning the last
+        reported number is intentional. Present-tense phrasings ("what
+        floating inputs are there", "how many flip-flops have ...") go through
+        the same cache and return the stale number after a transform; that is
+        a known limitation (batch 24 cold-read F3, see
+        experiments/stale_session_state_2026-10-27/SPEC.md).
+        """
+        self.last_op_count = None
+        self.last_gate_delta = {}
+        self.last_op_kind = None
+        self.last_op_args = None
+        self.last_query_gate_names = []
+        self.last_floating_count = None
+        self.last_enable_hold_count = None
+        self.last_enable_hold_not_examined = 0
+        self.last_enable_hold_simulated_only = 0
 
     def mirror_rename(self, kind: str, old_name: str, new_name: str) -> None:
         """Mirror a successful rename in `current_design` onto

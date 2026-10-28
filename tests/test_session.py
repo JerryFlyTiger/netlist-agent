@@ -147,6 +147,128 @@ def test_last_op_bookkeeping_defaults(tmp_path, monkeypatch) -> None:
 
 
 # ----------------------------------------------------------------------
+# Batch 24: `reset_per_design_state` -- what a design load resets.
+# ----------------------------------------------------------------------
+
+_RESET_ON_LOAD = frozenset(
+    {
+        "last_op_count",
+        "last_gate_delta",
+        "last_op_kind",
+        "last_op_args",
+        "last_query_gate_names",
+        "last_floating_count",
+        "last_enable_hold_count",
+        "last_enable_hold_not_examined",
+        "last_enable_hold_simulated_only",
+    }
+)
+_KEPT_ON_LOAD = frozenset(
+    {
+        # assigned by the load paths themselves
+        "current_design",
+        "original_snapshot",
+        "load_dir",
+        "load_filename",
+        # `structural_constraints`: not yet decided, currently kept (SPEC F2)
+        "structural_constraints",
+        # deliberately kept (see `Session.reset_per_design_state`)
+        "functional_change_ops",
+        "case_name",
+        "log_path",
+        "log_file",
+        "pending_log",
+        "next_response_id",
+        "stdout_write_failures",
+        "log_write_failures",
+        "_write_failure_summary_warned",
+    }
+)
+
+
+def test_every_session_field_is_classified_for_design_load() -> None:
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(Session)}
+    assert not (_RESET_ON_LOAD & _KEPT_ON_LOAD), "a field is in both sets"
+    unclassified = names - _RESET_ON_LOAD - _KEPT_ON_LOAD
+    assert not unclassified, (
+        f"Session field(s) {sorted(unclassified)} are not classified: "
+        "請決定這個欄位換 design 時要不要重設，並加進 `reset_per_design_state` 或保留清單 "
+        "(Please decide whether this field must be reset when a new design is loaded, and add it "
+        "to `reset_per_design_state` or to the keep list)."
+    )
+    stale = (_RESET_ON_LOAD | _KEPT_ON_LOAD) - names
+    assert not stale, f"classification names fields that no longer exist: {sorted(stale)}"
+
+
+def test_reset_per_design_state_resets_every_reset_field() -> None:
+    # Every `_RESET_ON_LOAD` field gets its own sentinel, so a field the helper forgets shows up.
+    fresh = Session()
+    session = Session()
+    sentinels = {name: object() for name in _RESET_ON_LOAD}
+    for name, value in sentinels.items():
+        setattr(session, name, value)
+
+    session.reset_per_design_state()
+
+    for name in _RESET_ON_LOAD:
+        assert getattr(session, name) == getattr(fresh, name), name
+
+
+def test_reset_per_design_state_gives_each_session_its_own_containers() -> None:
+    s1, s2 = Session(), Session()
+    old = {}
+    for s in (s1, s2):
+        s.last_gate_delta = {GateType.AND: 1}
+        s.last_query_gate_names = ["u"]
+        old[id(s)] = (s.last_gate_delta, s.last_query_gate_names)
+        s.reset_per_design_state()
+    for s in (s1, s2):
+        assert s.last_gate_delta is not old[id(s)][0]
+        assert s.last_query_gate_names is not old[id(s)][1]
+    assert s1.last_gate_delta is not s2.last_gate_delta
+    assert s1.last_query_gate_names is not s2.last_query_gate_names
+
+
+def test_reset_per_design_state_keeps_every_kept_field() -> None:
+    from netlist_agent.constraints import StructuralConstraint
+
+    session = Session()
+    # Non-default value for each kept field; hard-to-build ones use a sentinel object.
+    constraint = StructuralConstraint(
+        kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1
+    )
+    session.structural_constraints.append(constraint)
+    values = {
+        "current_design": object(),
+        "original_snapshot": object(),
+        "load_dir": "dirX",
+        "load_filename": "fileX.v",
+        "functional_change_ops": 9,
+        "case_name": "testZ",
+        "log_path": "pathX",
+        "log_file": object(),
+        "pending_log": ["pending"],
+        "next_response_id": 42,
+        "stdout_write_failures": 3,
+        "log_write_failures": 4,
+        "_write_failure_summary_warned": True,
+    }
+    assert set(values) | {"structural_constraints"} == _KEPT_ON_LOAD
+    for name, value in values.items():
+        setattr(session, name, value)
+    constraints = session.structural_constraints
+
+    session.reset_per_design_state()
+
+    for name, value in values.items():
+        assert getattr(session, name) is value, name
+    assert session.structural_constraints is constraints
+    assert session.structural_constraints == [constraint]
+
+
+# ----------------------------------------------------------------------
 # Log-not-lost: responses emitted before the case name is recognized must
 # survive, however (or whether) the case name is eventually recognized.
 # ----------------------------------------------------------------------

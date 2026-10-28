@@ -2025,6 +2025,11 @@ def test_h_load_resets_last_operation_state(tmp_path) -> None:
     session.last_op_args = ()
     session.last_op_count = 7
     assert session.last_op_kind is not None
+    session.last_query_gate_names = ["u_old"]
+    session.last_floating_count = 5
+    session.last_enable_hold_count = 6
+    session.last_enable_hold_not_examined = 2
+    session.last_enable_hold_simulated_only = 3
 
     path2 = str(tmp_path / "second.v")
     write_verilog(_dup_gate_design(), path2)
@@ -2035,11 +2040,95 @@ def test_h_load_resets_last_operation_state(tmp_path) -> None:
     assert session.last_op_args is None
     assert session.last_op_count is None
     assert session.last_gate_delta == {}
+    assert session.last_query_gate_names == []
+    assert session.last_floating_count is None
+    assert session.last_enable_hold_count is None
+    assert session.last_enable_hold_not_examined == 0
+    assert session.last_enable_hold_simulated_only == 0
 
     # And the design's genuinely first dedup pass must not be flagged either.
     result2 = TOOL_REGISTRY["do_deduplicate_gates"](session)
     assert result2["merged"] == 1  # the one duplicate pair in _dup_gate_design
     assert _RERUN_OF_PRIOR_OPERATION_KEY not in result2, result2
+
+
+@pytest.mark.skipif(not _HAS_REAL_ROUTER, reason="requires the private rule-based router (not present in this public export)")
+def test_h_load_failure_keeps_last_operation_state(tmp_path) -> None:
+    # Cold-read S6: a load that fails (missing file) must leave the old design's state alone.
+    from netlist_agent.router import handle_request as _handle_request
+
+    session = _new_session(tmp_path)
+
+    def _no_fallback(s: Session, t: str) -> str:
+        raise AssertionError("fallback must not run: this request is rule-routed")
+
+    delta = {GateType.AND: -1}
+    names = ["u_old"]
+    session.last_op_kind = "deduplicate_gates"
+    session.last_op_args = ()
+    session.last_op_count = 7
+    session.last_gate_delta = delta
+    session.last_query_gate_names = names
+    session.last_floating_count = 5
+    session.last_enable_hold_count = 6
+    session.last_enable_hold_not_examined = 2
+    session.last_enable_hold_simulated_only = 3
+    design = session.current_design
+
+    reply = _handle_request(session, f"Please load the design from {tmp_path / 'nope.v'}.", _no_fallback)
+    assert reply.startswith("Could not read the netlist file"), reply
+
+    assert session.current_design is design
+    assert session.last_op_kind == "deduplicate_gates"
+    assert session.last_op_args == ()
+    assert session.last_op_count == 7
+    assert session.last_gate_delta is delta
+    assert session.last_query_gate_names is names
+    assert session.last_floating_count == 5
+    assert session.last_enable_hold_count == 6
+    assert session.last_enable_hold_not_examined == 2
+    assert session.last_enable_hold_simulated_only == 3
+
+
+def test_tool_layer_load_design_failure_keeps_last_operation_state(tmp_path) -> None:
+    # Cold-read R2-2: tool-path twin of the router S6 test -- a failed load must leave the old state alone.
+    from netlist_agent.llm.tools_schema import load_design
+
+    session = _new_session(tmp_path)
+    delta = {GateType.AND: -1}
+    names = ["u_old"]
+    session.last_op_kind = "deduplicate_gates"
+    session.last_op_args = ()
+    session.last_op_count = 7
+    session.last_gate_delta = delta
+    session.last_query_gate_names = names
+    session.last_floating_count = 5
+    session.last_enable_hold_count = 6
+    session.last_enable_hold_not_examined = 2
+    session.last_enable_hold_simulated_only = 3
+    design = session.current_design
+    snapshot = session.original_snapshot
+    filename = session.load_filename
+    load_dir = session.load_dir
+
+    with pytest.raises(FileNotFoundError):
+        load_design(session, "nope.v", str(tmp_path / "missing_dir"))
+
+    assert session.load_dir == load_dir
+
+    assert session.current_design is design
+    assert session.original_snapshot is snapshot
+    assert session.load_filename == filename
+    assert session.load_filename != "nope.v"
+    assert session.last_op_kind == "deduplicate_gates"
+    assert session.last_op_args == ()
+    assert session.last_op_count == 7
+    assert session.last_gate_delta is delta
+    assert session.last_query_gate_names is names
+    assert session.last_floating_count == 5
+    assert session.last_enable_hold_count == 6
+    assert session.last_enable_hold_not_examined == 2
+    assert session.last_enable_hold_simulated_only == 3
 
 
 def test_tool_layer_load_design_resets_last_operation_state(tmp_path) -> None:
@@ -2050,6 +2139,11 @@ def test_tool_layer_load_design_resets_last_operation_state(tmp_path) -> None:
     session.last_op_args = ()
     session.last_op_count = 7
     session.last_gate_delta = {GateType.AND: -1}
+    session.last_query_gate_names = ["u_old"]
+    session.last_floating_count = 5
+    session.last_enable_hold_count = 6
+    session.last_enable_hold_not_examined = 2
+    session.last_enable_hold_simulated_only = 3
 
     path2 = str(tmp_path / "second.v")
     write_verilog(_dup_gate_design(), path2)
@@ -2059,6 +2153,11 @@ def test_tool_layer_load_design_resets_last_operation_state(tmp_path) -> None:
     assert session.last_op_args is None
     assert session.last_op_count is None
     assert session.last_gate_delta == {}
+    assert session.last_query_gate_names == []
+    assert session.last_floating_count is None
+    assert session.last_enable_hold_count is None
+    assert session.last_enable_hold_not_examined == 0
+    assert session.last_enable_hold_simulated_only == 0
 
     result = TOOL_REGISTRY["do_deduplicate_gates"](session)
     assert result["merged"] == 1

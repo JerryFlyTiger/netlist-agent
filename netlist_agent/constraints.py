@@ -1,5 +1,6 @@
 """Structural hard constraints that must keep holding across every
-subsequent request in a testcase. Per QA A63, a numeric bound established by
+subsequent request on the same design (loading another file drops them,
+reloading the same file keeps them; see `Session.reset_per_design_state`). Per QA A63, a numeric bound established by
 an earlier request (e.g. max fanout 4) is not scoped to that one request --
 it survives later requests that remap or rewrite the design, and the final
 design has to keep satisfying it. The problem specification, section 5,
@@ -9,7 +10,7 @@ point costs the testcase its credit, not just the request that broke it.
 A `StructuralConstraint` is recorded once, at the request that establishes a
 numeric bound (see router.py's `handle_request` docstring for the single
 enforcement point), and is re-checked -- and, where possible, re-enforced --
-after every later request for the rest of the testcase.
+after every later request on that design.
 """
 
 from __future__ import annotations

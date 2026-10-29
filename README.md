@@ -81,7 +81,7 @@ and optimize for depth or for gate count under a depth bound — the last two
 backed by ABC, with every result equivalence-checked before it is accepted.
 
 A structural bound stated by one request keeps being enforced against every later
-one, so "cap fanout at 4" is not undone by a remap three requests later. Six of
+request on the same design (loading a different file clears it), so "cap fanout at 4" is not undone by a remap three requests later. Six of
 eight transforms break such a bound if nothing re-enforces it.
 
 ## Results
@@ -194,7 +194,7 @@ artifact, and git history is forever. Instead:
 
 [![CI](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryFlyTiger/netlist-agent/actions/workflows/ci.yml)
 
-`pytest` — **1163 passing, 79 skipped** on a clean checkout with no testcases
+`pytest` — **1175 passing, 79 skipped** on a clean checkout with no testcases
 present. The skips are not hidden: `addopts = ["-rs"]` makes pytest print the
 reason for every one, and every reason names what is missing: an
 "Alpha_Testcase corpus not present" or "Beta_Testcase corpus not present" for
@@ -202,7 +202,7 @@ the two benchmark releases, and "requires the private rule-based router" for
 the part that stays private. Nothing fails, and nothing silently vanishes.
 
 Drop both releases in and the corpus-backed tests activate, taking the suite to
-**1616 passing, 16 skipped** — measured, not estimated.
+**1628 passing, 16 skipped** — measured, not estimated.
 
 CI builds ABC from scratch at the pinned commit on a clean Ubuntu runner and
 runs the suite there — the actual proof that the dependency is reproducible on a

@@ -2164,6 +2164,94 @@ def test_tool_layer_load_design_resets_last_operation_state(tmp_path) -> None:
     assert _RERUN_OF_PRIOR_OPERATION_KEY not in result, result
 
 
+def test_tool_layer_load_design_drops_structural_constraints_and_says_so(tmp_path) -> None:
+    # Batch 25: tool-path twin of the router test -- the constraint belongs to the replaced design.
+    from netlist_agent.constraints import StructuralConstraint
+    from netlist_agent.llm.tools_schema import load_design
+
+    session = _new_session(tmp_path)
+    constraint = StructuralConstraint(kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1)
+    session.structural_constraints.append(constraint)
+
+    result = load_design(session, "fixture.v", str(tmp_path))
+
+    assert result["dropped_structural_constraints"] == [constraint.describe()]
+    assert session.structural_constraints == []
+
+
+def test_tool_layer_load_design_without_constraints_returns_only_the_two_keys(tmp_path) -> None:
+    from netlist_agent.llm.tools_schema import load_design
+
+    session = _new_session(tmp_path)
+    result = load_design(session, "fixture.v", str(tmp_path))
+    assert set(result) == {"module_name", "path"}
+
+
+def test_tool_layer_load_design_same_file_reload_keeps_constraints(tmp_path) -> None:
+    from netlist_agent.constraints import StructuralConstraint
+    from netlist_agent.llm.tools_schema import load_design
+
+    session = _new_session(tmp_path)
+    load_design(session, "fixture.v", str(tmp_path))
+    constraint = StructuralConstraint(kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1)
+    session.structural_constraints.append(constraint)
+    session.last_op_count = 7
+    session.last_query_gate_names = ["x"]
+    old_snapshot = session.original_snapshot
+
+    result = load_design(session, "fixture.v", str(tmp_path) + "/.")
+
+    assert set(result) == {"module_name", "path"}
+    assert session.structural_constraints == [constraint]
+    assert session.last_op_count is None
+    assert session.last_query_gate_names == []
+    assert session.original_snapshot is not old_snapshot
+    assert session.original_snapshot is not session.current_design  # its own parse, not an alias
+
+
+def test_tool_layer_load_design_missing_file_keeps_constraints(tmp_path) -> None:
+    from netlist_agent.constraints import StructuralConstraint
+    from netlist_agent.llm.tools_schema import load_design
+
+    session = _new_session(tmp_path)
+    constraint = StructuralConstraint(kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1)
+    session.structural_constraints.append(constraint)
+    design = session.current_design
+
+    with pytest.raises(OSError):
+        load_design(session, "missing.v", str(tmp_path))
+
+    assert session.current_design is design
+    assert session.structural_constraints == [constraint]
+
+
+def test_tool_layer_load_design_second_parse_failure_changes_nothing(tmp_path, monkeypatch) -> None:
+    import netlist_agent.llm.tools_schema as tools_schema
+    from netlist_agent.constraints import StructuralConstraint
+
+    session = _new_session(tmp_path)
+    constraint = StructuralConstraint(kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1)
+    session.structural_constraints.append(constraint)
+    design, snapshot = session.current_design, session.original_snapshot
+    real_parse = tools_schema.parse_verilog
+    calls = {"n": 0}
+
+    def flaky(path):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("boom")
+        return real_parse(path)
+
+    monkeypatch.setattr(tools_schema, "parse_verilog", flaky)
+
+    with pytest.raises(OSError):
+        tools_schema.load_design(session, "fixture.v", str(tmp_path))
+
+    assert session.current_design is design
+    assert session.original_snapshot is snapshot
+    assert session.structural_constraints == [constraint]
+
+
 # ----------------------------------------------------------------------
 # End-to-end (rule-routed, then a do_* tool rerun) coverage for the two
 # `session.last_op_args` write sites nothing else here reaches:

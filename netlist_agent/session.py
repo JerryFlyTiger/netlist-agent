@@ -188,14 +188,16 @@ class Session:
     functional_change_ops: int = 0
 
     # Hard structural bounds ("max fanout <= 4", "max depth <= 5") established
-    # by earlier requests in THIS testcase -- per QA A63, these must keep
-    # holding across every later request, even one ("remap the entire
+    # by earlier requests on THIS design -- per QA A63, these must keep
+    # holding across every later request on it, even one ("remap the entire
     # design") that has nothing to do with fanout/depth itself, since
     # `Problem_Description/A_20260212.pdf` sec 5 gives the testcase NO credit
     # at all if any hard requirement is ultimately violated. Only requests
     # that recorded an explicit numeric bound append here (see router.py's
     # handlers and its `handle_request` docstring for the single point that
-    # re-checks/re-enforces every entry after every request).
+    # re-checks/re-enforces every entry after every request). Loading a
+    # DIFFERENT file clears them (`reset_per_design_state`, batch 25);
+    # reloading the same file keeps them.
     structural_constraints: list[StructuralConstraint] = field(default_factory=list)
 
     # How many times `io_protocol.emit_response()` has failed to write a
@@ -222,8 +224,20 @@ class Session:
     # history, not "history since the summary was last printed".
     _write_failure_summary_warned: bool = False
 
-    def reset_per_design_state(self) -> None:
-        """Reset every per-design "last result" field to a brand-new
+    def is_reload_of(self, directory: str, filename: str) -> bool:
+        """True when (`directory`, `filename`) is the file this session last
+        loaded successfully, compared by `os.path.realpath` (so `./a.v` and
+        an absolute path are the same file). False before any load. Call it
+        BEFORE overwriting `load_dir`/`load_filename`. Batch 25 R1-1."""
+        if self.load_dir is None or self.load_filename is None:
+            return False
+        return os.path.realpath(os.path.join(self.load_dir, self.load_filename)) == os.path.realpath(
+            os.path.join(directory, filename)
+        )
+
+    def reset_per_design_state(self, *, keep_structural_constraints: bool = False) -> None:
+        """Reset every per-design "last result" field (and the structural
+        constraints, unless `keep_structural_constraints`) to a brand-new
         `Session()`'s default. Call this when a NEW design is loaded (both
         `router._h_load` and the tool layer's `load_design` do), so nothing
         measured or remembered on the previous design can be read against
@@ -235,15 +249,24 @@ class Session:
         `last_enable_hold_count`, `last_enable_hold_not_examined`,
         `last_enable_hold_simulated_only`).
 
-        Not reset (yet): `structural_constraints` -- UNDECIDED, currently kept.
-        Whether they should be cleared on loading another design is open: QA
-        A63 only says later requests on the SAME design must not break them,
-        it says nothing about loading a different one. Measured (batch 24
-        cold-read F2): a net-specific constraint ("net x ...") carried over to
-        a design where `x` no longer resolves makes every later reply carry an
-        "x no longer resolves" WARNING. See
-        experiments/stale_session_state_2026-10-27/SPEC.md (F2). Also not
-        reset: `functional_change_ops` (a
+        Also resets `structural_constraints` (batch 25): a bound established
+        on design A is a requirement on A, not on whatever is loaded next.
+        Carrying it over silently rewrote the new design (measured, batch 24
+        cold-read F2: "max fanout <= 2" from A re-enforced on B by inserting
+        buffers; a net-specific constraint made every later reply carry a
+        "x no longer resolves" WARNING). QA A63 only says later requests on
+        the SAME design must not break a constraint; it says nothing about
+        loading a different one. Assigns a NEW list (not `.clear()`) because
+        callers read the old one for their reply before calling this. The
+        load paths say so when something was dropped.
+
+        `keep_structural_constraints=True` leaves them alone. The load paths
+        pass `is_reload_of(...)`: reloading the SAME file (same realpath) is
+        still the same design, so A63 still applies and the bounds are kept
+        and re-enforced as before. A different path with identical content
+        counts as a different design.
+
+        Not reset: `functional_change_ops` (a
         cross-design running total), and the testcase/log-level fields
         (`case_name`, `log_*`, `pending_log`, `next_response_id`, write
         failure counters). Also does not touch `current_design`,
@@ -268,6 +291,8 @@ class Session:
         self.last_enable_hold_count = None
         self.last_enable_hold_not_examined = 0
         self.last_enable_hold_simulated_only = 0
+        if not keep_structural_constraints:
+            self.structural_constraints = []
 
     def mirror_rename(self, kind: str, old_name: str, new_name: str) -> None:
         """Mirror a successful rename in `current_design` onto

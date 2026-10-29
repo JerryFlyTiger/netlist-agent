@@ -208,16 +208,24 @@ def _depth_opt_basis(token: Optional[str]) -> Optional[str]:
 
 def load_design(session: Session, filename: str, directory: str) -> dict[str, Any]:
     path = os.path.join(directory, filename)
-    session.current_design = parse_verilog(path)
-    session.original_snapshot = parse_verilog(path)
+    design = parse_verilog(path)
+    snapshot = parse_verilog(path)
+    # Read BEFORE the reset below, which replaces the list (batch 25).
+    same_file = session.is_reload_of(directory, filename)  # before load_dir/load_filename change
+    dropped = [] if same_file else list(session.structural_constraints)
+    session.current_design = design
+    session.original_snapshot = snapshot
     session.load_dir = directory
     session.load_filename = filename
     # Same reset as router._h_load, and for the same reason -- see its
     # comment and `Session.reset_per_design_state`. Without this, a design
     # loaded via this tool inherits the "last result" fields the PREVIOUS
     # design left behind.
-    session.reset_per_design_state()
-    return {"module_name": session.current_design.module_name, "path": path}
+    session.reset_per_design_state(keep_structural_constraints=same_file)
+    result: dict[str, Any] = {"module_name": session.current_design.module_name, "path": path}
+    if dropped:
+        result["dropped_structural_constraints"] = [c.describe() for c in dropped]
+    return result
 
 
 def set_testcase(session: Session, case_name: str, log_filename: Optional[str] = None) -> dict[str, Any]:

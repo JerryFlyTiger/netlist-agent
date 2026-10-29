@@ -161,6 +161,7 @@ _RESET_ON_LOAD = frozenset(
         "last_enable_hold_count",
         "last_enable_hold_not_examined",
         "last_enable_hold_simulated_only",
+        "structural_constraints",  # batch 25: a bound on design A is not a requirement on design B
     }
 )
 _KEPT_ON_LOAD = frozenset(
@@ -170,8 +171,6 @@ _KEPT_ON_LOAD = frozenset(
         "original_snapshot",
         "load_dir",
         "load_filename",
-        # `structural_constraints`: not yet decided, currently kept (SPEC F2)
-        "structural_constraints",
         # deliberately kept (see `Session.reset_per_design_state`)
         "functional_change_ops",
         "case_name",
@@ -231,15 +230,60 @@ def test_reset_per_design_state_gives_each_session_its_own_containers() -> None:
     assert s1.last_query_gate_names is not s2.last_query_gate_names
 
 
-def test_reset_per_design_state_keeps_every_kept_field() -> None:
+def test_reset_per_design_state_clears_structural_constraints_into_a_new_list() -> None:
     from netlist_agent.constraints import StructuralConstraint
 
     session = Session()
-    # Non-default value for each kept field; hard-to-build ones use a sentinel object.
-    constraint = StructuralConstraint(
-        kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1
+    session.structural_constraints.append(
+        StructuralConstraint(kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1)
     )
-    session.structural_constraints.append(constraint)
+    old = session.structural_constraints
+
+    session.reset_per_design_state()
+
+    assert session.structural_constraints == []
+    assert session.structural_constraints is not old
+    assert len(old) == 1  # callers read the old list for their reply; it must not be emptied in place
+    other = Session()
+    other.reset_per_design_state()
+    assert other.structural_constraints is not session.structural_constraints
+
+
+def test_reset_per_design_state_can_keep_structural_constraints() -> None:
+    from netlist_agent.constraints import StructuralConstraint
+
+    session = Session()
+    session.structural_constraints.append(
+        StructuralConstraint(kind="max_fanout", bound=2, scope_token=None, cone_of=None, request_id=1)
+    )
+    kept = session.structural_constraints
+    fresh = Session()
+    others = _RESET_ON_LOAD - {"structural_constraints"}
+    for name in others:
+        setattr(session, name, object())
+
+    session.reset_per_design_state(keep_structural_constraints=True)
+
+    assert session.structural_constraints is kept
+    assert len(kept) == 1
+    for name in others:  # everything else is still reset
+        assert getattr(session, name) == getattr(fresh, name), name
+
+
+def test_is_reload_of_compares_realpaths_and_is_false_before_any_load(tmp_path) -> None:
+    (tmp_path / "a.v").write_text("")
+    session = Session()
+    assert session.is_reload_of(str(tmp_path), "a.v") is False
+    session.load_dir = str(tmp_path)
+    session.load_filename = "a.v"
+    assert session.is_reload_of(str(tmp_path), "a.v") is True
+    assert session.is_reload_of(str(tmp_path) + "/.", "a.v") is True
+    assert session.is_reload_of(str(tmp_path), "b.v") is False
+
+
+def test_reset_per_design_state_keeps_every_kept_field() -> None:
+    session = Session()
+    # Non-default value for each kept field; hard-to-build ones use a sentinel object.
     values = {
         "current_design": object(),
         "original_snapshot": object(),
@@ -255,17 +299,14 @@ def test_reset_per_design_state_keeps_every_kept_field() -> None:
         "log_write_failures": 4,
         "_write_failure_summary_warned": True,
     }
-    assert set(values) | {"structural_constraints"} == _KEPT_ON_LOAD
+    assert set(values) == _KEPT_ON_LOAD
     for name, value in values.items():
         setattr(session, name, value)
-    constraints = session.structural_constraints
 
     session.reset_per_design_state()
 
     for name, value in values.items():
         assert getattr(session, name) is value, name
-    assert session.structural_constraints is constraints
-    assert session.structural_constraints == [constraint]
 
 
 # ----------------------------------------------------------------------
@@ -918,3 +959,43 @@ def test_start_stays_retryable_when_flushing_buffered_responses_fails(tmp_path, 
         content = f.read()
     assert content.count("emitted before the case name was known") == 1
     assert content.count("second buffered response") == 1
+
+
+def _write_net(directory, name="a.v") -> str:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("module m(I, O);\n  input I;\n  output O;\n  buf g1(O, I);\nendmodule\n")
+    return str(path)
+
+
+def test_is_reload_of_symlink_to_same_file_is_true(tmp_path) -> None:
+    real = _write_net(tmp_path)
+    link = str(tmp_path / "link.v")
+    os.symlink(real, link)
+    session = Session()
+    session.load_dir, session.load_filename = str(tmp_path), "a.v"
+    assert session.is_reload_of(str(tmp_path), "link.v")
+
+
+def test_is_reload_of_same_name_in_two_directories_is_false(tmp_path) -> None:
+    _write_net(tmp_path / "d1")
+    _write_net(tmp_path / "d2")
+    session = Session()
+    session.load_dir, session.load_filename = str(tmp_path / "d1"), "a.v"
+    assert not session.is_reload_of(str(tmp_path / "d2"), "a.v")
+
+
+def test_is_reload_of_alias_first_canonical_second_is_true(tmp_path) -> None:
+    _write_net(tmp_path)
+    (tmp_path / "sub").mkdir()
+    session = Session()
+    session.load_dir, session.load_filename = str(tmp_path / "sub" / ".."), "a.v"
+    assert session.is_reload_of(str(tmp_path), "a.v")
+
+
+def test_is_reload_of_relative_path_against_absolute_is_true(tmp_path, monkeypatch) -> None:
+    _write_net(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    session = Session()
+    session.load_dir, session.load_filename = ".", "a.v"
+    assert session.is_reload_of(str(tmp_path), "a.v")

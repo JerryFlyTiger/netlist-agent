@@ -161,6 +161,11 @@ _RESET_ON_LOAD = frozenset(
         "last_enable_hold_count",
         "last_enable_hold_not_examined",
         "last_enable_hold_simulated_only",
+        "last_enable_hold_fingerprint",
+        "prev_floating_count",  # batch 26: P cells
+        "prev_enable_hold_count",
+        "prev_enable_hold_not_examined",
+        "prev_enable_hold_simulated_only",
         "structural_constraints",  # batch 25: a bound on design A is not a requirement on design B
     }
 )

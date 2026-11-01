@@ -144,10 +144,11 @@ class Session:
     # past-tense question ("how many were found?") about what the last check
     # already reported to the user, and recomputing it after e.g. a dangling
     # removal would contradict the number just reported. Past-tense wording is
-    # deliberate; present-tense wording ("floating inputs are there") shares
-    # this cache and returns the old number after a transform -- known
-    # limitation (batch 24 cold-read F3, see
-    # experiments/stale_session_state_2026-10-27/SPEC.md).
+    # deliberate. Present-tense wording ("floating inputs are there") always
+    # recomputes and writes the result back here (batch 26), so a later
+    # past-tense question echoes the newest reported number. A sentence whose tense
+    # cannot be told apart ("other" form) recomputes the same way; when
+    # `prev_floating_count` holds a value it answers with both numbers.
     last_floating_count: Optional[int] = None
 
     # Headline "flip-flops formally proven to have an enable/hold structure
@@ -164,10 +165,11 @@ class Session:
     # Reset when a new design is loaded (batch 24; `reset_per_design_state`).
     # Deliberately NOT reset after a transform, for the same reason as
     # `last_floating_count`: it answers with what the last check reported.
-    # Present-tense wording ("how many flip-flops have ...") shares this cache
-    # too and returns the old number after a transform -- known limitation
-    # (batch 24 cold-read F3, see
-    # experiments/stale_session_state_2026-10-27/SPEC.md).
+    # Present-tense wording ("how many flip-flops have ...") reuses it only
+    # while `last_enable_hold_fingerprint` still matches the design (batch 26),
+    # otherwise it recomputes and writes all three counts back. The "other" form
+    # (tense cannot be told apart) behaves like the present form here, and answers
+    # with two numbers when `prev_enable_hold_count` holds a value.
     last_enable_hold_count: Optional[int] = None
 
     # `EnableHoldResult.not_examined` from the same check: flops its time budget cut off, so
@@ -178,6 +180,31 @@ class Session:
     # have a hold but could not be formally settled, so `last_enable_hold_count` may undercount.
     # Always written together with it.
     last_enable_hold_simulated_only: int = 0
+
+    # `ir.design_fingerprint` of `current_design` right after the enable/hold check that wrote the
+    # three counts above (batch 26). Always written together with them. A present-tense (or tense-neutral "other") count
+    # question compares it with the current fingerprint: same => the cached numbers still describe
+    # this design; different or None => recompute (detection costs 20-45 s, so no blind rerun).
+    last_enable_hold_fingerprint: Optional[str] = None
+
+    # Batch 26 (round-7 redesign): "previous number", the P cell next to the latest-reported L cell.
+    # P is the number reported on a DIFFERENT design just before L, so a question whose tense cannot
+    # be told apart (anything outside the closed bare-sentence templates, `router._count_form`) can
+    # answer with both: "current: L; before the design was changed: P". P is written only when the
+    # design really changed AND the number differs (floating: the number differs; enable/hold:
+    # fingerprint differs and (count, not_examined, simulated_only) differs), so the "before the
+    # design was changed" label is always true. Only the most recent such report is kept. Reset when
+    # a new design is loaded (`reset_per_design_state`).
+    prev_floating_count: Optional[int] = None
+
+    # P for `last_enable_hold_count`; `None` = no earlier report on a different design.
+    prev_enable_hold_count: Optional[int] = None
+
+    # P for `last_enable_hold_not_examined`. Written together with `prev_enable_hold_count`.
+    prev_enable_hold_not_examined: int = 0
+
+    # P for `last_enable_hold_simulated_only`. Written together with `prev_enable_hold_count`.
+    prev_enable_hold_simulated_only: int = 0
 
     # Running total of gates rewritten by a transform that is a deliberate
     # FUNCTIONAL change (not equivalence-preserving) -- currently only the
@@ -247,7 +274,9 @@ class Session:
         `last_op_kind`, `last_op_args`) and the query results
         (`last_query_gate_names`, `last_floating_count`,
         `last_enable_hold_count`, `last_enable_hold_not_examined`,
-        `last_enable_hold_simulated_only`).
+        `last_enable_hold_simulated_only`, `last_enable_hold_fingerprint`) and their "previous number"
+        cells (`prev_floating_count`, `prev_enable_hold_count`, `prev_enable_hold_not_examined`,
+        `prev_enable_hold_simulated_only`; batch 26).
 
         Also resets `structural_constraints` (batch 25): a bound established
         on design A is a requirement on A, not on whatever is loaded next.
@@ -276,11 +305,11 @@ class Session:
         A transform does NOT call this: the count queries answer about what
         the last check already reported, so they stay put after a transform.
         Past-tense phrasings ("how many were found?") returning the last
-        reported number is intentional. Present-tense phrasings ("what
-        floating inputs are there", "how many flip-flops have ...") go through
-        the same cache and return the stale number after a transform; that is
-        a known limitation (batch 24 cold-read F3, see
-        experiments/stale_session_state_2026-10-27/SPEC.md).
+        reported number is intentional. Present-tense phrasings ("how many
+        floating inputs are there", "how many flip-flops have ...") recompute
+        when the design may have changed and write the result back (batch 26);
+        so does a question outside the bare templates, which then answers with
+        both the new number and the previous one.
         """
         self.last_op_count = None
         self.last_gate_delta = {}
@@ -291,6 +320,11 @@ class Session:
         self.last_enable_hold_count = None
         self.last_enable_hold_not_examined = 0
         self.last_enable_hold_simulated_only = 0
+        self.last_enable_hold_fingerprint = None
+        self.prev_floating_count = None
+        self.prev_enable_hold_count = None
+        self.prev_enable_hold_not_examined = 0
+        self.prev_enable_hold_simulated_only = 0
         if not keep_structural_constraints:
             self.structural_constraints = []
 

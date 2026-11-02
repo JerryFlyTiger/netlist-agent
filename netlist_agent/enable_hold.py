@@ -73,7 +73,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Union, cast
+from typing import Optional, Sequence, Union, cast
 
 from netlist_agent.abc_bridge import ABCBridgeError, are_equivalent
 from netlist_agent.ir import (
@@ -361,15 +361,39 @@ def _simulate(
     q_bits: list[NetBit],
     mask: int,
     seed: int,
+    undriven_bits: Sequence[NetBit] = (),
 ) -> dict[NetBit, int]:
     """One `NUM_SAMPLES`-wide bit-parallel simulation: every PI bit and
     every flop's Q gets an independent random pattern (Q is a free variable
-    -- see module docstring), propagated through one topological pass."""
+    -- see module docstring), propagated through one topological pass.
+
+    `undriven_bits` are nets that some gate reads but that are neither a PI,
+    a flop Q, nor a gate output. They are FREE VARIABLES here too: each gets
+    an independent random pattern, drawn AFTER the PI and Q patterns (so a
+    design with no such nets draws exactly the same sequence as before), in
+    the given order. This matches the proof stages (`_constprop`,
+    `_support`, `_truth_table_proof`, and `_build_forced_cone_design` for a
+    scalar net) and keeps the `_candidates` soundness argument valid: each
+    simulated pattern is a point of the proof's input space. It deliberately
+    differs from `abc_bridge`, which ties undriven nets to 0 for equivalence
+    checking; enable/hold asks "what if this net were forced", which does
+    not depend on the net's usual value. Known exception to the two
+    statements above: on the ABC route (`_build_forced_cone_design`), a bus
+    name becomes INTERNAL in the sub-design as a whole when one of its bits
+    is the forced bit or the output bit of any cone gate (including the
+    gate that drives the flop's D). The other bits of that same name that
+    are only read as leaves (a PI bit, an undriven net, or any flop's Q,
+    including this flop's own) are
+    then not declared INPUT, and `write_blif` ties them to 0 instead of
+    leaving them free (see batch 28 / F1 in
+    experiments/undriven_wire_2026-11-02/SPEC.md)."""
     rng = random.Random(seed)
     sig: dict[NetBit, int] = {}
     for nb in pi_bits:
         sig[nb] = rng.getrandbits(NUM_SAMPLES)
     for nb in q_bits:
+        sig[nb] = rng.getrandbits(NUM_SAMPLES)
+    for nb in undriven_bits:
         sig[nb] = rng.getrandbits(NUM_SAMPLES)
 
     def resolve(p: Pin) -> int:
@@ -414,6 +438,8 @@ def _candidates(
     so the real control was dropped, `_candidates` came back empty, and the
     flop was counted as formally proven to have no hold (repro:
     experiments/degenerate_prefix_2026-10-24/min_evidence_false_proof.py).
+    The same holds for a cone net missing from `sig` altogether (D3): no
+    value to test, so both (c, 1) and (c, 0) are kept, with ranking key 0.
     Zero-evidence candidates sort LAST (their ranking key is 0), so they never
     use up Stage 3's small per-flop budget ahead of a candidate with evidence.
     What that fix removes is the flop being treated as PROVEN to have no
@@ -455,6 +481,11 @@ def _candidates(
             continue
         sc = sig.get(c)
         if sc is None:
+            # No simulation value (cannot happen once `_simulate` gives
+            # undriven nets a pattern): no evidence either way, so keep both
+            # values rather than drop a possible control; ranked last.
+            hits.append((c, 1))
+            hits.append((c, 0))
             continue
         if x & sc == 0:
             hits.append((c, 1))
@@ -471,7 +502,13 @@ def _candidates(
     # own order -- which is only deterministic because `cone` is walked in
     # `netbit_sort_key` order above, NOT because of anything in this sort
     # call itself.
-    hits.sort(key=lambda cv: -((sig[cv[0]] if cv[1] else (~sig[cv[0]]) & mask).bit_count()))
+    hits.sort(
+        key=lambda cv: (
+            0
+            if cv[0] not in sig
+            else -((sig[cv[0]] if cv[1] else (~sig[cv[0]]) & mask).bit_count())
+        )
+    )
     return hits
 
 
@@ -719,6 +756,34 @@ def _truth_table_proof(
     return sig.get(d, 0) == sig.get(q, 0)
 
 
+def _cone_bit_extents(
+    cone_gates: list[Gate], comb_ins: dict[str, list[Pin]], out_of: dict[str, Pin]
+) -> dict[str, tuple[int, int]]:
+    """One pass over the cone: for every net name used with a bit-select on
+    some gate output or input pin, `name -> (max bit, min bit)`. Names used
+    only as scalars are absent."""
+    ext: dict[str, tuple[int, int]] = {}
+    for g in cone_gates:
+        for p in [out_of[g.inst_name], *comb_ins[g.inst_name]]:
+            if isinstance(p, NetBit) and p.bit is not None:
+                hi, lo = ext.get(p.name, (p.bit, p.bit))
+                ext[p.name] = (max(hi, p.bit), min(lo, p.bit))
+    return ext
+
+
+def _net_extent(
+    design: Design, name: str, extents: dict[str, tuple[int, int]]
+) -> tuple[Optional[int], Optional[int]]:
+    """(msb, lsb) for net `name`. A net that is referenced on a pin but never
+    declared (Verilog implicit net) is missing from `design.signals`; derive
+    its width from `extents` (see `_cone_bit_extents`), the bits of that name
+    actually used in the cone."""
+    sig_decl = design.signals.get(name)
+    if sig_decl is not None:
+        return sig_decl.msb, sig_decl.lsb
+    return extents.get(name, (None, None))
+
+
 def _build_forced_cone_design(
     design: Design,
     cone_gates: list[Gate],
@@ -746,14 +811,14 @@ def _build_forced_cone_design(
     1 of `detect_enable_hold`'s per-flop loop (cheap symbolic constant
     propagation with an empty `forced` dict) already covers that case for
     every self-referencing flop before Stage 3 ever runs."""
+    extents = _cone_bit_extents(cone_gates, comb_ins, out_of)
     tie_net = forced[0]
     gate_names = {g.inst_name for g in cone_gates if out_of[g.inst_name] != tie_net}
 
     work = Design(module_name="__enable_hold_cone__")
     c, v = forced
-    work.signals[c.name] = Signal(
-        name=c.name, msb=design.signals[c.name].msb, lsb=design.signals[c.name].lsb, direction=Direction.INTERNAL
-    )
+    c_msb, c_lsb = _net_extent(design, c.name, extents)
+    work.signals[c.name] = Signal(name=c.name, msb=c_msb, lsb=c_lsb, direction=Direction.INTERNAL)
     work.add_gate(
         Gate(inst_name="__force__", gate_type=GateType.BUF, pins={"O": c, "I0": Const.ONE if v else Const.ZERO})
     )
@@ -764,8 +829,8 @@ def _build_forced_cone_design(
         work.add_gate(Gate(inst_name=g.inst_name, gate_type=g.gate_type, pins=dict(g.pins)))
         o = out_of[g.inst_name]
         if isinstance(o, NetBit) and o.name not in work.signals:
-            orig = design.signals[o.name]
-            work.signals[o.name] = Signal(name=o.name, msb=orig.msb, lsb=orig.lsb, direction=Direction.INTERNAL)
+            o_msb, o_lsb = _net_extent(design, o.name, extents)
+            work.signals[o.name] = Signal(name=o.name, msb=o_msb, lsb=o_lsb, direction=Direction.INTERNAL)
 
     leaf_names: set[str] = set()
     for name in gate_names:
@@ -776,8 +841,8 @@ def _build_forced_cone_design(
         if isinstance(nb, NetBit) and nb.name not in work.signals:
             leaf_names.add(nb.name)
     for name in leaf_names:
-        orig = design.signals[name]
-        work.signals[name] = Signal(name=name, msb=orig.msb, lsb=orig.lsb, direction=Direction.INPUT)
+        l_msb, l_lsb = _net_extent(design, name, extents)
+        work.signals[name] = Signal(name=name, msb=l_msb, lsb=l_lsb, direction=Direction.INPUT)
         work.ports.append(Port(name=name, direction=Direction.INPUT))
     return work
 
@@ -874,7 +939,14 @@ def detect_enable_hold(design: Design, *, deadline: Optional[float] = None) -> E
             no_self_ref += 1
 
     mask = (1 << NUM_SAMPLES) - 1
-    sig = _simulate(design, order, comb_ins, out_of, pi_bits, q_bits, mask, SIM_SEED)
+    # Nets some gate reads that nothing drives and that are not PI / Q: free
+    # variables in simulation, like in every proof stage (see `_simulate`).
+    known = set(driver) | set(pi_bits) | set(q_bits)
+    undriven_bits = sorted(
+        {p for ins in comb_ins.values() for p in ins if isinstance(p, NetBit) and p not in known},
+        key=netbit_sort_key,
+    )
+    sig = _simulate(design, order, comb_ins, out_of, pi_bits, q_bits, mask, SIM_SEED, undriven_bits)
 
     cone_gates: dict[str, list[Gate]] = {}
     by_name = {g.inst_name: g for g in comb_gates}

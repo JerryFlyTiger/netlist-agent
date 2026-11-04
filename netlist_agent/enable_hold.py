@@ -75,7 +75,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence, Union, cast
 
-from netlist_agent.abc_bridge import ABCBridgeError, are_equivalent
+from netlist_agent.abc_bridge import ABCBridgeError, _is_declared_bit, are_equivalent
 from netlist_agent.ir import (
     Const,
     Design,
@@ -372,21 +372,12 @@ def _simulate(
     an independent random pattern, drawn AFTER the PI and Q patterns (so a
     design with no such nets draws exactly the same sequence as before), in
     the given order. This matches the proof stages (`_constprop`,
-    `_support`, `_truth_table_proof`, and `_build_forced_cone_design` for a
-    scalar net) and keeps the `_candidates` soundness argument valid: each
+    `_support`, `_truth_table_proof`, and `_build_forced_cone_design`)
+    and keeps the `_candidates` soundness argument valid: each
     simulated pattern is a point of the proof's input space. It deliberately
     differs from `abc_bridge`, which ties undriven nets to 0 for equivalence
     checking; enable/hold asks "what if this net were forced", which does
-    not depend on the net's usual value. Known exception to the two
-    statements above: on the ABC route (`_build_forced_cone_design`), a bus
-    name becomes INTERNAL in the sub-design as a whole when one of its bits
-    is the forced bit or the output bit of any cone gate (including the
-    gate that drives the flop's D). The other bits of that same name that
-    are only read as leaves (a PI bit, an undriven net, or any flop's Q,
-    including this flop's own) are
-    then not declared INPUT, and `write_blif` ties them to 0 instead of
-    leaving them free (see batch 28 / F1 in
-    experiments/undriven_wire_2026-11-02/SPEC.md)."""
+    not depend on the net's usual value."""
     rng = random.Random(seed)
     sig: dict[NetBit, int] = {}
     for nb in pi_bits:
@@ -799,11 +790,20 @@ def _build_forced_cone_design(
     `forced[1]`, mirroring `abc_bridge.extract_combinational_view`'s
     "const_zero" DFF-tie convention but for one net, not every flop. Every
     other leaf (PI bit, or another flop's free Q, INCLUDING this flop's own
-    Q) becomes an ordinary primary input. Built directly from `cone_gates`
-    rather than via `abc_bridge.extract_combinational_view` +
-    `_restrict_to_fanin_cone` on the WHOLE design, which would re-walk (and
-    re-copy) the entire netlist on every single candidate -- measured to
-    matter at this design's scale (26k gates, hundreds of candidates).
+    Q) is a free primary input, in one of two ways. A leaf whose whole name
+    is undriven in the sub-design becomes an INPUT under its own name. A leaf
+    bit whose name is already INTERNAL there (another bit of the same bus is
+    the forced net or a cone gate's output), or whose bit lies outside the
+    declared range of its INPUT name (including a bus read by its bare name,
+    or a scalar read with a bit index), is driven by a BUF from a fresh scalar
+    INPUT `__leaf_<name>_<bit>` instead, so `write_blif` cannot tie it to 0
+    and let ABC prove a hold that is not one. If that fresh name already
+    exists, `ABCBridgeError` is raised (`_prove_via_abc` turns that into
+    None, undecided). Built directly from `cone_gates` rather than via
+    `abc_bridge.extract_combinational_view` + `_restrict_to_fanin_cone` on
+    the WHOLE design, which would re-walk (and re-copy) the entire netlist on
+    every single candidate -- measured to matter at this design's scale (26k
+    gates, hundreds of candidates).
 
     `forced` is required, not optional: the only caller (`_prove_via_abc`)
     only ever runs on genuine forced candidates -- ABC is never asked to
@@ -832,18 +832,50 @@ def _build_forced_cone_design(
             o_msb, o_lsb = _net_extent(design, o.name, extents)
             work.signals[o.name] = Signal(name=o.name, msb=o_msb, lsb=o_lsb, direction=Direction.INTERNAL)
 
-    leaf_names: set[str] = set()
+    read_bits: set[NetBit] = set()
     for name in gate_names:
         for p in comb_ins[name]:
-            if isinstance(p, NetBit) and p.name not in work.signals:
-                leaf_names.add(p.name)
+            if isinstance(p, NetBit):
+                read_bits.add(p)
     for nb in (d, q):
-        if isinstance(nb, NetBit) and nb.name not in work.signals:
-            leaf_names.add(nb.name)
-    for name in leaf_names:
+        if isinstance(nb, NetBit):
+            read_bits.add(nb)
+    driven_bits: set[NetBit] = {tie_net}
+    for name in gate_names:
+        o = out_of[name]
+        if isinstance(o, NetBit):
+            driven_bits.add(o)
+    leaf_bits = read_bits - driven_bits
+
+    # Whole-name leaves: no bit of the name is driven in the sub-design.
+    leaf_names = {nb.name for nb in leaf_bits if nb.name not in work.signals}
+    for name in sorted(leaf_names):
         l_msb, l_lsb = _net_extent(design, name, extents)
         work.signals[name] = Signal(name=name, msb=l_msb, lsb=l_lsb, direction=Direction.INPUT)
         work.ports.append(Port(name=name, direction=Direction.INPUT))
+
+    # Leaf bits whose NAME is already INTERNAL (another bit of the same name is
+    # the forced net or a gate output), or whose bit lies outside the declared
+    # range of an INPUT name (a bus read by its bare name counts as outside):
+    # declaring the name INPUT is impossible or does not cover the bit, and
+    # leaving the bit undeclared lets `write_blif` tie it to 0. Give each such
+    # bit its own scalar INPUT, fed through a BUF.
+    for nb in sorted(leaf_bits, key=netbit_sort_key):
+        sig = work.signals[nb.name]
+        if sig.direction == Direction.INPUT and _is_declared_bit(sig, nb):
+            continue
+        leaf = f"__leaf_{nb.name}" if nb.bit is None else f"__leaf_{nb.name}_{nb.bit}"
+        if leaf in work.signals:
+            raise ABCBridgeError(f"enable/hold cone: leaf alias name {leaf!r} collides with an existing net")
+        work.signals[leaf] = Signal(name=leaf, msb=None, lsb=None, direction=Direction.INPUT)
+        work.ports.append(Port(name=leaf, direction=Direction.INPUT))
+        work.add_gate(
+            Gate(
+                inst_name=work.fresh_gate_name("__leaf_buf_"),
+                gate_type=GateType.BUF,
+                pins={"O": nb, "I0": NetBit(leaf)},
+            )
+        )
     return work
 
 
@@ -873,9 +905,10 @@ def _prove_via_abc(
     too large for `_truth_table_proof` to be cheap: a single bounded
     `abc_bridge.are_equivalent` formal check. Returns True (proven hold),
     False (proven NOT a hold for this candidate), or None (ABC timed out /
-    errored -- genuinely unresolved, NOT the same as False)."""
-    work = _build_forced_cone_design(design, cone_gates, comb_ins, out_of, d, q, forced)
+    errored, or the sub-design's alias name collided with an existing net --
+    genuinely unresolved, NOT the same as False)."""
     try:
+        work = _build_forced_cone_design(design, cone_gates, comb_ins, out_of, d, q, forced)
         return are_equivalent(work, d, q, timeout=timeout)
     except ABCBridgeError:
         return None

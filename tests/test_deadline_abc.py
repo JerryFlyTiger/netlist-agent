@@ -22,7 +22,7 @@ from netlist_agent.abc_bridge import (
     extract_combinational_view,
     is_constant,
 )
-from netlist_agent.abc_synth import _run_abc_synthesis, _SynthError, optimize_depth
+from netlist_agent.abc_synth import _run_abc_synthesis, _SynthError, _SynthTimeout, optimize_depth
 from netlist_agent.ir import NetBit
 from netlist_agent.parser import parse_verilog
 
@@ -300,11 +300,11 @@ def test_synthesis_clamps_timeout_and_messages(monkeypatch, clock, tmp_path) -> 
     monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
     spawns = _Spawns(monkeypatch, _raise_timeout)
     with deadline.request_scope(3.0):
-        with pytest.raises(_SynthError) as exc:
+        with pytest.raises(_SynthTimeout) as exc:
             _run_abc_synthesis(view, None, 120.0)
     assert spawns.timeouts == [3.0]
     assert str(exc.value) == f"ABC synthesis timed out after 3.0s {_BUDGET_MSG}"
-    with pytest.raises(_SynthError) as exc:
+    with pytest.raises(_SynthTimeout) as exc:
         _run_abc_synthesis(view, None, 5.0)
     assert str(exc.value) == "ABC synthesis timed out after 5.0s"
     assert spawns.timeouts[-1] == 5.0
@@ -348,3 +348,25 @@ def test_optimize_depth_with_spent_budget_returns_original(monkeypatch, clock, t
     assert result.changed is False
     assert result.failure is not None and "was not started" in result.failure
     assert spawns.timeouts == []
+
+
+def test_optimize_depth_budget_clamped_timeout_triggers_quick_script(monkeypatch, clock, tmp_path) -> None:
+    """kills: the clamped-timeout `_SynthTimeout` not being recognized as a timeout by the depth
+    path (no quick-script retry). Real `_run_abc_synthesis`; only `subprocess.run` is fake."""
+    design = _design(tmp_path, _CHAIN_V)
+    monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
+
+    def first_times_out(t):
+        clock["t"] = 9.8  # the full script ate the budget; the quick retry cannot start
+        _raise_timeout(t)
+
+    spawns = _Spawns(monkeypatch, first_times_out)
+    with deadline.request_scope(10.0):
+        result = optimize_depth(design)
+    assert result.design is design
+    assert result.changed is False
+    assert len(spawns.timeouts) == 1
+    assert result.failure is not None
+    assert _BUDGET_MSG in result.failure
+    assert "the quick fallback script also failed" in result.failure
+    assert "was not started" in result.failure

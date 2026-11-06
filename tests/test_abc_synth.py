@@ -598,7 +598,14 @@ def test_depth_opt_not_equivalent_sets_failure_field(monkeypatch, name, call) ->
     result = call(design)
     assert not result.changed
     assert result.design is design
-    assert result.failure is not None
+    assert result.failure == (
+        "equivalence check found the resynthesized design not equivalent to the original: "
+        "counterexample: a=1 b=0"
+    )
+    assert result.note == (
+        "Equivalence check failed after resynthesis (this indicates a bug, not a normal outcome) -- "
+        "kept the original design untouched. Detail: counterexample: a=1 b=0"
+    )
 
 
 def test_depth_opt_already_optimal_leaves_failure_none() -> None:
@@ -1155,3 +1162,269 @@ def test_optimize_depth_locator_failure_is_one_clean_line(monkeypatch) -> None:
     assert result.failure is not None
     assert "could not locate the ABC binary" in result.failure
     assert root not in result.failure and "\n" not in result.failure
+
+
+# ----------------------------------------------------------------------
+# Batch 30: a timed-out full depth script retries once with the quick script
+# (`strash; balance`). Only a TIMEOUT retries; the quick result goes through
+# the same acceptance gates; "already optimal" is never claimed after it.
+# ----------------------------------------------------------------------
+
+_PRIMARY_TIMEOUT = "ABC synthesis timed out after 120s"
+_QUICK_CASES = [
+    ("whole", _build_and_chain, lambda d: optimize_depth(d)),
+    ("cone", _build_two_cone_design, lambda d: optimize_cone_depth(d, _nb("y"))),
+]
+_QUICK_IDS = [c[0] for c in _QUICK_CASES]
+
+
+def _times_out_then(monkeypatch, fast):
+    """Full script raises `_SynthTimeout`; the quick script runs `fast(real_run,
+    view, basis, timeout)`. Returns the list of `opt_script`s it was called with."""
+    real_run = abc_synth_module._run_abc_synthesis
+    scripts: list[str] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        if opt_script == abc_synth_module._OPT_SCRIPT:
+            raise abc_synth_module._SynthTimeout(_PRIMARY_TIMEOUT)
+        return fast(real_run, view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    return scripts
+
+
+def _real_fast(real_run, view, basis, timeout, opt_script):
+    return real_run(view, basis, timeout, opt_script)
+
+
+def test_synth_timeout_is_a_synth_error() -> None:
+    assert issubclass(abc_synth_module._SynthTimeout, _SynthError)
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_improvement_is_committed_with_honest_note(monkeypatch, name, build, call) -> None:
+    """spec 1 + D9."""
+    scripts = _times_out_then(monkeypatch, _real_fast)
+    design = build()
+    result = call(design)
+    assert scripts == [abc_synth_module._OPT_SCRIPT, abc_synth_module._FAST_OPT_SCRIPT]
+    assert result.changed is True
+    assert result.design is not design
+    assert result.failure is None
+    assert result.quick_fallback == _PRIMARY_TIMEOUT
+    assert result.depth_after < result.depth_before
+    assert result.note.startswith("Reduced ")
+    assert result.note.endswith(
+        f"ABC's full script timed out ({_PRIMARY_TIMEOUT}), so this used a quicker script and a lower depth may exist."
+    )
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_without_improvement_is_a_failure_not_already_optimal(monkeypatch, name, build, call) -> None:
+    """spec 2 + D7: the full script never completed, so no optimality claim."""
+    scripts = _times_out_then(monkeypatch, _real_fast)
+    design = _build_single_and()
+    result = call(design) if name == "whole" else optimize_cone_depth(design, _nb("y"))
+    assert len(scripts) == 2
+    assert result.changed is False
+    assert result.design is design
+    assert result.failure == f"{_PRIMARY_TIMEOUT}; the quick fallback script found no improvement"
+    assert "already optimal" not in result.note
+    assert result.quick_fallback is None
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+@pytest.mark.parametrize(
+    "fast_exc",
+    [abc_synth_module._SynthError("quick broke"), abc_synth_module._SynthTimeout("quick also timed out")],
+    ids=["error", "timeout"],
+)
+def test_quick_fallback_failure_keeps_both_reasons(monkeypatch, name, build, call, fast_exc) -> None:
+    """spec 3 + D8."""
+
+    def _fast_fails(real_run, view, basis, timeout, opt_script):
+        raise fast_exc
+
+    _times_out_then(monkeypatch, _fast_fails)
+    design = build()
+    result = call(design)
+    assert result.changed is False
+    assert result.design is design
+    assert result.failure == f"{_PRIMARY_TIMEOUT}; the quick fallback script also failed: {fast_exc}"
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_non_timeout_synth_error_is_not_retried(monkeypatch, name, build, call) -> None:
+    """spec 4 + D1."""
+    scripts: list[str] = []
+
+    def _crash(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        raise _SynthError("ABC synthesis process exited with code 1")
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _crash)
+    design = build()
+    result = call(design)
+    assert scripts == [abc_synth_module._OPT_SCRIPT]
+    assert result.changed is False
+    assert result.design is design
+    assert result.failure == "ABC synthesis process exited with code 1"
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_full_script_success_runs_once_and_keeps_the_old_sentence(monkeypatch, name, build, call) -> None:
+    """spec 5."""
+    real_run = abc_synth_module._run_abc_synthesis
+    scripts: list[str] = []
+
+    def _spy(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _spy)
+    result = call(build())
+    assert scripts == [abc_synth_module._OPT_SCRIPT]
+    assert result.changed is True
+    assert result.quick_fallback is None
+    if name == "whole":
+        assert result.note == f"Reduced maximum logic depth from {result.depth_before} to {result.depth_after}."
+    else:
+        assert result.note == (
+            f"Reduced the depth of the cone of y from {result.depth_before} to {result.depth_after}."
+        )
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_result_must_still_verify_equivalent(monkeypatch, name, build, call) -> None:
+    """spec 6 + D6."""
+    _times_out_then(monkeypatch, _real_fast)
+    monkeypatch.setattr(
+        abc_synth_module, "verify_equivalence", lambda *a, **k: EquivResult(False, "counterexample: a=1")
+    )
+    design = build()
+    result = call(design)
+    assert result.changed is False
+    assert result.design is design
+    assert result.quick_fallback is None
+    assert result.failure is not None and "not equivalent" in result.failure
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_verify_inconclusive_keeps_primary(monkeypatch, name, build, call) -> None:
+    """F1: the quick result's verification raising inconclusive must not drop the full script's timeout."""
+    _times_out_then(monkeypatch, _real_fast)
+
+    def _inconclusive(*a, **k):
+        raise abc_bridge_module.ABCInconclusiveError("cec gave up")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _inconclusive)
+    design = build()
+    result = call(design)
+    assert result.changed is False
+    assert result.design is design
+    assert result.quick_fallback is None
+    assert "already optimal" not in result.note
+    assert result.failure is not None
+    assert _PRIMARY_TIMEOUT in result.failure
+    assert "equivalence check was inconclusive: cec gave up" in result.failure
+    assert _PRIMARY_TIMEOUT in result.note
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_not_equivalent_keeps_primary(monkeypatch, name, build, call) -> None:
+    """F1: a mismatch on the quick result carries the full script's timeout too, and the old note text."""
+    _times_out_then(monkeypatch, _real_fast)
+    monkeypatch.setattr(
+        abc_synth_module, "verify_equivalence", lambda *a, **k: EquivResult(False, "counterexample: a=1")
+    )
+    design = build()
+    result = call(design)
+    assert result.changed is False
+    assert result.design is design
+    assert "already optimal" not in result.note
+    assert result.note.startswith("Equivalence check failed after resynthesis (this indicates a bug")
+    assert result.failure is not None
+    assert _PRIMARY_TIMEOUT in result.failure
+    assert "not equivalent" in result.failure and "counterexample: a=1" in result.failure
+    assert result.note.endswith(f"(Context: {_PRIMARY_TIMEOUT}; the result came from the quick fallback script.)")
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_splice_rejection_keeps_primary(monkeypatch, name, build, call) -> None:
+    """F6: an unrecognized gate in the quick script's BLIF goes through the real splice and is
+    reported as a rejected result (not as a script failure), with the full script's timeout."""
+
+    def _bogus(real_run, view, basis, timeout, opt_script):
+        real = real_run(view, basis, timeout, opt_script)
+        out = real.outputs[0]
+        return abc_synth_module._BlifNetlist(
+            real.inputs, real.outputs, [abc_synth_module._BlifGate("bogus_gate9", {"O": out})]
+        )
+
+    _times_out_then(monkeypatch, _bogus)
+    design = build()
+    result = call(design)
+    assert result.changed is False
+    assert result.design is design
+    assert result.failure is not None
+    assert _PRIMARY_TIMEOUT in result.failure
+    assert "result was rejected" in result.failure
+    assert "bogus_gate9" in result.failure
+    assert "also failed" not in result.failure
+    assert _PRIMARY_TIMEOUT in result.note
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_quick_fallback_uses_same_basis_and_timeout(monkeypatch, name, build, call) -> None:
+    """F5: both ABC calls get the caller's basis and synthesis timeout."""
+    real_run = abc_synth_module._run_abc_synthesis
+    calls: list[tuple] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        calls.append((basis, timeout, opt_script))
+        if opt_script == abc_synth_module._OPT_SCRIPT:
+            raise abc_synth_module._SynthTimeout(_PRIMARY_TIMEOUT)
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    design = build()
+    if name == "whole":
+        optimize_depth(design, basis="and_or_not", timeout=77.0)
+    else:
+        optimize_cone_depth(design, _nb("y"), basis="and_or_not", timeout=77.0)
+    assert calls == [
+        ("and_or_not", 77.0, abc_synth_module._OPT_SCRIPT),
+        ("and_or_not", 77.0, abc_synth_module._FAST_OPT_SCRIPT),
+    ]
+
+
+@pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
+def test_real_subprocess_full_script_times_out_quick_script_wins(monkeypatch, tmp_path, name, build, call) -> None:
+    """spec 7: a wrapper around the real ABC sleeps whenever the command has
+    `; dch;` (the full script's `dch` step as `_run_abc_synthesis` assembles it;
+    the quick script's command does not contain it, and a bare `*dch*` could match
+    a random temp-dir name). `exec` makes the sleep replace the shell, so the timeout kill hits
+    the sleep itself (no orphan holding the stdout pipe past this test)."""
+    real_abc = abc_synth_module._resolve_abc()
+    wrapper = tmp_path / "abc_wrapper.sh"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        '  *"; dch;"*) exec sleep 60 ;;\n'
+        "esac\n"
+        f'exec "{real_abc}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: str(wrapper))
+    design = build()
+    if name == "whole":
+        result = optimize_depth(design, timeout=2.0)
+    else:
+        result = optimize_cone_depth(design, _nb("y"), timeout=2.0)
+    assert result.failure is None, result.failure
+    assert result.changed is True
+    assert result.quick_fallback == "ABC synthesis timed out after 2.0s"
+    assert result.depth_after < result.depth_before
+    # Re-check with the same `verify_equivalence`, here through the real (unwrapped) cec.
+    assert verify_equivalence(design, result.design).equivalent

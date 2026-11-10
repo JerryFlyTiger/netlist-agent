@@ -156,6 +156,7 @@ _RESET_ON_LOAD = frozenset(
         "last_gate_delta",
         "last_op_kind",
         "last_op_args",
+        "op_counts",  # batch 32a: per-family counts
         "last_query_gate_names",
         "last_floating_count",
         "last_enable_hold_count",

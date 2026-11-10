@@ -87,7 +87,12 @@ class Session:
     # Bookkeeping for "how many gates were {added,removed,merged,eliminated}
     # by the {transform} just performed"-style follow-up queries: updated by
     # router.py immediately after every count-returning transform call, then
-    # read back (without re-running anything) by the follow-up query.
+    # read back (without re-running anything) by the tool layer (rerun guard,
+    # `count_gates_by_type`, `get_last_operation_summary`; router.py itself
+    # reads `last_gate_delta` only to copy the NAND/NOR delta into
+    # `op_counts`). The rule-routed
+    # count follow-ups read the per-family `op_counts` below instead (batch
+    # 32a), because this single cell reflects only the LAST transform.
     last_op_count: Optional[int] = None
     last_gate_delta: dict[GateType, int] = field(default_factory=dict)
 
@@ -121,6 +126,23 @@ class Session:
     # args tuple), but is handled the same as any other non-match rather
     # than assumed impossible.
     last_op_args: Optional[tuple] = None
+
+    # Per-question-family count of the most recent operation of that family
+    # (batch 32a). `last_op_count`/`last_gate_delta` are ONE cell shared by
+    # every transform, so "how many BUF gates were added" asked after an
+    # unrelated later transform read that transform's number. Keys are
+    # question families written explicitly by each rule-routed handler in
+    # router.py: `buffers_added`, `dangling_removed`, `dedup_merged`,
+    # `const_eliminated:<GATE_TYPE>`, `inverter_buffer_removed`, `nand_added`,
+    # `nor_added`. Same family: the latest write wins (no summing). A
+    # handler that raised ValueError writes nothing. The 7 count follow-up
+    # handlers read this, and answer 0 when the family has no entry. The
+    # `last_op_*` cells above are deliberately untouched: the tool layer's
+    # rerun guard depends on their "the most recent operation" meaning.
+    # Reset when a new design is loaded (`reset_per_design_state`), NOT by a
+    # transform. `_enforce_structural_constraints`' buffers are not counted
+    # (known limitation).
+    op_counts: dict[str, int] = field(default_factory=dict)
 
     # Instance names of gates that matched the most recent "find all the
     # gates whose name includes X"-style query -- consumed by a later
@@ -271,7 +293,7 @@ class Session:
         the new one (batch 24).
 
         Resets: the transform counters (`last_op_count`, `last_gate_delta`,
-        `last_op_kind`, `last_op_args`) and the query results
+        `last_op_kind`, `last_op_args`, `op_counts`) and the query results
         (`last_query_gate_names`, `last_floating_count`,
         `last_enable_hold_count`, `last_enable_hold_not_examined`,
         `last_enable_hold_simulated_only`, `last_enable_hold_fingerprint`) and their "previous number"
@@ -315,6 +337,7 @@ class Session:
         self.last_gate_delta = {}
         self.last_op_kind = None
         self.last_op_args = None
+        self.op_counts = {}
         self.last_query_gate_names = []
         self.last_floating_count = None
         self.last_enable_hold_count = None

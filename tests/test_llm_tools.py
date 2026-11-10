@@ -2568,3 +2568,31 @@ def test_find_signal_pair_tool_dict_carries_conclusive(tmp_path, monkeypatch) ->
     out = find_signal_pair_for_operator(session, "z", "AND")
     assert out["found"] is False and out["conclusive"] is False
     assert out["explanation"].startswith("Undetermined.")
+
+
+@pytest.mark.skipif(not _HAS_REAL_ROUTER, reason="requires the private rule-based router (not present in this public export)")
+def test_get_last_operation_summary_reports_op_counts_per_family(tmp_path) -> None:
+    """Batch 32a: `op_counts` keeps an earlier operation's number after a later
+    unrelated one overwrote the single `last_op_count` cell."""
+    src = (
+        "module top(a, b, y1, y2, y3);\n  input a, b;\n  output y1, y2, y3;\n"
+        "  wire a, b, y1, y2, y3, m1, m2;\n"
+        "  and d1(m1, a, b);\n  and d2(m2, a, b);\n  or o1(y1, m1, m2);\n"
+        "  buf u1(y2, a);\n  buf u2(y3, b);\nendmodule\n"
+    )
+    (tmp_path / "t.v").write_text(src)
+    session = Session()
+
+    def no_fallback(s: Session, t: str) -> str:
+        raise AssertionError(t)
+
+    handle_request(session, f"load t.v in the directory {tmp_path}", no_fallback)
+    handle_request(session, "Insert a BUF gate on signal a so that each load is driven separately.", no_fallback)
+    handle_request(
+        session, "Deduplicate gates that compute the same function.", no_fallback
+    )
+    summary = tools_schema.get_last_operation_summary(session)
+    assert summary["op_counts"] == {"buffers_added": 3, "dedup_merged": 2}
+    assert summary["last_op_count"] == 2  # the single cell only has the latest
+    summary["op_counts"]["x"] = 1
+    assert "x" not in session.op_counts  # a copy, not the live dict

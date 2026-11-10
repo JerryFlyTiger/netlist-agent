@@ -970,9 +970,30 @@ def get_last_operation_summary(session: Session) -> dict[str, Any]:
     Reading `last_op_count` unchanged after running a mutating tool this
     turn is therefore correct, not stale: it is still answering "what did
     the earlier request do", not "what did this turn's tool call do" (that
-    call's own result already reports its own count under its own key)."""
+    call's own result already reports its own count under its own key).
+
+    `last_op_count` is ONE number: whatever the most recent counted
+    operation returned, whichever kind it was. `op_counts` is the same idea
+    per question family, so an earlier operation's number survives a later
+    unrelated one. Keys: `buffers_added`, `dangling_removed`,
+    `dedup_merged`, `const_eliminated:<GATE_TYPE>`,
+    `inverter_buffer_removed`, `nand_added`, `nor_added` (the rule-routed
+    transform handlers in router.py write them: grep `op_counts[` there).
+    For a "how many X were added/removed/merged/eliminated"
+    question where X is one of those families, read `op_counts[X's family]`,
+    not `last_op_count`. Some operations have no family key: the ABC
+    optimizers, rename and reconnect do not write `last_op_count` either,
+    but `collapse_double_inverters`, `replace_buf_with_and`, and the remap/
+    decompose handlers that do not target NAND/NOR write `last_op_count`
+    with no family key: for those operations `last_op_count` is the only
+    number.
+    A missing key means no RECORDED operation of that family ran on this
+    design; the rule router then answers 0. It does NOT prove the operation
+    was never done: only the rule-routed handlers record, and operations run
+    through the do_* tools do not (yet)."""
     return {
         "last_op_count": session.last_op_count,
+        "op_counts": dict(session.op_counts),
         "last_gate_delta": {gt.name: n for gt, n in session.last_gate_delta.items()},
         "last_query_gate_names": list(session.last_query_gate_names),
         "last_floating_count": session.last_floating_count,
@@ -2027,7 +2048,13 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "rerunning anything. Use this to answer a follow-up like 'how many gates did that merge?' -- do "
         "NOT call the original do_*/check_* tool again just to recover a number it already returned, "
         "since calling it again repeats its effect (e.g. re-running a merge/dedup mutates the design "
-        "again and reports a different, wrong count for what 'just happened'). The enable/hold count "
+        "again and reports a different, wrong count for what 'just happened'). op_counts holds the last "
+        "count per question family (buffers_added, dangling_removed, dedup_merged, const_eliminated:<GATE_TYPE>, "
+        "inverter_buffer_removed, nand_added, nor_added); for a 'how many X were added/removed/merged' question "
+        "read the matching op_counts key, since last_op_count is only the single most recent operation of any kind. "
+        "A missing key does NOT prove the operation was never done: the do_* tools do not record op_counts "
+        "(each reports its own count in its own result). "
+        "The enable/hold count "
         "is formally PROVEN flip-flops only; last_enable_hold_simulated_only is how many more could not "
         "be settled (may also have one) and last_enable_hold_not_examined how many the time budget cut "
         "off, so when either is above 0 the true number may be higher. The floating and enable/hold counts "

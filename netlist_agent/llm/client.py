@@ -338,6 +338,11 @@ class LLMClient:
         history = adapter.initial_history(build_system_prompt(session), user_message)
 
         last_text: Optional[str] = None
+        # Batch 32b: do_* tools park their counts in pending cells; commit them
+        # when the request ends (also on timeout/exception: the design was
+        # already changed).
+        session.pending_op_counts = {}
+        session.pending_functional_change_ops = 0
         try:
             for iteration in range(self.max_iterations):
                 turn = self._request(adapter, history)
@@ -365,3 +370,5 @@ class LLMClient:
         except deadline.DeadlineExceeded as exc:
             self._emit({"type": "deadline", "budget": exc.budget})
             return deadline.incomplete_message(exc)
+        finally:
+            session.commit_tool_turn_counts()

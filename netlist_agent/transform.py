@@ -326,17 +326,24 @@ def _apply_degenerate(design: Design, gate: Gate, other: Pin, new_type: GateType
     gate.gate_type = new_type
 
 
-def simplify_constant_inputs(design: Design, gate_types: Optional[Iterable[GateType]] = None) -> int:
+def simplify_constant_inputs(
+    design: Design,
+    gate_types: Optional[Iterable[GateType]] = None,
+    by_type: Optional[dict[GateType, int]] = None,
+) -> int:
     """Fold every 2-input gate that has a Const.ZERO/Const.ONE-tied input,
     per the fixed truth-table identity for its gate type. `gate_types`
     optionally restricts the sweep to a subset (e.g. {GateType.NAND} to match
     a prompt asking only about NAND gates); defaults to all six 2-input types.
+    `by_type`, if given, is filled in with the per-ORIGINAL-gate-type count
+    (only types that were actually simplified get a key; the caller zero-fills).
     """
     allowed = set(gate_types) if gate_types is not None else TWO_INPUT_GATES
     count = 0
     for gate in list(design.gates):
         if gate.gate_type not in allowed:
             continue
+        orig_type = gate.gate_type
         i0, i1 = gate.pins.get("I0"), gate.pins.get("I1")
         c0, c1 = isinstance(i0, Const), isinstance(i1, Const)
         if not c0 and not c1:
@@ -345,6 +352,8 @@ def simplify_constant_inputs(design: Design, gate_types: Optional[Iterable[GateT
         if c0 and c1:
             _apply_const_output(design, gate, out_nb, Const(_eval_two_input(gate.gate_type, i0.value, i1.value)))
             count += 1
+            if by_type is not None:
+                by_type[orig_type] = by_type.get(orig_type, 0) + 1
             continue
         const_val, other = (i0, i1) if c0 else (i1, i0)
         rule = _CONST_RULES.get((gate.gate_type, const_val))
@@ -357,6 +366,8 @@ def simplify_constant_inputs(design: Design, gate_types: Optional[Iterable[GateT
         else:
             _apply_degenerate(design, gate, other, GateType.NOT)
         count += 1
+        if by_type is not None:
+            by_type[orig_type] = by_type.get(orig_type, 0) + 1
     return count
 
 

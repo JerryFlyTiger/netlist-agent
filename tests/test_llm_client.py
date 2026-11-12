@@ -995,3 +995,199 @@ def test_c5_pre_send_exit_reports_the_scope_budget(_env) -> None:
         out = _llm(client, _env).answer(_session(), "q")
     assert client.calls == 0
     assert out == _incomplete(30)
+
+
+# ----------------------------------------------------------------------
+# Batch 32b: do_* counts are parked in `pending_*` and committed when the
+# request ends (`LLMClient.answer`'s `finally`).
+# ----------------------------------------------------------------------
+
+_DEDUP_V = """module top(a, b, y);
+  input a, b;
+  output y;
+  wire a, b, y, m1, m2;
+  and d1(m1, a, b);
+  and d2(m2, a, b);
+  or o1(y, m1, m2);
+endmodule
+"""
+
+
+def _dedup_session(tmp_path) -> Session:
+    from netlist_agent.parser import parse_verilog
+
+    path = tmp_path / "dd.v"
+    path.write_text(_DEDUP_V)
+    session = Session()
+    session.current_design = parse_verilog(str(path))
+    session.original_snapshot = parse_verilog(str(path))
+    return session
+
+
+def _call(name: str, **arguments: Any) -> dict:
+    return {"tool_calls": [{"id": f"c-{name}", "name": name, "arguments": arguments}]}
+
+
+def _plain_llm(client: _ScriptedClient) -> LLMClient:
+    return LLMClient(provider=client.provider, client=client, model="fake-model")
+
+
+def test_u2_same_turn_summary_does_not_show_this_turns_count(tmp_path) -> None:
+    """32b U2. kills: do_* writing op_counts directly (this turn's summary would then show dedup_merged);
+    commit missing (the next request's summary would lack it)."""
+    session = _dedup_session(tmp_path)
+    seen: list = []
+
+    def spy_summary(s: Session) -> dict:
+        seen.append((dict(s.op_counts), dict(s.pending_op_counts)))
+        return {}
+
+    client = _ScriptedClient(
+        "openai", [_call("do_deduplicate_gates"), _call("get_last_operation_summary"), {"text": "done"}]
+    )
+    orig = TOOL_REGISTRY["get_last_operation_summary"]
+    TOOL_REGISTRY["get_last_operation_summary"] = spy_summary
+    try:
+        assert _plain_llm(client).answer(session, "merge duplicates") == "done"
+    finally:
+        TOOL_REGISTRY["get_last_operation_summary"] = orig
+    assert seen == [({}, {"dedup_merged": 1})]  # in-turn: committed side empty, count is only pending
+    assert session.op_counts == {"dedup_merged": 1}
+    assert session.pending_op_counts == {}
+    # the next request's real summary has it
+    client2 = _ScriptedClient("openai", [_call("get_last_operation_summary"), {"text": "ok"}])
+    results: list = []
+    orig_exec = TOOL_REGISTRY["get_last_operation_summary"]
+
+    def grab(s: Session) -> dict:
+        out = orig_exec(s)
+        results.append(out)
+        return out
+
+    TOOL_REGISTRY["get_last_operation_summary"] = grab
+    try:
+        _plain_llm(client2).answer(session, "how many merged?")
+    finally:
+        TOOL_REGISTRY["get_last_operation_summary"] = orig_exec
+    assert results[0]["op_counts"] == {"dedup_merged": 1}
+
+
+def test_f3_commit_merges_into_op_counts_not_replaces(tmp_path) -> None:
+    """32b F3. kills: `commit_tool_turn_counts` assigning `op_counts = pending` instead of `update`
+    (an earlier family's count, here buffers_added, would vanish)."""
+    session = _dedup_session(tmp_path)
+    session.op_counts = {"buffers_added": 3}
+    client = _ScriptedClient("openai", [_call("do_deduplicate_gates"), {"text": "done"}])
+    assert _plain_llm(client).answer(session, "merge duplicates") == "done"
+    assert session.op_counts.get("buffers_added") == 3, session.op_counts
+    assert session.op_counts["dedup_merged"] == 1
+
+
+def test_u3_load_mid_turn_drops_pending_of_the_old_design(tmp_path) -> None:
+    """32b U3. kills: reset_per_design_state not clearing pending_op_counts (old design's count committed onto the new one)."""
+    session = _dedup_session(tmp_path)
+    (tmp_path / "other.v").write_text(_DEDUP_V.replace("module top", "module other"))
+    client = _ScriptedClient(
+        "openai",
+        [_call("do_deduplicate_gates"), _call("load_design", filename="other.v", directory=str(tmp_path)), {"text": "done"}],
+    )
+    assert _plain_llm(client).answer(session, "merge then load") == "done"
+    assert session.current_design.module_name == "other"
+    assert session.op_counts == {}
+    assert session.pending_op_counts == {}
+
+
+def test_u4_exception_and_deadline_still_commit(tmp_path, monkeypatch) -> None:
+    """32b U4. kills: commit placed after the try (skipped on exception) or only on the normal return path."""
+
+    def boom(s, **kw):
+        raise deadline.DeadlineExceeded(37)
+
+    monkeypatch.setitem(TOOL_REGISTRY, "fake_deadline_tool", boom)
+    session = _dedup_session(tmp_path)
+    client = _ScriptedClient("openai", [_call("do_deduplicate_gates"), _call("fake_deadline_tool"), _OK])
+    out = _plain_llm(client).answer(session, "q")
+    assert out == _incomplete(37)
+    assert session.op_counts == {"dedup_merged": 1}
+
+    session = _dedup_session(tmp_path)
+    client = _ScriptedClient("openai", [_call("do_deduplicate_gates"), RuntimeError("sdk blew up")])
+    with pytest.raises(RuntimeError, match="sdk blew up"):
+        _plain_llm(client).answer(session, "q")
+    assert session.op_counts == {"dedup_merged": 1}
+    assert session.pending_op_counts == {}
+
+
+def test_g7_max_iterations_exhausted_still_commits(tmp_path) -> None:
+    """32b G7-2. kills: the commit missing from the `return last_text or _INCOMPLETE_MESSAGE` path
+    (e.g. `session.pending_op_counts = {}` inserted before that return: op_counts would stay empty)."""
+    session = _dedup_session(tmp_path)
+    client = _ScriptedClient("openai", [_call("do_deduplicate_gates"), _OK])
+    llm = LLMClient(provider="openai", client=client, model="fake-model", max_iterations=1)
+    out = llm.answer(session, "q")
+    assert out == _INCOMPLETE_MESSAGE  # loop exhausted: neither the exception nor the deadline leg
+    assert session.op_counts == {"dedup_merged": 1}
+    assert session.pending_op_counts == {}
+
+
+def test_answer_clears_stale_pending_on_entry(tmp_path) -> None:
+    """32b: leftovers from a direct tool call outside any request must not ride into the next request's commit."""
+    session = _dedup_session(tmp_path)
+    session.pending_op_counts["dedup_merged"] = 99
+    session.pending_functional_change_ops = 5
+    _plain_llm(_ScriptedClient("openai", [{"text": "hi"}])).answer(session, "q")
+    assert session.op_counts == {}
+    assert session.functional_change_ops == 0
+
+
+_BUF_V = """module top(a, c, y1, y2);
+  input a, c;
+  output y1, y2;
+  wire a, c, y1, y2;
+  buf b1(y1, a);
+  buf b2(y2, a);
+endmodule
+"""
+
+
+def test_u10_replace_buf_through_the_llm_counts_as_a_functional_change(tmp_path) -> None:
+    """32b U10. kills: do_replace_buf_with_and not feeding the pending total; commit not adding it;
+    reset_per_design_state (a later load_design) clearing the cross-design total."""
+    from netlist_agent.parser import parse_verilog
+
+    path = tmp_path / "buf.v"
+    path.write_text(_BUF_V)
+    (tmp_path / "other.v").write_text(_DEDUP_V.replace("module top", "module other"))
+    session = Session()
+    session.current_design = parse_verilog(str(path))
+    session.original_snapshot = parse_verilog(str(path))
+    assert session.functional_change_ops == 0
+    seen: list = []
+    orig = TOOL_REGISTRY["get_last_operation_summary"]
+
+    def spy(s: Session) -> dict:
+        seen.append(s.functional_change_ops)
+        return {}
+
+    client = _ScriptedClient(
+        "openai",
+        [
+            _call("do_replace_buf_with_and", ctrl_net="c", gate_names=["b1", "b2"]),
+            _call("get_last_operation_summary"),
+            {"text": "done"},
+        ],
+    )
+    TOOL_REGISTRY["get_last_operation_summary"] = spy
+    try:
+        assert _plain_llm(client).answer(session, "gate the buffers with c") == "done"
+    finally:
+        TOOL_REGISTRY["get_last_operation_summary"] = orig
+    assert seen == [0]  # same turn: not yet committed (E1)
+    assert session.functional_change_ops == 2
+    assert session.pending_functional_change_ops == 0
+    assert session.op_counts == {}  # no family key for this tool
+
+    client2 = _ScriptedClient("openai", [_call("load_design", filename="other.v", directory=str(tmp_path)), {"text": "ok"}])
+    assert _plain_llm(client2).answer(session, "load the other design") == "ok"
+    assert session.current_design.module_name == "other"
+    assert session.functional_change_ops == 2  # a different design does not clear the running total

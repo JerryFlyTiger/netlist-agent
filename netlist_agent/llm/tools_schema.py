@@ -59,7 +59,18 @@ from netlist_agent.analysis import (
 )
 from netlist_agent.boolean_function import derive_boolean_function
 from netlist_agent.graph import DffPin, NetlistGraph
-from netlist_agent.ir import Const, DFF_PIN_ORDER, Design, Gate, GateType, NetBit, OUTPUT_PIN, Pin, POSITIONAL_PIN_ORDER
+from netlist_agent.ir import (
+    Const,
+    DFF_PIN_ORDER,
+    Design,
+    Gate,
+    GateType,
+    NetBit,
+    OUTPUT_PIN,
+    Pin,
+    POSITIONAL_PIN_ORDER,
+    TWO_INPUT_GATES,
+)
 from netlist_agent.netref import (
     netbit_sort_key,
     netbit_token,
@@ -293,9 +304,11 @@ def write_design(session: Session, filename: str) -> dict[str, Any]:
 # that batch did, and it matters here because the precedent being claimed is
 # specifically "adding a field changed nothing else", not "refusing worked".
 #
-# The key NAMES do the work, because a model reads keys. They are absent when
-# no count-tracked transform has run since the current design was loaded, so their presence is itself
-# the signal that a "how many did it change" question has a recorded answer.
+# The key NAMES do the work, because a model reads keys. They appear only when
+# a change is recorded (`last_op_kind is not None` -- a rule-path transform ran -- or
+# `session.op_counts` is non-empty -- a do_* tool's count was committed at the end of an
+# earlier request), so their presence is itself the signal that a "how many did it change"
+# question has a recorded answer. They read COMMITTED values only, never this turn's pending ones.
 _CURRENT_TOTALS_NOT_A_CHANGE_KEY = "these_are_current_totals_not_how_many_an_operation_changed"
 _RECORDED_CHANGE_KEY = "how_many_the_last_operation_changed"
 
@@ -305,12 +318,19 @@ def count_gates_by_type(session: Session) -> dict[str, Any]:
     by_type = {gt.name: n for gt, n in counts.items()}
     result: dict[str, Any] = {"total": sum(counts.values()), "by_type": by_type}
     # `last_op_kind is None` alongside `last_op_count is None` is session.py's
-    # documented meaning of "no count-tracked transform has run yet".
-    if session.last_op_kind is not None:
+    # documented meaning of "no count-tracked transform has run yet" -- for
+    # the rule path. The do_* tools (batch 32b) write only `op_counts` (on
+    # request end), so a non-empty `op_counts` also means a recorded change
+    # exists. Committed values only, never this turn's pending ones.
+    # `last_op_count`/`last_gate_delta` are written only by the built-in rule
+    # path, so they can describe an older operation than `op_counts` records;
+    # the per-family count is the one in `op_counts`.
+    if session.last_op_kind is not None or session.op_counts:
         result[_CURRENT_TOTALS_NOT_A_CHANGE_KEY] = True
         result[_RECORDED_CHANGE_KEY] = {
             "last_op_count": session.last_op_count,
             "last_gate_delta": {gt.name: n for gt, n in session.last_gate_delta.items() if n},
+            "op_counts": dict(session.op_counts),
         }
     return result
 
@@ -958,8 +978,8 @@ _UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY = "unaffected_by_this_turns_tool_calls"
 def get_last_operation_summary(session: Session) -> dict[str, Any]:
     """Read back the counters router.py's own handlers already maintain for
     "how many gates did the last operation touch?"-style follow-ups --
-    WITHOUT rerunning anything. If an earlier tool call (or an earlier
-    rule-routed request this same session) already reported a count, this
+    WITHOUT rerunning anything. If an earlier request this same session
+    (rule-routed, or one that used a do_* tool) already reported a count, this
     is how to retrieve it again: calling the original do_* tool a second
     time repeats its mutation and produces a NEW, different count, not the
     same answer over again.
@@ -977,8 +997,13 @@ def get_last_operation_summary(session: Session) -> dict[str, Any]:
     per question family, so an earlier operation's number survives a later
     unrelated one. Keys: `buffers_added`, `dangling_removed`,
     `dedup_merged`, `const_eliminated:<GATE_TYPE>`,
-    `inverter_buffer_removed`, `nand_added`, `nor_added` (the rule-routed
-    transform handlers in router.py write them: grep `op_counts[` there).
+    `inverter_buffer_removed`, `nand_added`, `nor_added`,
+    `simplify_last_run_total` (the TOTAL of the latest simplify, whichever
+    gate types it touched: on the rule path the latest operation, on the LLM
+    path the sum of the simplify calls within the latest request that ran
+    one). The rule-routed handlers write
+    them as they run; the do_* tools write them when the REQUEST THEY RAN IN
+    ENDS, so they show up from the next request on, never in the same turn.
     For a "how many X were added/removed/merged/eliminated"
     question where X is one of those families, read `op_counts[X's family]`,
     not `last_op_count`. Some operations have no family key: the ABC
@@ -986,11 +1011,18 @@ def get_last_operation_summary(session: Session) -> dict[str, Any]:
     but `collapse_double_inverters`, `replace_buf_with_and`, and the remap/
     decompose handlers that do not target NAND/NOR write `last_op_count`
     with no family key: for those operations `last_op_count` is the only
-    number.
+    number (written by the rule path only).
+    `last_op_count` and `last_gate_delta` (and the internal `last_op_kind` /
+    `last_op_args`) are written only by the built-in rule path; do_* tools
+    never update them, so they can describe an older operation than the one
+    `op_counts` records. The per-family count is the one in `op_counts`.
+    Within one request, repeated do_* calls of a family accumulate into one
+    `op_counts` value.
     A missing key means no RECORDED operation of that family ran on this
     design; the rule router then answers 0. It does NOT prove the operation
-    was never done: only the rule-routed handlers record, and operations run
-    through the do_* tools do not (yet)."""
+    was never done: a missing key can also mean an operation that has no
+    family key (see above), or one done earlier THIS turn (not yet
+    committed)."""
     return {
         "last_op_count": session.last_op_count,
         "op_counts": dict(session.op_counts),
@@ -1037,9 +1069,9 @@ def rename_signal(session: Session, old_name: str, new_name: str) -> dict[str, A
 # Rerun-of-a-prior-operation disclosure (measured:
 # experiments/count_question_reruns_2026-08-29/REPORT.md). `session.last_op_kind`
 # names the transform function that produced `session.last_op_count` --
-# router.py sets both together, whether the count came from an EARLIER
-# rule-routed request in this session or an earlier call to one of these
-# same do_* tools. A mutating do_* tool below has no way to know, on its
+# router.py sets both together; only rule-routed requests write them (the
+# do_* tools below write the per-family `op_counts` instead, committed at
+# request end -- never `last_op_kind`/`last_op_args`). A mutating do_* tool below has no way to know, on its
 # own, whether the model is asking about the operation it is CURRENTLY
 # running or one from earlier -- but it DOES know when it is re-running the
 # exact same transform `last_op_kind` already reported a count for, and
@@ -1231,6 +1263,17 @@ def _refuse_rerun(session: Session, fn: Callable[..., Any], *args: object, force
     }
 
 
+def _pending_count(session: Session, family: str, value: int) -> None:
+    """Park a do_* tool's count under its question family (batch 32b). Goes
+    to `pending_op_counts`, NOT `op_counts`: `LLMClient.answer` commits it
+    when the request ends, so this turn's tool calls never refresh
+    `get_last_operation_summary` (see `_UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY`).
+    Same family, same request: counts ACCUMULATE (batch 32b F1), so the
+    value means "how much this request did", not "what the last call did".
+    Refusals and ToolErrors return/raise before reaching a call site."""
+    session.pending_op_counts[family] = session.pending_op_counts.get(family, 0) + value
+
+
 def do_limit_fanout_global(session: Session, max_fanout: int, force: bool = False) -> dict[str, Any]:
     refusal = _refuse_rerun(session, limit_fanout, max_fanout, force=force)
     if refusal is not None:
@@ -1240,6 +1283,7 @@ def do_limit_fanout_global(session: Session, max_fanout: int, force: bool = Fals
         result = limit_fanout(design, max_fanout)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+    _pending_count(session, "buffers_added", result)
     return {"buffers_added": result, **_rerun_conflict_fields(session, limit_fanout, max_fanout)}
 
 
@@ -1269,6 +1313,7 @@ def do_limit_fanout_net(session: Session, net: str, max_fanout: int, force: bool
         per_bit = [limit_fanout_net(design, nb.name, max_fanout, nb.bit) for nb in netbits]
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+    _pending_count(session, "buffers_added", sum(per_bit))
     return {
         "buffers_added": sum(per_bit),
         "bits_processed": len(netbits),
@@ -1287,6 +1332,7 @@ def do_insert_buffer_per_load(session: Session, net: str, force: bool = False) -
     if refusal is not None:
         return refusal
     per_bit = [insert_buffer_per_load(design, nb.name, nb.bit) for nb in netbits]
+    _pending_count(session, "buffers_added", sum(per_bit))
     return {
         "buffers_added": sum(per_bit),
         "bits_processed": len(netbits),
@@ -1312,6 +1358,7 @@ def do_balance_depth_to_sinks(session: Session, source: str, sinks: list[str], f
         result = balance_depth_to_sinks(design, src, sink_nbs)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+    _pending_count(session, "buffers_added", result.buffers_added)
     return {
         "buffers_added": result.buffers_added,
         "target_depth": result.target_depth,
@@ -1379,6 +1426,9 @@ def do_replace_buf_with_and(
         replaced = replace_buf_with_and(design, names, ctrl, skipped_self_loop)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+    # Not a question family: feeds `functional_change_ops` (committed with
+    # `op_counts` when the request ends; read by get_last_operation_summary).
+    session.pending_functional_change_ops += replaced
     return {
         "skipped_self_loop": sorted(skipped_self_loop),
         "replaced": replaced,
@@ -1393,8 +1443,10 @@ def do_remove_dangling_gates(session: Session, force: bool = False) -> dict[str,
     refusal = _refuse_rerun(session, remove_dangling_gates, force=force)
     if refusal is not None:
         return refusal
+    removed = remove_dangling_gates(_design(session))
+    _pending_count(session, "dangling_removed", removed)
     return {
-        "removed": remove_dangling_gates(_design(session)),
+        "removed": removed,
         **_rerun_conflict_fields(session, remove_dangling_gates),
     }
 
@@ -1403,8 +1455,10 @@ def do_deduplicate_gates(session: Session, force: bool = False) -> dict[str, Any
     refusal = _refuse_rerun(session, deduplicate_gates, force=force)
     if refusal is not None:
         return refusal
+    merged = deduplicate_gates(_design(session))
+    _pending_count(session, "dedup_merged", merged)
     return {
-        "merged": deduplicate_gates(_design(session)),
+        "merged": merged,
         **_rerun_conflict_fields(session, deduplicate_gates),
     }
 
@@ -1426,8 +1480,10 @@ def do_collapse_inverter_buffer_chains(session: Session, force: bool = False) ->
     refusal = _refuse_rerun(session, collapse_inverter_buffer_chains, force=force)
     if refusal is not None:
         return refusal
+    collapsed = collapse_inverter_buffer_chains(_design(session))
+    _pending_count(session, "inverter_buffer_removed", collapsed)
     return {
-        "collapsed": collapse_inverter_buffer_chains(_design(session)),
+        "collapsed": collapsed,
         **_rerun_conflict_fields(session, collapse_inverter_buffer_chains),
     }
 
@@ -1440,8 +1496,15 @@ def do_simplify_constant_inputs(
     refusal = _refuse_rerun(session, simplify_constant_inputs, gts, force=force)
     if refusal is not None:
         return refusal
+    by_type: dict[GateType, int] = {}
+    simplified = simplify_constant_inputs(design, gts, by_type)
+    # Every in-scope type gets a key, 0 included: "swept, found none" is true.
+    for gt in sorted(gts if gts is not None else TWO_INPUT_GATES, key=lambda g: g.name):
+        _pending_count(session, f"const_eliminated:{gt.name}", by_type.get(gt, 0))
+    # The TOTAL of simplify within this request (accumulates over calls): the fallback for a question that names no type.
+    _pending_count(session, "simplify_last_run_total", simplified)
     return {
-        "simplified": simplify_constant_inputs(design, gts),
+        "simplified": simplified,
         **_rerun_conflict_fields(session, simplify_constant_inputs, gts),
     }
 
@@ -1492,10 +1555,17 @@ def do_remap_to_basis(
     refusal = _refuse_rerun(session, remap_to_basis, *rerun_args, force=force)
     if refusal is not None:
         return refusal
+    before = gate_count_by_type(design)
     try:
         replaced = remap_to_basis(design, basis_key, only_gates)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+    # Same rule as `router._record_nand_nor_added`, delta computed here.
+    after = gate_count_by_type(_design(session))
+    if basis_key == "nand_not":
+        _pending_count(session, "nand_added", after.get(GateType.NAND, 0) - before.get(GateType.NAND, 0))
+    elif basis_key == "nor_not":
+        _pending_count(session, "nor_added", after.get(GateType.NOR, 0) - before.get(GateType.NOR, 0))
     return {
         "replaced": replaced,
         "scope": scope,
@@ -1709,7 +1779,9 @@ TOOL_SCHEMA: list[ToolSpec] = [
         f"'{_CURRENT_TOTALS_NOT_A_CHANGE_KEY}' and "
         f"'{_RECORDED_CHANGE_KEY}', which holds the recorded per-type change; "
         "use that, or get_last_operation_summary, for any question about what "
-        "an operation changed.",
+        "an operation changed. Its last_op_count and last_gate_delta are written "
+        "only by the built-in rule path, so they can describe an older operation "
+        "than op_counts records; the per-family count is the one in op_counts.",
         _schema({}),
     ),
     ToolSpec(
@@ -2052,15 +2124,19 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "count per question family (buffers_added, dangling_removed, dedup_merged, const_eliminated:<GATE_TYPE>, "
         "inverter_buffer_removed, nand_added, nor_added); for a 'how many X were added/removed/merged' question "
         "read the matching op_counts key, since last_op_count is only the single most recent operation of any kind. "
-        "A missing key does NOT prove the operation was never done: the do_* tools do not record op_counts "
-        "(each reports its own count in its own result). "
+        "A missing key does NOT prove the operation was never done: operations with no family key do not "
+        "appear, and a do_* tool's count is added to op_counts only when the request it ran in ends (so not "
+        "this turn; each do_* result reports its own count). simplify_last_run_total is the total of the latest simplify across all gate types "
+        "(rule path: the latest operation; do_* path: the sum of the simplify calls within the latest request that ran one). "
         "The enable/hold count "
         "is formally PROVEN flip-flops only; last_enable_hold_simulated_only is how many more could not "
         "be settled (may also have one) and last_enable_hold_not_examined how many the time budget cut "
         "off, so when either is above 0 the true number may be higher. The floating and enable/hold counts "
         "are the numbers from the last check; if a transform has run since, they may be out of date -- for "
-        "the number NOW, re-check (floating: check_floating_signals). A null field means NO "
-        "such operation has run yet since the current design was loaded -- it does NOT mean the operation ran and found zero; "
+        "the number NOW, re-check (floating: check_floating_signals). last_op_count and last_gate_delta are written only by the built-in rule path; do_* tools never "
+        "update them, so they can describe an older operation than the one op_counts records. The per-family count is the one in op_counts. "
+        "A null field means the RULE PATH has run NO "
+        "such operation yet since the current design was loaded -- it does NOT mean the operation ran and found zero; "
         f"an operation that found zero reports 0. Do not quote a null as a count. {_UNAFFECTED_BY_THIS_TURNS_TOOL_CALLS_KEY!r} "
         f"is always true: these counters describe the user's PREVIOUS request, and are deliberately not "
         f"refreshed by any tool call made THIS turn (including a do_* tool this same turn already called) "

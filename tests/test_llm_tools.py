@@ -7,6 +7,7 @@ behavior on bad gate/signal/net references.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import pathlib
@@ -21,7 +22,18 @@ from netlist_agent.analysis import find_floating_signals
 from dataclasses import replace
 
 from netlist_agent.graph import NetlistGraph
-from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, Port, Signal, design_fingerprint
+from netlist_agent.ir import (
+    Const,
+    Design,
+    Direction,
+    Gate,
+    GateType,
+    NetBit,
+    Port,
+    Signal,
+    TWO_INPUT_GATES,
+    design_fingerprint,
+)
 from netlist_agent.llm import tools_schema
 from netlist_agent.llm.tools_schema import (
     TOOL_REGISTRY,
@@ -2596,3 +2608,750 @@ def test_get_last_operation_summary_reports_op_counts_per_family(tmp_path) -> No
     assert summary["last_op_count"] == 2  # the single cell only has the latest
     summary["op_counts"]["x"] = 1
     assert "x" not in session.op_counts  # a copy, not the live dict
+
+
+# ----------------------------------------------------------------------
+# Batch 32b: do_* tools park their counts per question family in
+# `session.pending_op_counts` (committed by `commit_tool_turn_counts()` when
+# the request ends). U5-U9.
+# ----------------------------------------------------------------------
+
+_SIMPLIFY_FAMILIES = tuple(f"const_eliminated:{gt.name}" for gt in sorted(TWO_INPUT_GATES, key=lambda g: g.name))
+
+# U9: every `do_*` function and the pending keys it may write. An empty tuple is the explicit
+# "writes no family key"; "functional_change_ops" marks the one tool that feeds that counter instead.
+_DO_TOOL_WRITES: dict[str, tuple[str, ...]] = {
+    "do_limit_fanout_global": ("buffers_added",),
+    "do_limit_fanout_net": ("buffers_added",),
+    "do_insert_buffer_per_load": ("buffers_added",),
+    "do_balance_depth_to_sinks": ("buffers_added",),
+    "do_remove_dangling_gates": ("dangling_removed",),
+    "do_deduplicate_gates": ("dedup_merged",),
+    "do_collapse_inverter_buffer_chains": ("inverter_buffer_removed",),
+    "do_simplify_constant_inputs": (*_SIMPLIFY_FAMILIES, "simplify_last_run_total"),
+    "do_remap_to_basis": ("nand_added", "nor_added"),
+    "do_replace_buf_with_and": ("functional_change_ops",),
+    "do_collapse_double_inverters": (),
+    "do_optimize_depth": (),
+    "do_optimize_cone_depth": (),
+    "do_optimize_gate_count": (),
+    "do_optimize_cone_gate_count": (),
+}
+
+_CONST_V = """module top3(a, b, c, y1, y2, y3, y4);
+  input a, b, c;
+  output y1, y2, y3, y4;
+  wire a, b, c, y1, y2, y3, y4, n1o, x1o, x2o;
+  nand n1(n1o, a, 1'b1);
+  xor x1(x1o, b, 1'b0);
+  xor x2(x2o, c, 1'b0);
+  or o1(y1, n1o, x1o);
+  and o2(y2, x2o, a);
+  buf u(y3, b);
+  buf u2(y4, c);
+endmodule
+"""
+
+
+_XOR_V = """module tx(a, b, y);
+  input a, b;
+  output y;
+  wire a, b, y;
+  xor x1(y, a, b);
+endmodule
+"""
+
+
+def _session_from_text(tmp_path, text: str, name: str = "d.v") -> Session:
+    path = tmp_path / name
+    path.write_text(text)
+    session = Session()
+    session.current_design = parse_verilog(str(path))
+    session.original_snapshot = parse_verilog(str(path))
+    session.load_dir = str(tmp_path)
+    return session
+
+
+def _nand_count(session: Session) -> int:
+    return sum(1 for g in session.current_design.gates if g.gate_type == GateType.NAND)
+
+
+def _nor_count(session: Session) -> int:
+    return sum(1 for g in session.current_design.gates if g.gate_type == GateType.NOR)
+
+
+# (tool, kwargs, result key holding the count, family it must be parked under)
+_U5_ROWS = [
+    ("do_limit_fanout_global", {"max_fanout": 2}, "buffers_added", "buffers_added"),
+    ("do_limit_fanout_net", {"net": "n10", "max_fanout": 2}, "buffers_added", "buffers_added"),
+    ("do_insert_buffer_per_load", {"net": "n10"}, "buffers_added", "buffers_added"),
+    ("do_balance_depth_to_sinks", {"source": "n10", "sinks": ["n20", "n11"]}, "buffers_added", "buffers_added"),
+    ("do_remove_dangling_gates", {}, "removed", "dangling_removed"),
+    ("do_deduplicate_gates", {}, "merged", "dedup_merged"),
+    ("do_collapse_inverter_buffer_chains", {}, "collapsed", "inverter_buffer_removed"),
+]
+
+
+@pytest.mark.parametrize("tool, kwargs, result_key, family", _U5_ROWS, ids=[r[0] for r in _U5_ROWS])
+def test_u5_do_tool_parks_its_count_under_its_family(tmp_path, tool, kwargs, result_key, family) -> None:
+    """32b U5. kills: a do_* tool that forgets its `_pending_count` call, writes the wrong family, or
+    parks a number other than the one it returns; commit that does not fold pending into op_counts."""
+    session = _new_session(tmp_path)
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    count = result[result_key]
+    assert count > 0, "fixture gives no signal for this tool (a 0 would pass vacuously)"
+    assert family in _DO_TOOL_WRITES[tool]
+    assert session.pending_op_counts == {family: count}
+    assert session.op_counts == {}  # E1: nothing is visible before the commit
+    assert session.pending_functional_change_ops == 0
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {family: count}
+    assert session.pending_op_counts == {}
+
+
+# 32b F4: a 2-bit bus whose bits have DIFFERENT load counts (6 and 3), so the per-bit buffer
+# counts differ and `sum(per_bit)` is distinguishable from `per_bit[-1]`.
+_BUS_FANOUT_V = """module bus(w, y0, y1, y2, y3, y4, y5, z0, z1, z2);
+  input [1:0] w;
+  output y0, y1, y2, y3, y4, y5, z0, z1, z2;
+  wire [1:0] w;
+  not a0(y0, w[0]);
+  not a1(y1, w[0]);
+  not a2(y2, w[0]);
+  not a3(y3, w[0]);
+  not a4(y4, w[0]);
+  not a5(y5, w[0]);
+  not b0(z0, w[1]);
+  not b1(z1, w[1]);
+  not b2(z2, w[1]);
+endmodule
+"""
+
+
+@pytest.mark.parametrize(
+    "tool, kwargs",
+    [
+        ("do_limit_fanout_net", {"net": "w", "max_fanout": 2}),
+        ("do_insert_buffer_per_load", {"net": "w"}),
+    ],
+)
+def test_u5_multi_bit_net_parks_the_sum_over_bits(tmp_path, tool, kwargs) -> None:
+    """32b F4. kills: `sum(per_bit)` -> `per_bit[-1]` (or [0]) in the pending write of either tool."""
+    per_bit = []
+    for bit in (0, 1):
+        probe = _session_from_text(tmp_path, _BUS_FANOUT_V, f"probe{bit}.v")
+        r = TOOL_REGISTRY[tool](probe, **{**kwargs, "net": f"w[{bit}]"})
+        per_bit.append(r["buffers_added"])
+    assert per_bit[0] > 0 and per_bit[1] > 0 and per_bit[0] != per_bit[1], per_bit
+    session = _session_from_text(tmp_path, _BUS_FANOUT_V)
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result["bits_processed"] == 2
+    assert result["buffers_added"] == sum(per_bit)
+    assert session.pending_op_counts == {"buffers_added": sum(per_bit)}
+    assert session.pending_op_counts["buffers_added"] not in per_bit
+
+
+def test_u5_collapse_double_inverters_writes_no_family_key(tmp_path) -> None:
+    """32b U5 ("does not write" row). kills: someone mapping collapse_double_inverters onto a family."""
+    session = _new_session(tmp_path)
+    assert TOOL_REGISTRY["do_collapse_double_inverters"](session)["collapsed"] == 1
+    assert session.pending_op_counts == {}
+    assert session.pending_functional_change_ops == 0
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {}
+    assert session.functional_change_ops == 0
+
+
+def test_u5_replace_buf_with_and_feeds_functional_change_ops_only(tmp_path) -> None:
+    """32b U5. kills: replace_buf writing a family key; dropping the `pending_functional_change_ops` add;
+    commit that does not add it to `functional_change_ops`."""
+    session = _new_session(tmp_path)
+    session.last_query_gate_names = ["g13", "g4"]
+    result = TOOL_REGISTRY["do_replace_buf_with_and"](session, ctrl_net="n2")
+    assert result["replaced"] == 2
+    assert session.pending_op_counts == {}
+    assert session.pending_functional_change_ops == 2
+    assert session.functional_change_ops == 0
+    session.commit_tool_turn_counts()
+    assert session.functional_change_ops == 2
+    assert session.pending_functional_change_ops == 0
+    assert session.op_counts == {}
+
+
+def test_u5_remap_to_basis_nand_added_is_the_nand_count_difference(tmp_path) -> None:
+    """32b U5. kills: nand_added taken from `replaced` instead of the NAND delta; wrong family for nand_not."""
+    session = _session_from_text(tmp_path, _XOR_V)  # one XOR becomes several NANDs, so delta != replaced
+    before = _nand_count(session)
+    result = TOOL_REGISTRY["do_remap_to_basis"](session, basis="nand")
+    delta = _nand_count(session) - before
+    assert result["replaced"] > 0
+    assert delta > 0 and delta != result["replaced"], "pick a fixture where delta and replaced differ"
+    assert session.pending_op_counts == {"nand_added": delta}
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {"nand_added": delta}
+
+
+def test_u5_remap_to_basis_nor_added_is_the_nor_count_difference(tmp_path) -> None:
+    """32b U5. kills: nor_not mapped to nand_added (or the reverse); delta read from the wrong gate type."""
+    session = _session_from_text(tmp_path, _XOR_V)
+    before = _nor_count(session)
+    result = TOOL_REGISTRY["do_remap_to_basis"](session, basis="nor")
+    delta = _nor_count(session) - before
+    assert result["replaced"] > 0
+    assert delta > 0 and delta != result["replaced"]
+    assert session.pending_op_counts == {"nor_added": delta}
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {"nor_added": delta}
+
+
+def test_u5_remap_to_basis_and_writes_no_family_key(tmp_path) -> None:
+    """32b U5 ("does not write" row). kills: the and basis falling into the nand/nor branches."""
+    session = _new_session(tmp_path)
+    result = TOOL_REGISTRY["do_remap_to_basis"](session, basis="and")
+    assert result["replaced"] > 0
+    assert session.pending_op_counts == {}
+    assert session.pending_functional_change_ops == 0
+
+
+def test_u5_remap_to_basis_nand_that_is_a_no_op_records_zero(tmp_path) -> None:
+    """32b U5. A nand remap of NAND gates only replaces nothing: 0 is a true answer and is recorded
+    (kills: `if delta:` style guards that would leave the key missing, which the rule path reads as 0 anyway
+    but get_last_operation_summary would then not show)."""
+    session = _new_session(tmp_path)
+    assert TOOL_REGISTRY["do_remap_to_basis"](session, basis="nand", gate_type="nand")["replaced"] == 0
+    assert session.pending_op_counts == {"nand_added": 0}
+
+
+def test_u5_remap_to_basis_nor_that_is_a_no_op_records_zero(tmp_path) -> None:
+    """32b G7-4. Mirror of the nand case. The fixture has no NOR gates, so the `gate_type="nor"` scope is empty
+    and `replaced == 0`; 0 is still recorded as `nor_added: 0`
+    (kills: an `if delta:` guard around the nor_added write, which would leave the key missing)."""
+    session = _new_session(tmp_path)
+    assert TOOL_REGISTRY["do_remap_to_basis"](session, basis="nor", gate_type="nor")["replaced"] == 0
+    assert session.pending_op_counts == {"nor_added": 0}
+
+
+# ----------------------------------------------------------------------
+# U6: simplify_constant_inputs keys
+# ----------------------------------------------------------------------
+
+
+def test_u6_simplify_by_type_sums_to_the_return_value(tmp_path) -> None:
+    """32b U6. kills: by_type accumulating in only one of the two fold branches (both-const / one-const);
+    by_type keyed by the post-rewrite type."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    by_type: dict = {}
+    total = simplify_constant_inputs(session.current_design, None, by_type)
+    assert total == 3
+    assert sum(by_type.values()) == total
+    assert by_type == {GateType.NAND: 1, GateType.XOR: 2}
+
+
+def test_u6_simplify_by_type_counts_both_inputs_constant_too(tmp_path) -> None:
+    """32b U6. The both-inputs-constant branch is a separate code path from the one-constant one."""
+    text = """module t(a, y1, y2);
+  input a;
+  output y1, y2;
+  wire a, y1, y2;
+  and g1(y1, 1'b1, 1'b0);
+  or g2(y2, a, 1'b1);
+endmodule
+"""
+    session = _session_from_text(tmp_path, text)
+    by_type: dict = {}
+    total = simplify_constant_inputs(session.current_design, None, by_type)
+    assert total == 2
+    assert by_type == {GateType.AND: 1, GateType.OR: 1}
+
+
+def test_u6_simplify_without_by_type_behaves_as_before(tmp_path) -> None:
+    """32b U6. kills: by_type becoming a required argument (the omitted-argument call must still work and
+    count the same as before). Does NOT catch a mutable default shared between calls: the default is None."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    assert simplify_constant_inputs(session.current_design) == 3
+    session2 = _session_from_text(tmp_path, _CONST_V, "d2.v")
+    assert simplify_constant_inputs(session2.current_design, {GateType.NAND}) == 1
+    # the restricted sweep left the XOR gates alone
+    assert design_fingerprint(session.current_design) != design_fingerprint(session2.current_design)
+
+
+def test_u6_single_type_writes_that_type_and_the_total(tmp_path) -> None:
+    """32b U6. kills: writing keys for types outside the requested scope; missing simplify_last_run_total."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    result = TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["xor"])
+    assert result["simplified"] == 2
+    assert session.pending_op_counts == {"const_eliminated:XOR": 2, "simplify_last_run_total": 2}
+
+
+def test_u6_multi_type_writes_each_type_including_zero_and_the_total(tmp_path) -> None:
+    """32b U6. kills: skipping types whose count is 0; total taken from the last type instead of the whole run."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    result = TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["nand", "xor", "and"])
+    assert result["simplified"] == 3
+    assert session.pending_op_counts == {
+        "const_eliminated:NAND": 1,
+        "const_eliminated:XOR": 2,
+        "const_eliminated:AND": 0,
+        "simplify_last_run_total": 3,
+    }
+
+
+def test_u6_no_type_given_covers_all_two_input_types(tmp_path) -> None:
+    """32b U6. kills: default scope not being TWO_INPUT_GATES (a type missing its 0 key)."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    result = TOOL_REGISTRY["do_simplify_constant_inputs"](session)
+    assert result["simplified"] == 3
+    expected = {f: 0 for f in _SIMPLIFY_FAMILIES}
+    expected["const_eliminated:NAND"] = 1
+    expected["const_eliminated:XOR"] = 2
+    expected["simplify_last_run_total"] = 3
+    assert session.pending_op_counts == expected
+    assert len(_SIMPLIFY_FAMILIES) == len(TWO_INPUT_GATES) == 6
+
+
+# ----------------------------------------------------------------------
+# U7: refusals and ToolErrors leave both pending cells alone
+# ----------------------------------------------------------------------
+
+
+def _mark_as_already_reported(session: Session, fn_name: str, *args: object) -> None:
+    session.last_op_kind = fn_name
+    session.last_op_args = tools_schema._normalize_op_args(*args)
+    session.last_op_count = 4
+
+
+_U7_REFUSALS = [
+    ("do_deduplicate_gates", {}, "deduplicate_gates", ()),
+    ("do_remove_dangling_gates", {}, "remove_dangling_gates", ()),
+    ("do_collapse_inverter_buffer_chains", {}, "collapse_inverter_buffer_chains", ()),
+    ("do_limit_fanout_global", {"max_fanout": 2}, "limit_fanout", (2,)),
+    # router only ever calls simplify with a type set, so `(None,)` is a state it cannot create
+    ("do_simplify_constant_inputs", {"gate_types": ["xor"]}, "simplify_constant_inputs", ({GateType.XOR},)),
+    # batch 32b G7-3: the four tools the first five rows did not cover (n10/n20 are single-bit nets: NetBit(name, None))
+    ("do_limit_fanout_net", {"net": "n10", "max_fanout": 3}, "limit_fanout_net", ([NetBit("n10")], 3)),
+    ("do_insert_buffer_per_load", {"net": "n10"}, "insert_buffer_per_load", ([NetBit("n10")],)),
+    (
+        "do_balance_depth_to_sinks",
+        {"source": "n10", "sinks": ["n20"]},
+        "balance_depth_to_sinks",
+        (NetBit("n10"), [NetBit("n20")]),
+    ),
+    ("do_remap_to_basis", {"basis": "and"}, "remap_to_basis", ("and_not",)),
+]
+
+
+@pytest.mark.parametrize("tool, kwargs, fn_name, args", _U7_REFUSALS, ids=[r[0] for r in _U7_REFUSALS])
+def test_u7_refused_rerun_does_not_touch_pending(tmp_path, tool, kwargs, fn_name, args) -> None:
+    """32b U7. kills: moving a `_pending_count` call above the `_refuse_rerun` check (a refused rerun would
+    overwrite the family with a count for work that never ran)."""
+    session = _new_session(tmp_path)
+    _mark_as_already_reported(session, fn_name, *args)
+    session.pending_op_counts = {"sentinel": 5}
+    session.pending_functional_change_ops = 3
+    before = design_fingerprint(session.current_design)
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result[_MUTATION_PERFORMED_KEY] is False, "precondition: this call must be a refusal"
+    assert design_fingerprint(session.current_design) == before
+    assert session.pending_op_counts == {"sentinel": 5}
+    assert session.pending_functional_change_ops == 3
+
+
+def test_u7_refused_replace_buf_does_not_add_to_functional_change_ops(tmp_path) -> None:
+    """32b U7. kills: the `pending_functional_change_ops += replaced` line sitting before the refusal check."""
+    session = _new_session(tmp_path)
+    session.last_query_gate_names = ["g13"]
+    ctrl = tools_schema._resolve_bit(session.current_design, "n2")
+    _mark_as_already_reported(session, "replace_buf_with_and", ["g13"], ctrl, [])
+    result = TOOL_REGISTRY["do_replace_buf_with_and"](session, ctrl_net="n2")
+    assert result[_MUTATION_PERFORMED_KEY] is False
+    assert session.pending_functional_change_ops == 0
+    assert session.pending_op_counts == {}
+
+
+_U7_TOOL_ERRORS = [
+    ("do_limit_fanout_global", {"max_fanout": 0}),
+    ("do_limit_fanout_net", {"net": "no_such_net", "max_fanout": 2}),
+    ("do_remap_to_basis", {"basis": "xor"}),
+    ("do_replace_buf_with_and", {"ctrl_net": "no_such_net"}),
+    ("do_balance_depth_to_sinks", {"source": "no_such_net", "sinks": ["n20"]}),
+    # R8-1: these two deliberately avoid name resolution and raise from the tool's own `except ValueError`.
+    # The rows above fail elsewhere: do_limit_fanout_global's row also goes through its own `except ValueError`,
+    # do_remap_to_basis fails in `_basis()` validation, the rest fail in `_resolve_*` name resolution.
+    ("do_limit_fanout_net", {"net": "n10", "max_fanout": 0}),
+    ("do_balance_depth_to_sinks", {"source": "n10", "sinks": []}),
+]
+# unique ids; the first row of each tool keeps the bare tool name, a repeat gets `-except`
+_U7_IDS = [t if [r[0] for r in _U7_TOOL_ERRORS].index(t) == i else f"{t}-except" for i, (t, _k) in enumerate(_U7_TOOL_ERRORS)]
+
+
+@pytest.mark.parametrize("tool, kwargs", _U7_TOOL_ERRORS, ids=_U7_IDS)
+def test_u7_tool_error_does_not_touch_pending(tmp_path, tool, kwargs) -> None:
+    """32b U7. kills: a pending write placed before the call that can raise ToolError."""
+    session = _new_session(tmp_path)
+    session.pending_op_counts = {"sentinel": 5}
+    session.pending_functional_change_ops = 3
+    with pytest.raises(ToolError):
+        TOOL_REGISTRY[tool](session, **kwargs)
+    assert session.pending_op_counts == {"sentinel": 5}
+    assert session.pending_functional_change_ops == 3
+
+
+# ----------------------------------------------------------------------
+# U8: count_gates_by_type carries op_counts
+# ----------------------------------------------------------------------
+
+
+def test_u8_count_gates_by_type_carries_op_counts_after_a_rule_path_operation(tmp_path) -> None:
+    """32b U8. kills: the `op_counts` copy missing from the recorded-change dict."""
+    session = _new_session(tmp_path)
+    session.last_op_count = 2
+    session.last_op_kind = "deduplicate_gates"
+    session.op_counts = {"dedup_merged": 2, "buffers_added": 1}
+    recorded = TOOL_REGISTRY["count_gates_by_type"](session)[tools_schema._RECORDED_CHANGE_KEY]
+    assert recorded["op_counts"] == {"dedup_merged": 2, "buffers_added": 1}
+    assert recorded["op_counts"] is not session.op_counts  # a copy
+
+
+def test_u8_count_gates_by_type_shows_a_change_recorded_only_by_the_llm_path(tmp_path) -> None:
+    """32b U8. kills: the appearance condition staying `last_op_kind is not None` (an LLM-only session
+    would never see its own recorded counts here)."""
+    session = _new_session(tmp_path)
+    assert TOOL_REGISTRY["do_deduplicate_gates"](session)["merged"] == 1
+    session.commit_tool_turn_counts()
+    assert session.last_op_kind is None
+    result = TOOL_REGISTRY["count_gates_by_type"](session)
+    assert result[tools_schema._CURRENT_TOTALS_NOT_A_CHANGE_KEY] is True
+    recorded = result[tools_schema._RECORDED_CHANGE_KEY]
+    assert recorded["op_counts"] == {"dedup_merged": 1}
+    assert recorded["last_op_count"] is None
+
+
+def test_u8_count_gates_by_type_stays_lean_when_nothing_is_recorded(tmp_path) -> None:
+    """32b U8. kills: the condition becoming always-true (e.g. `or session.op_counts is not None`)."""
+    session = _new_session(tmp_path)
+    assert session.last_op_kind is None and session.op_counts == {}
+    assert set(TOOL_REGISTRY["count_gates_by_type"](session)) == {"total", "by_type"}
+
+
+def test_u8_count_gates_by_type_ignores_this_turns_pending_counts(tmp_path) -> None:
+    """32b U8 (E9: committed values only). kills: the condition or the copy reading pending_op_counts."""
+    session = _new_session(tmp_path)
+    assert TOOL_REGISTRY["do_deduplicate_gates"](session)["merged"] == 1
+    assert session.pending_op_counts == {"dedup_merged": 1}
+    assert set(TOOL_REGISTRY["count_gates_by_type"](session)) == {"total", "by_type"}
+
+
+# ----------------------------------------------------------------------
+# U9: every do_* function is classified
+# ----------------------------------------------------------------------
+
+
+def _real_do_tools() -> set[str]:
+    return {
+        name
+        for name, fn in inspect.getmembers(tools_schema, inspect.isfunction)
+        if name.startswith("do_") and fn.__module__ == tools_schema.__name__
+    }
+
+
+def test_u9_every_do_tool_is_classified_in_the_writes_table() -> None:
+    """32b U9. kills: a new do_* tool added without deciding which family (or none) it writes."""
+    unclassified = _real_do_tools() - set(_DO_TOOL_WRITES)
+    assert not unclassified, f"classify these do_* tools in _DO_TOOL_WRITES: {sorted(unclassified)}"
+
+
+def test_u9_the_writes_table_names_no_tool_that_does_not_exist() -> None:
+    """32b U9. kills: a stale table entry for a renamed/removed tool."""
+    ghosts = set(_DO_TOOL_WRITES) - _real_do_tools()
+    assert not ghosts, f"_DO_TOOL_WRITES names tools that do not exist: {sorted(ghosts)}"
+
+
+def test_u9_table_families_are_keys_the_readers_know() -> None:
+    """32b U9. kills: a typo'd family in the table (it would otherwise be self-consistent and pass)."""
+    known = {"buffers_added", "dangling_removed", "dedup_merged", "inverter_buffer_removed", "nand_added",
+             "nor_added", "simplify_last_run_total", "functional_change_ops", *_SIMPLIFY_FAMILIES}
+    for tool, fams in _DO_TOOL_WRITES.items():
+        assert set(fams) <= known, (tool, set(fams) - known)
+
+
+def test_u9_u5_rows_stay_inside_the_table(tmp_path) -> None:
+    """32b U9. Behavior cross-check: whatever the U5 tools actually park must be declared in the table."""
+    for tool, kwargs, _result_key, _family in _U5_ROWS:
+        session = _new_session(tmp_path)
+        TOOL_REGISTRY[tool](session, **kwargs)
+        assert set(session.pending_op_counts) <= set(_DO_TOOL_WRITES[tool]), tool
+
+
+# 32b F5: the four ABC-backed optimizers write nothing. ABC is replaced by a fixed result.
+def _fake_depth_result(design):
+    from netlist_agent.abc_synth import DepthOptResult
+
+    return DepthOptResult(design=design, changed=True, depth_before=5, depth_after=3, note="fake")
+
+
+def _fake_area_result(design):
+    from netlist_agent.abc_synth import AreaOptResult
+
+    return AreaOptResult(
+        design=design, changed=True, gates_before=9, gates_after=7, depth_before=5, depth_after=4, note="fake"
+    )
+
+
+_F5_ROWS = [
+    ("do_optimize_depth", {}, "optimize_depth", _fake_depth_result),
+    ("do_optimize_cone_depth", {"net": "n20"}, "optimize_cone_depth", _fake_depth_result),
+    ("do_optimize_gate_count", {}, "optimize_gate_count", _fake_area_result),
+    ("do_optimize_cone_gate_count", {"net": "n20"}, "optimize_cone_gate_count", _fake_area_result),
+]
+
+
+@pytest.mark.parametrize("tool, kwargs, symbol, fake", _F5_ROWS, ids=[r[0] for r in _F5_ROWS])
+def test_f5_optimize_tools_park_nothing(tmp_path, monkeypatch, tool, kwargs, symbol, fake) -> None:
+    """32b F5. kills: an ABC optimizer starting to write a family key / the functional-change counter
+    (the table says it writes nothing; this checks the behavior, with ABC replaced by a fixed result)."""
+    session = _new_session(tmp_path)
+    monkeypatch.setattr(tools_schema, symbol, lambda design, *a, **k: fake(design))
+    session.pending_functional_change_ops = 2
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result["changed"] is True, "precondition: the faked optimizer result reached the tool"
+    assert _DO_TOOL_WRITES[tool] == ()
+    assert session.pending_op_counts == {}
+    assert session.pending_functional_change_ops == 2
+    assert session.op_counts == {}
+
+
+# ----------------------------------------------------------------------
+# 32b F1: same family, same request accumulates
+# ----------------------------------------------------------------------
+
+# Two-level duplicates, upper level listed first: one pass merges only d1/d2 (the e gates
+# were already examined), a second pass then merges e1/e2.
+_TWO_LEVEL_DEDUP_V = """module tl(a, b, c, y);
+  input a, b, c;
+  output y;
+  wire a, b, c, y, m1, m2, p1, p2;
+  or e1(p1, m1, c);
+  or e2(p2, m2, c);
+  and d1(m1, a, b);
+  and d2(m2, a, b);
+  xor z(y, p1, p2);
+endmodule
+"""
+
+
+def test_f1_two_dedup_calls_in_one_request_sum(tmp_path) -> None:
+    """32b F1. kills: `_pending_count` assigning instead of accumulating (the later call would win).
+    The design is built so the second (forced) pass really merges one more gate: 1 then 1 -> 2."""
+    session = _session_from_text(tmp_path, _TWO_LEVEL_DEDUP_V)
+    first = TOOL_REGISTRY["do_deduplicate_gates"](session)
+    second = TOOL_REGISTRY["do_deduplicate_gates"](session, force=True)
+    assert first["merged"] == 1 and second["merged"] == 1
+    assert session.pending_op_counts == {"dedup_merged": 2}
+
+
+def test_f1_nonzero_then_zero_keeps_the_nonzero(tmp_path) -> None:
+    """32b F1. kills: assignment semantics (a later 0 would erase the earlier count)."""
+    session = _session_from_text(tmp_path, _TWO_LEVEL_DEDUP_V)
+    TOOL_REGISTRY["do_deduplicate_gates"](session)
+    TOOL_REGISTRY["do_deduplicate_gates"](session, force=True)
+    third = TOOL_REGISTRY["do_deduplicate_gates"](session, force=True)
+    assert third["merged"] == 0
+    assert session.pending_op_counts == {"dedup_merged": 2}
+
+
+def test_f1_two_simplify_calls_of_different_types_total_is_the_sum(tmp_path) -> None:
+    """32b F1. kills: simplify_last_run_total holding only the last call's total."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["NAND"])
+    TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["XOR"])
+    assert session.pending_op_counts["const_eliminated:NAND"] == 1
+    assert session.pending_op_counts["const_eliminated:XOR"] == 2
+    assert session.pending_op_counts["simplify_last_run_total"] == 3
+
+
+# ----------------------------------------------------------------------
+# 32b F8: deterministic key order
+# ----------------------------------------------------------------------
+
+
+def test_f8_simplify_keys_are_in_name_order(tmp_path) -> None:
+    """32b F8. kills: iterating the TWO_INPUT_GATES set directly (order depends on hash seed;
+    may survive under a lucky PYTHONHASHSEED)."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    TOOL_REGISTRY["do_simplify_constant_inputs"](session)
+    keys = [k for k in session.pending_op_counts if k.startswith("const_eliminated:")]
+    assert keys == sorted(keys)
+    assert len(keys) == len(TWO_INPUT_GATES)
+
+
+# ----------------------------------------------------------------------
+# 32b R2-2: accumulation at the call sites (not only in the helper)
+# ----------------------------------------------------------------------
+
+# g1 is the only constant-input gate on the first sweep; g2 only becomes one after g1 folds.
+_CASCADE_V = """module cas(a, b, y);
+  input a, b;
+  output y;
+  wire a, b, y, w;
+  and g2(y, w, b);
+  and g1(w, a, 1'b0);
+endmodule
+"""
+
+_NAND_V = """module nn(a, b, c, y1, y2);
+  input a, b, c;
+  output y1, y2;
+  wire a, b, c, y1, y2;
+  xor x1(y1, a, b);
+  xnor x2(y2, b, c);
+endmodule
+"""
+
+
+def test_r2_same_type_simplify_twice_accumulates_per_type_key(tmp_path) -> None:
+    """32b R2-2. kills: `do_simplify_constant_inputs` assigning (not accumulating) `const_eliminated:<GT>`
+    or `simplify_last_run_total` at the call site (the helper-level test cannot see that)."""
+    session = _session_from_text(tmp_path, _CASCADE_V)
+    first = TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["AND"])
+    second = TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["AND"], force=True)
+    assert (first["simplified"], second["simplified"]) == (1, 1)
+    assert session.pending_op_counts["const_eliminated:AND"] == 2
+    assert session.pending_op_counts["simplify_last_run_total"] == 2
+
+
+def test_r2_two_nand_remaps_in_one_request_sum(tmp_path) -> None:
+    """32b R2-2. kills: `do_remap_to_basis` assigning `nand_added` at the call site (the second remap would win)."""
+    session = _session_from_text(tmp_path, _NAND_V)
+    before = _nand_count(session)
+    TOOL_REGISTRY["do_remap_to_basis"](session, basis="nand", gate_type="xor")
+    first_delta = _nand_count(session) - before
+    TOOL_REGISTRY["do_remap_to_basis"](session, basis="nand", gate_type="xnor")
+    total_delta = _nand_count(session) - before
+    assert 0 < first_delta < total_delta
+    assert session.pending_op_counts["nand_added"] == total_delta
+
+
+@pytest.mark.parametrize("tool, kwargs, result_key, family", _U5_ROWS, ids=[r[0] for r in _U5_ROWS])
+def test_r3_every_u5_tool_accumulates_onto_an_earlier_count(tmp_path, tool, kwargs, result_key, family) -> None:
+    """32b R3-1, prefilled per R4-2. kills: any single `_pending_count` call site in a do_* tool turning
+    into an assignment, a keep-first (`setdefault`) or a `max` -- the earlier 100 stands in for a previous
+    call in the same request, and only `100 + count` with `count > 0` tells all three apart. (Calling the
+    tool twice did not: the second call returns 0 for six of the seven rows, so keep-first and `max`
+    survived.)"""
+    session = _new_session(tmp_path)
+    session.pending_op_counts[family] = 100
+    count = TOOL_REGISTRY[tool](session, **kwargs)[result_key]
+    assert count > 0, "fixture gives no signal for this tool (a 0 would make `max` and keep-first pass)"
+    assert session.pending_op_counts[family] == 100 + count
+
+
+def test_r3_two_nor_remaps_in_one_request_sum(tmp_path) -> None:
+    """32b R3-1. kills: `do_remap_to_basis` assigning `nor_added` at the call site (the second remap would win)."""
+    session = _session_from_text(tmp_path, _NAND_V)
+    before = _nor_count(session)
+    TOOL_REGISTRY["do_remap_to_basis"](session, basis="nor", gate_type="xor")
+    first_delta = _nor_count(session) - before
+    TOOL_REGISTRY["do_remap_to_basis"](session, basis="nor", gate_type="xnor")
+    total_delta = _nor_count(session) - before
+    assert 0 < first_delta < total_delta
+    assert session.pending_op_counts["nor_added"] == total_delta
+
+
+def test_r4_two_replace_buf_calls_sum_functional_change_ops(tmp_path) -> None:
+    """32b R4-1. kills: `do_replace_buf_with_and` assigning (`=`) or taking `max` into
+    `pending_functional_change_ops` -- it does not go through `_pending_count`, so R3-1 never reaches it.
+    R5-4: the first call names `g0` (an AND, not a BUF) too, so `replaced` (1) differs from the length of
+    the name list (2); adding `len(names)` instead of `replaced` would commit 3."""
+    session = _new_session(tmp_path)
+    a = TOOL_REGISTRY["do_replace_buf_with_and"](session, ctrl_net="n2", gate_names=["g4", "g0"])
+    b = TOOL_REGISTRY["do_replace_buf_with_and"](session, ctrl_net="n2", gate_names=["g13"])
+    assert (a["replaced"], b["replaced"]) == (1, 1)
+    assert session.pending_functional_change_ops == 2
+
+
+# ----------------------------------------------------------------------
+# 32b R2-3: do_* tools never write the rule path's `last_*` cells
+# ----------------------------------------------------------------------
+
+
+def _fresh_sentinels() -> dict:
+    """New objects per call: a shared module-level dict could be mutated in place by one row and the
+    `is` check would still pass for every later row."""
+    return {
+        "last_op_count": 7,
+        "last_op_kind": object(),  # not any transform, so `_refuse_rerun` never fires
+        "last_op_args": ("sentinel",),
+        "last_gate_delta": {GateType.AND: 9},
+    }
+
+
+def _plant_sentinels(session: Session) -> tuple[dict, dict]:
+    planted = _fresh_sentinels()
+    snapshot = {k: (v if k == "last_op_kind" else copy.deepcopy(v)) for k, v in planted.items()}
+    for name, value in planted.items():
+        setattr(session, name, value)
+    return planted, snapshot
+
+
+def _assert_sentinels_untouched(session: Session, planted: dict, snapshot: dict) -> None:
+    for name, value in planted.items():
+        assert getattr(session, name) is value, name
+        assert getattr(session, name) == snapshot[name], name
+
+
+_R2_3_ROWS = [
+    *[(t, k, "fixture") for t, k, _rk, _f in _U5_ROWS],
+    ("do_simplify_constant_inputs", {}, "const"),
+    ("do_remap_to_basis", {"basis": "nand"}, "fixture"),
+    ("do_collapse_double_inverters", {}, "fixture"),
+    ("do_replace_buf_with_and", {"ctrl_net": "n2", "gate_names": ["g4"]}, "fixture"),
+]
+
+
+def _design_fingerprint(session: Session) -> str:
+    return repr([(g.inst_name, g.gate_type, g.pins) for g in session.current_design.gates])
+
+
+@pytest.mark.parametrize("tool, kwargs, fixture", _R2_3_ROWS, ids=[r[0] for r in _R2_3_ROWS])
+def test_r2_do_tools_never_write_the_rule_path_last_cells(tmp_path, tool, kwargs, fixture) -> None:
+    """32b R2-3. kills: a do_* tool writing `last_op_count`/`last_op_kind`/`last_op_args`/`last_gate_delta`
+    (the rerun guard and the rule path's follow-up handlers own those cells)."""
+    session = _session_from_text(tmp_path, _CONST_V) if fixture == "const" else _new_session(tmp_path)
+    planted, snapshot = _plant_sentinels(session)
+    before = _design_fingerprint(session)
+    TOOL_REGISTRY[tool](session, **kwargs)
+    assert _design_fingerprint(session) != before, "precondition: the tool really changed the design"
+    _assert_sentinels_untouched(session, planted, snapshot)
+
+
+@pytest.mark.parametrize("tool, kwargs, symbol, fake", _F5_ROWS, ids=[r[0] for r in _F5_ROWS])
+def test_r2_optimize_tools_never_write_the_rule_path_last_cells(tmp_path, monkeypatch, tool, kwargs, symbol, fake) -> None:
+    """32b R2-3. Same as above for the ABC-backed optimizers (ABC replaced by a fixed result, so the
+    design itself is not asserted to change; the tool reaching its success path is)."""
+    session = _new_session(tmp_path)
+    monkeypatch.setattr(tools_schema, symbol, lambda design, *a, **k: fake(design))
+    planted, snapshot = _plant_sentinels(session)
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result["changed"] is True
+    _assert_sentinels_untouched(session, planted, snapshot)
+
+
+def test_r3_r2_3_and_f5_rows_cover_exactly_the_classified_do_tools() -> None:
+    """32b R3-3. kills: a do_* tool added to `_DO_TOOL_WRITES` (or dropped from a row list) without the
+    never-writes-last-cells tests following."""
+    assert {r[0] for r in _R2_3_ROWS} | {r[0] for r in _F5_ROWS} == set(_DO_TOOL_WRITES)
+
+
+# ----------------------------------------------------------------------
+# 32b R2-4: explicit gate_types are also written in name order
+# ----------------------------------------------------------------------
+
+
+def test_r2_explicit_gate_types_are_written_in_name_order(tmp_path) -> None:
+    """32b R2-4. kills: sorting only the no-gate_types branch (a set built from the caller's list has
+    hash-seed-dependent order; run with PYTHONHASHSEED=0 for a stable red)."""
+    session = _session_from_text(tmp_path, _CONST_V)
+    TOOL_REGISTRY["do_simplify_constant_inputs"](session, gate_types=["XOR", "NAND", "OR", "AND"])
+    keys = [k for k in session.pending_op_counts if k.startswith("const_eliminated:")]
+    assert len(keys) == 4
+    assert keys == sorted(keys)

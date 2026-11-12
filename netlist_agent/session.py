@@ -128,13 +128,17 @@ class Session:
     last_op_args: Optional[tuple] = None
 
     # Per-question-family count of the most recent operation of that family
-    # (batch 32a). `last_op_count`/`last_gate_delta` are ONE cell shared by
+    # (batch 32a; the LLM tool layer's do_* tools feed it too since batch 32b,
+    # via the pending cells below, committed when the request ends). `last_op_count`/`last_gate_delta` are ONE cell shared by
     # every transform, so "how many BUF gates were added" asked after an
     # unrelated later transform read that transform's number. Keys are
     # question families written explicitly by each rule-routed handler in
     # router.py: `buffers_added`, `dangling_removed`, `dedup_merged`,
     # `const_eliminated:<GATE_TYPE>`, `inverter_buffer_removed`, `nand_added`,
-    # `nor_added`. Same family: the latest write wins (no summing). A
+    # `nor_added`, `simplify_last_run_total` (the TOTAL of the latest simplify,
+    # whatever types it touched). Same family: the rule path writes once per
+    # operation (latest wins); the LLM path SUMS within one request and the
+    # latest request wins across requests. A
     # handler that raised ValueError writes nothing. The 7 count follow-up
     # handlers read this, and answer 0 when the family has no entry. The
     # `last_op_*` cells above are deliberately untouched: the tool layer's
@@ -143,6 +147,17 @@ class Session:
     # transform. `_enforce_structural_constraints`' buffers are not counted
     # (known limitation).
     op_counts: dict[str, int] = field(default_factory=dict)
+
+    # Batch 32b: counts written by the LLM tool layer's do_* tools DURING one
+    # request. Not written into `op_counts` directly, because
+    # `get_last_operation_summary` promises that this turn's tool calls do not
+    # refresh it. `LLMClient.answer` clears these on entry and calls
+    # `commit_tool_turn_counts` in its `finally`, so a later (rule-routed)
+    # request reads them. `pending_op_counts` is per-design (cleared by
+    # `reset_per_design_state`); `pending_functional_change_ops` is a
+    # cross-design total like `functional_change_ops`.
+    pending_op_counts: dict[str, int] = field(default_factory=dict)
+    pending_functional_change_ops: int = 0
 
     # Instance names of gates that matched the most recent "find all the
     # gates whose name includes X"-style query -- consumed by a later
@@ -293,7 +308,7 @@ class Session:
         the new one (batch 24).
 
         Resets: the transform counters (`last_op_count`, `last_gate_delta`,
-        `last_op_kind`, `last_op_args`, `op_counts`) and the query results
+        `last_op_kind`, `last_op_args`, `op_counts`, `pending_op_counts`) and the query results
         (`last_query_gate_names`, `last_floating_count`,
         `last_enable_hold_count`, `last_enable_hold_not_examined`,
         `last_enable_hold_simulated_only`, `last_enable_hold_fingerprint`) and their "previous number"
@@ -317,7 +332,7 @@ class Session:
         and re-enforced as before. A different path with identical content
         counts as a different design.
 
-        Not reset: `functional_change_ops` (a
+        Not reset: `functional_change_ops` and `pending_functional_change_ops` (a
         cross-design running total), and the testcase/log-level fields
         (`case_name`, `log_*`, `pending_log`, `next_response_id`, write
         failure counters). Also does not touch `current_design`,
@@ -338,6 +353,7 @@ class Session:
         self.last_op_kind = None
         self.last_op_args = None
         self.op_counts = {}
+        self.pending_op_counts = {}
         self.last_query_gate_names = []
         self.last_floating_count = None
         self.last_enable_hold_count = None
@@ -350,6 +366,17 @@ class Session:
         self.prev_enable_hold_simulated_only = 0
         if not keep_structural_constraints:
             self.structural_constraints = []
+
+    def commit_tool_turn_counts(self) -> None:
+        """Fold this request's pending LLM-tool counts into `op_counts` /
+        `functional_change_ops`, then clear them (batch 32b). Calls within
+        one request were summed into the pending cells; across requests the
+        same family's latest request wins (`update`). The rule path writes
+        once per operation."""
+        self.op_counts.update(self.pending_op_counts)
+        self.functional_change_ops += self.pending_functional_change_ops
+        self.pending_op_counts = {}
+        self.pending_functional_change_ops = 0
 
     def mirror_rename(self, kind: str, old_name: str, new_name: str) -> None:
         """Mirror a successful rename in `current_design` onto

@@ -157,6 +157,7 @@ _RESET_ON_LOAD = frozenset(
         "last_op_kind",
         "last_op_args",
         "op_counts",  # batch 32a: per-family counts
+        "pending_op_counts",  # batch 32b: this request's do_* counts, per design
         "last_query_gate_names",
         "last_floating_count",
         "last_enable_hold_count",
@@ -179,6 +180,7 @@ _KEPT_ON_LOAD = frozenset(
         "load_filename",
         # deliberately kept (see `Session.reset_per_design_state`)
         "functional_change_ops",
+        "pending_functional_change_ops",  # batch 32b: cross-design, like the total it feeds
         "case_name",
         "log_path",
         "log_file",
@@ -296,6 +298,7 @@ def test_reset_per_design_state_keeps_every_kept_field() -> None:
         "load_dir": "dirX",
         "load_filename": "fileX.v",
         "functional_change_ops": 9,
+        "pending_functional_change_ops": 7,
         "case_name": "testZ",
         "log_path": "pathX",
         "log_file": object(),
@@ -1005,3 +1008,30 @@ def test_is_reload_of_relative_path_against_absolute_is_true(tmp_path, monkeypat
     session = Session()
     session.load_dir, session.load_filename = ".", "a.v"
     assert session.is_reload_of(str(tmp_path), "a.v")
+
+
+def test_g7_commit_is_last_request_wins_across_requests() -> None:
+    """32b G7-1. kills: cross-request accumulation (step 2 would give dedup_merged 5), dropping a 0 value
+    (step 3 would keep 1), first-wins `{**pending, **op_counts}` (step 2 would keep 4), per-key `min`
+    (step 4 would keep 0)."""
+    session = Session()
+    assert session.op_counts == {}
+    session.pending_op_counts = {"dedup_merged": 4, "buffers_added": 2}
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {"dedup_merged": 4, "buffers_added": 2}
+    assert session.pending_op_counts == {}
+
+    session.pending_op_counts = {"dedup_merged": 1}
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {"dedup_merged": 1, "buffers_added": 2}
+    assert session.pending_op_counts == {}
+
+    session.pending_op_counts = {"dedup_merged": 0}
+    session.commit_tool_turn_counts()
+    assert "dedup_merged" in session.op_counts and session.op_counts["dedup_merged"] == 0
+    assert session.op_counts == {"dedup_merged": 0, "buffers_added": 2}
+
+    session.pending_op_counts = {"dedup_merged": 7}
+    session.commit_tool_turn_counts()
+    assert session.op_counts == {"dedup_merged": 7, "buffers_added": 2}
+    assert session.pending_op_counts == {}

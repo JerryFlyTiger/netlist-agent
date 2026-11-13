@@ -7,6 +7,7 @@ import os
 import re
 import sys
 
+from netlist_agent.constraints import StructuralConstraint, rename_token
 from netlist_agent.io_protocol import emit_response
 from netlist_agent.ir import GateType
 from netlist_agent.session import Session
@@ -169,6 +170,7 @@ _RESET_ON_LOAD = frozenset(
         "prev_enable_hold_not_examined",
         "prev_enable_hold_simulated_only",
         "structural_constraints",  # batch 25: a bound on design A is not a requirement on design B
+        "signal_renames_since_load",  # batch 33: renames of THIS design; replayed backwards on a same-file reload
     }
 )
 _KEPT_ON_LOAD = frozenset(
@@ -269,13 +271,18 @@ def test_reset_per_design_state_can_keep_structural_constraints() -> None:
     others = _RESET_ON_LOAD - {"structural_constraints"}
     for name in others:
         setattr(session, name, object())
+    # batch 33: the rename history is replayed on the kept constraints, so it needs a
+    # well-formed sentinel; ("x", "y") matches no token, so the constraints are unchanged.
+    session.signal_renames_since_load = [("x", "y")]
 
     session.reset_per_design_state(keep_structural_constraints=True)
 
     assert session.structural_constraints is kept
     assert len(kept) == 1
-    for name in others:  # everything else is still reset
+    assert kept[0].scope_token is None
+    for name in others:  # everything else, the rename history included, is still reset
         assert getattr(session, name) == getattr(fresh, name), name
+    assert session.signal_renames_since_load == []
 
 
 def test_is_reload_of_compares_realpaths_and_is_false_before_any_load(tmp_path) -> None:
@@ -1035,3 +1042,171 @@ def test_g7_commit_is_last_request_wins_across_requests() -> None:
     session.commit_tool_turn_counts()
     assert session.op_counts == {"dedup_merged": 7, "buffers_added": 2}
     assert session.pending_op_counts == {}
+
+
+# ----------------------------------------------------------------------
+# Batch 33: a signal rename is followed by the stored constraint tokens.
+# ----------------------------------------------------------------------
+
+_SNAPSHOT_SRC = """
+module top(a, b, y);
+  input a, b;
+  output y;
+  wire n1, n2;
+  and g1(n1, a, b);
+  or g2(n2, a, b);
+  xor g3(y, n1, n2);
+endmodule
+"""
+
+
+def _fan(token, bound=4, rid=1) -> StructuralConstraint:
+    return StructuralConstraint("max_fanout", bound, token, None, rid)
+
+
+def _depth(cone, bound=3, rid=2) -> StructuralConstraint:
+    return StructuralConstraint("max_depth", bound, None, cone, rid)
+
+
+def test_rename_token_table() -> None:
+    assert rename_token(None, "n1", "m1") is None
+    assert rename_token("n1", "n1", "m1") == "m1"
+    assert rename_token("n4[0]", "n4", "m4") == "m4[0]"
+    assert rename_token("n4[12]", "n4", "m4") == "m4[12]"
+    # same prefix, different name: untouched
+    assert rename_token("n10", "n1", "m1") == "n10"
+    assert rename_token("n1_x", "n1", "m1") == "n1_x"
+    assert rename_token("n1x[0]", "n1", "m1") == "n1x[0]"
+    # no case folding, no stripping
+    assert rename_token("N1", "n1", "m1") == "N1"
+    assert rename_token(" n1", "n1", "m1") == " n1"
+    assert rename_token("n1 ", "n1", "m1") == "n1 "
+    # old == new
+    assert rename_token("n1", "n1", "n1") == "n1"
+    assert rename_token("n1[2]", "n1", "n1") == "n1[2]"
+    # an unrelated token that equals `new` is not touched
+    assert rename_token("m1", "n1", "m1") == "m1"
+
+
+def test_mirror_rename_signal_rewrites_both_token_fields() -> None:
+    session = Session()
+    other = _fan("n9")
+    glob = StructuralConstraint("max_fanout", 4, None, None, 3)
+    session.structural_constraints = [_fan("n1"), _depth("n1[0]"), other, glob]
+    lst = session.structural_constraints
+    session.mirror_rename("signal", "n1", "m1")
+    assert session.structural_constraints is lst  # edited in place
+    assert [c.scope_token for c in lst] == ["m1", None, "n9", None]
+    assert [c.cone_of for c in lst] == [None, "m1[0]", None, None]
+    assert lst[2] is other and lst[3] is glob  # unchanged elements keep identity
+    assert lst[0].bound == 4 and lst[0].request_id == 1 and lst[1].kind == "max_depth"
+    assert session.signal_renames_since_load == [("n1", "m1")]
+
+
+def test_mirror_rename_signal_rewrites_every_constraint_on_the_same_net() -> None:
+    session = Session()
+    session.structural_constraints = [_fan("n1", 4, 1), _fan("n1", 2, 2), _fan("n1[3]", 1, 3)]
+    session.mirror_rename("signal", "n1", "m1")
+    assert [c.scope_token for c in session.structural_constraints] == ["m1", "m1", "m1[3]"]
+    assert [c.bound for c in session.structural_constraints] == [4, 2, 1]
+
+
+def test_mirror_rename_signal_rewrites_constraints_without_a_snapshot() -> None:
+    # `original_snapshot is None` makes the snapshot mirroring return early;
+    # the constraint rewrite must come before that.
+    session = Session()
+    assert session.original_snapshot is None
+    session.structural_constraints = [_fan("n1")]
+    session.mirror_rename("signal", "n1", "m1")
+    assert session.structural_constraints[0].scope_token == "m1"
+    assert session.signal_renames_since_load == [("n1", "m1")]
+
+
+def test_mirror_rename_signal_rewrites_constraints_when_snapshot_lacks_the_name(tmp_path) -> None:
+    from netlist_agent.parser import parse_verilog
+
+    path = tmp_path / "t.v"
+    path.write_text(_SNAPSHOT_SRC)
+    session = Session()
+    session.original_snapshot = parse_verilog(str(path))
+    session.structural_constraints = [_fan("fresh_net")]
+    session.mirror_rename("signal", "fresh_net", "m1")  # not in the snapshot: snapshot no-op
+    assert session.structural_constraints[0].scope_token == "m1"
+    session.mirror_rename("signal", "n1", "k1")  # in the snapshot: renamed there too
+    assert "k1" in session.original_snapshot.signals
+
+
+def test_mirror_rename_signal_rewrites_constraints_when_snapshot_already_has_the_new_name(tmp_path) -> None:
+    from netlist_agent.parser import parse_verilog
+
+    path = tmp_path / "t.v"
+    path.write_text(_SNAPSHOT_SRC)
+    session = Session()
+    session.original_snapshot = parse_verilog(str(path))
+    assert "n1" in session.original_snapshot.signals and "n2" in session.original_snapshot.signals
+    session.structural_constraints = [_fan("n1")]
+    session.mirror_rename("signal", "n1", "n2")  # snapshot already has n2: snapshot no-op
+    assert "n1" in session.original_snapshot.signals  # snapshot really was left alone
+    assert session.structural_constraints[0].scope_token == "n2"
+    assert session.signal_renames_since_load == [("n1", "n2")]
+
+
+def test_mirror_rename_gate_leaves_constraints_alone() -> None:
+    session = Session()
+    session.structural_constraints = [_fan("g1"), _depth("g1")]
+    before = list(session.structural_constraints)
+    session.mirror_rename("gate", "g1", "h1")
+    assert session.structural_constraints == before
+    assert all(a is b for a, b in zip(session.structural_constraints, before))
+    assert session.signal_renames_since_load == []
+
+
+def test_same_file_reload_undoes_a_rename_made_before_the_constraint() -> None:
+    session = Session()
+    session.mirror_rename("signal", "n1", "m1")
+    session.structural_constraints = [_fan("m1"), _depth("m1[2]")]  # constraint set on the renamed net
+    session.reset_per_design_state(keep_structural_constraints=True)
+    assert [c.scope_token for c in session.structural_constraints] == ["n1", None]
+    assert [c.cone_of for c in session.structural_constraints] == [None, "n1[2]"]
+    assert session.signal_renames_since_load == []
+
+
+def test_same_file_reload_undoes_a_rename_made_after_the_constraint() -> None:
+    session = Session()
+    session.structural_constraints = [_fan("n1")]
+    session.mirror_rename("signal", "n1", "m1")
+    assert session.structural_constraints[0].scope_token == "m1"
+    session.reset_per_design_state(keep_structural_constraints=True)
+    assert session.structural_constraints[0].scope_token == "n1"
+    assert session.signal_renames_since_load == []
+
+
+def test_same_file_reload_undoes_a_name_swap_in_reverse_order() -> None:
+    session = Session()
+    session.structural_constraints = [_fan("n1", 4, 1), _fan("n2", 2, 2)]
+    for old, new in [("n1", "t"), ("n2", "n1"), ("t", "n2")]:
+        session.mirror_rename("signal", old, new)
+    # swapped names: the constraint on the original n1 now says n2, and vice versa
+    assert [c.scope_token for c in session.structural_constraints] == ["n2", "n1"]
+    session.reset_per_design_state(keep_structural_constraints=True)
+    assert [c.scope_token for c in session.structural_constraints] == ["n1", "n2"]
+    assert [c.bound for c in session.structural_constraints] == [4, 2]
+    assert session.signal_renames_since_load == []
+
+
+def test_different_file_reload_clears_constraints_and_rename_history() -> None:
+    session = Session()
+    session.structural_constraints = [_fan("n1")]
+    session.mirror_rename("signal", "n1", "m1")
+    session.reset_per_design_state()
+    assert session.structural_constraints == []
+    assert session.signal_renames_since_load == []
+
+
+def test_reset_without_any_rename_keeps_constraints_untouched() -> None:
+    session = Session()
+    c = _fan("n1")
+    session.structural_constraints = [c]
+    session.reset_per_design_state(keep_structural_constraints=True)
+    assert session.structural_constraints == [c] and session.structural_constraints[0] is c
+    assert session.signal_renames_since_load == []

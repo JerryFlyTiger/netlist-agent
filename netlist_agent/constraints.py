@@ -89,8 +89,10 @@ class CheckResult:
     """Outcome of re-checking one `StructuralConstraint` against the current
     design.
 
-    `unresolvable` (the token this constraint scopes to no longer resolves
-    on the current design -- e.g. a later request renamed it) takes
+    `unresolvable` (the token this constraint scopes to does not resolve
+    on the current design -- e.g. a hand-written token naming no net; a
+    rename of the net does NOT cause it since batch 33, see
+    `rename_token`) takes
     precedence over `holds`/`measured`, both of which are meaningless in
     that case (`measured` is `None`).
 
@@ -111,6 +113,22 @@ class CheckResult:
     culprit: Optional[NetBit] = None
 
 
+def rename_token(token: Optional[str], old: str, new: str) -> Optional[str]:
+    """Rewrite a stored constraint token after the signal `old` was renamed
+    to `new` (batch 33). `None` stays `None`; `old` becomes `new`; a bit
+    reference `old[3]` keeps its suffix (`new[3]`); anything else -- including
+    names that merely start with `old` (`n10` vs `n1`) -- is returned as is.
+    Exact string comparison on purpose: no case folding, no stripping, so a
+    token is only rewritten when it is literally the renamed signal."""
+    if token is None:
+        return None
+    if token == old:
+        return new
+    if token.startswith(old + "["):
+        return new + token[len(old):]
+    return token
+
+
 @dataclass(frozen=True)
 class StructuralConstraint:
     """One hard structural bound established by an earlier request.
@@ -121,7 +139,11 @@ class StructuralConstraint:
     reference resolves against the CURRENT design, not the one in force
     when it was written down. Storing a `NetBit` here would silently turn
     into a reference to a since-renamed ghost; re-resolving the token fresh
-    on every `check()` call is what QA A61 requires anyway."""
+    on every `check()` call is what QA A61 requires anyway.
+
+    Batch 33: the token FOLLOWS a signal rename -- `Session.mirror_rename`
+    rewrites it (via `rename_token`) so it keeps naming the same net; the
+    instance is frozen, so the session replaces it with a copy."""
 
     kind: str  # "max_fanout" | "max_depth"
     bound: int

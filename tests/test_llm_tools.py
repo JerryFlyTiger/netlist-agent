@@ -1183,6 +1183,46 @@ def test_rename_gate_and_signal(tmp_path) -> None:
         TOOL_REGISTRY["rename_signal"](session, old_name="ghost_signal", new_name="whatever")
 
 
+def test_rename_signal_tool_follows_structural_constraint_tokens(tmp_path) -> None:
+    """Batch 33 U5: the LLM-tool rename path (no `handle_request`) keeps the
+    stored constraint tokens in step with a successful signal rename."""
+    from netlist_agent.constraints import StructuralConstraint
+
+    session = _new_session(tmp_path)
+    session.structural_constraints.append(StructuralConstraint("max_fanout", 2, "n26", None, 1))
+    session.structural_constraints.append(StructuralConstraint("max_depth", 3, None, "n26", 2))
+    TOOL_REGISTRY["rename_signal"](session, old_name="n26", new_name="n26_new")
+    assert [(c.scope_token, c.cone_of) for c in session.structural_constraints] == [
+        ("n26_new", None),
+        (None, "n26_new"),
+    ]
+    assert session.signal_renames_since_load == [("n26", "n26_new")]
+
+
+def test_rename_signal_tool_failure_leaves_constraints_and_history_alone(tmp_path) -> None:
+    from netlist_agent.constraints import StructuralConstraint
+
+    session = _new_session(tmp_path)
+    session.structural_constraints.append(StructuralConstraint("max_fanout", 2, "n26", None, 1))
+    before = list(session.structural_constraints)
+    with pytest.raises(ToolError):
+        TOOL_REGISTRY["rename_signal"](session, old_name="ghost_signal", new_name="whatever")
+    with pytest.raises(ToolError):  # collision: n14 already exists
+        TOOL_REGISTRY["rename_signal"](session, old_name="n26", new_name="n14")
+    assert session.structural_constraints == before
+    assert session.signal_renames_since_load == []
+
+
+def test_rename_gate_tool_does_not_touch_constraints(tmp_path) -> None:
+    from netlist_agent.constraints import StructuralConstraint
+
+    session = _new_session(tmp_path)
+    session.structural_constraints.append(StructuralConstraint("max_fanout", 2, "g0", None, 1))
+    TOOL_REGISTRY["rename_gate"](session, old_name="g0", new_name="g0_new")
+    assert session.structural_constraints[0].scope_token == "g0"
+    assert session.signal_renames_since_load == []
+
+
 # ----------------------------------------------------------------------
 # Transforms
 # ----------------------------------------------------------------------

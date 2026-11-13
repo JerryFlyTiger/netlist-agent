@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import os
 import sys
+import dataclasses
 from dataclasses import dataclass, field
 from typing import IO, Optional
 
-from netlist_agent.constraints import StructuralConstraint
+from netlist_agent.constraints import StructuralConstraint, rename_token
 from netlist_agent.ir import Design, GateType
 
 
@@ -264,6 +265,13 @@ class Session:
     # reloading the same file keeps them.
     structural_constraints: list[StructuralConstraint] = field(default_factory=list)
 
+    # Signal renames done on `current_design` since it was loaded, in order,
+    # as `(old, new)` pairs (batch 33). `mirror_rename` rewrites the stored
+    # constraint tokens to follow a rename; reloading the SAME file brings
+    # the original names back, so `reset_per_design_state` replays this list
+    # backwards onto the kept constraints. Always empty right after a reset.
+    signal_renames_since_load: list[tuple[str, str]] = field(default_factory=list)
+
     # How many times `io_protocol.emit_response()` has failed to write a
     # response to stdout / to the testcase log, respectively (an `OSError`
     # or `UnicodeEncodeError` raised by that channel's `write()`/`flush()`,
@@ -313,7 +321,8 @@ class Session:
         `last_enable_hold_count`, `last_enable_hold_not_examined`,
         `last_enable_hold_simulated_only`, `last_enable_hold_fingerprint`) and their "previous number"
         cells (`prev_floating_count`, `prev_enable_hold_count`, `prev_enable_hold_not_examined`,
-        `prev_enable_hold_simulated_only`; batch 26).
+        `prev_enable_hold_simulated_only`; batch 26) and `signal_renames_since_load`
+        (batch 33; always `[]` afterwards).
 
         Also resets `structural_constraints` (batch 25): a bound established
         on design A is a requirement on A, not on whatever is loaded next.
@@ -326,7 +335,10 @@ class Session:
         callers read the old one for their reply before calling this. The
         load paths say so when something was dropped.
 
-        `keep_structural_constraints=True` leaves them alone. The load paths
+        `keep_structural_constraints=True` keeps them, but first undoes every
+        signal rename since load on their tokens (batch 33; the reloaded file
+        has the original names again; see the known-limitation note in the
+        body for the case where the input file was overwritten). The load paths
         pass `is_reload_of(...)`: reloading the SAME file (same realpath) is
         still the same design, so A63 still applies and the bounds are kept
         and re-enforced as before. A different path with identical content
@@ -366,6 +378,29 @@ class Session:
         self.prev_enable_hold_simulated_only = 0
         if not keep_structural_constraints:
             self.structural_constraints = []
+        else:
+            # Batch 33: the design is back to its original names, so undo the
+            # token rewrites of every rename since load, last one first.
+            # Known limitation (batch 33, cold read R1-5): if the user renamed
+            # a net, wrote the design back over the SAME input file, and then
+            # reloads that file, the file no longer has the original name, so
+            # the token goes back to a name that is gone and the constraint
+            # becomes unresolvable. That is loud (a WARNING on every reply),
+            # not silent, and needs overwriting the input file to happen.
+            for old, new in reversed(self.signal_renames_since_load):
+                self._rename_constraint_tokens(new, old)
+        self.signal_renames_since_load = []
+
+    def _rename_constraint_tokens(self, old_name: str, new_name: str) -> None:
+        """Follow a signal rename in every stored constraint token
+        (`scope_token`, `cone_of`; see `constraints.rename_token`). Edits the
+        list IN PLACE and leaves unchanged elements as the same objects."""
+        lst = self.structural_constraints
+        for i, c in enumerate(lst):
+            scope = rename_token(c.scope_token, old_name, new_name)
+            cone = rename_token(c.cone_of, old_name, new_name)
+            if scope != c.scope_token or cone != c.cone_of:
+                lst[i] = dataclasses.replace(c, scope_token=scope, cone_of=cone)
 
     def commit_tool_turn_counts(self) -> None:
         """Fold this request's pending LLM-tool counts into `op_counts` /
@@ -400,7 +435,7 @@ class Session:
 
         `kind` is `"signal"` or `"gate"`.
 
-        Deliberately a no-op (not an error) in two cases:
+        Deliberately a no-op (not an error) in three cases:
 
         - `original_snapshot` is `None` (no snapshot was ever loaded --
           nothing to mirror onto).
@@ -446,7 +481,16 @@ class Session:
         `abc_bridge.extract_combinational_view`), because the
         two designs' PO/PI name sets no longer match. See the branch below
         for how this is now handled instead of skipped.
+
+        Before any of that (and before any of the no-ops above), a signal rename
+        is also followed by the stored structural-constraint tokens (batch
+        33), and recorded in `signal_renames_since_load`; those do not depend
+        on the snapshot. Gate renames never touch constraints (they store
+        net names only).
         """
+        if kind == "signal":
+            self._rename_constraint_tokens(old_name, new_name)
+            self.signal_renames_since_load.append((old_name, new_name))
         if self.original_snapshot is None:
             return
         if kind == "signal":

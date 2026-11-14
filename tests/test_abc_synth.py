@@ -1428,3 +1428,363 @@ def test_real_subprocess_full_script_times_out_quick_script_wins(monkeypatch, tm
     assert result.depth_after < result.depth_before
     # Re-check with the same `verify_equivalence`, here through the real (unwrapped) cec.
     assert verify_equivalence(design, result.design).equivalent
+
+
+# ----------------------------------------------------------------------
+# Batch 34a: synthesized gates drive POs / the cone target directly (no tap BUF)
+# ----------------------------------------------------------------------
+
+
+def _tap_gates(design: Design) -> list[Gate]:
+    return [g for g in design.gates if g.inst_name.startswith("t_depth_opt_tap_")]
+
+
+def _force_retap(monkeypatch) -> None:
+    """Disable direct wiring: every PO/target goes through `_retap_output`."""
+    monkeypatch.setattr(abc_synth_module, "_can_wire_directly", lambda *a, **k: False)
+
+
+def test_whole_design_has_no_tap_gate_and_depth_is_one_less_than_tapped(monkeypatch) -> None:
+    design = _build_and_chain()
+    original = copy.deepcopy(design)
+    direct = optimize_depth(design)
+    assert direct.changed
+    assert _tap_gates(direct.design) == []
+    eq = verify_equivalence(original, direct.design)
+    assert eq.equivalent, eq.detail
+
+    _force_retap(monkeypatch)
+    tapped = optimize_depth(copy.deepcopy(original))
+    assert len(_tap_gates(tapped.design)) == 1
+    assert direct.depth_after == tapped.depth_after - 1
+    assert NetlistGraph(direct.design).max_design_depth() == direct.depth_after
+
+
+def test_q_bus_corner_has_no_tap_and_stays_equivalent() -> None:
+    design = Design(module_name="top")
+    for n in ("a", "b", "clk", "rn"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["n11"] = Signal("n11", 1, 0, Direction.OUTPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port(n, Direction.INPUT) for n in ("a", "b", "clk", "rn")] + [
+        Port("n11", Direction.OUTPUT),
+        Port("y", Direction.OUTPUT),
+    ]
+    design.add_gate(Gate("g0", GateType.AND, {"O": _nb("n11", 1), "I0": _nb("a"), "I1": _nb("b")}))
+    design.add_gate(
+        Gate("dff0", GateType.DFF, {"RN": _nb("rn"), "SN": Const.ONE, "CK": _nb("clk"), "D": _nb("a"), "Q": _nb("n11", 0)})
+    )
+    prev = _nb("n11", 1)
+    for i in range(6):
+        last = i == 5
+        out = _nb("y") if last else design.fresh_net("t_")
+        design.add_gate(Gate(f"h{i}", GateType.AND, {"O": out, "I0": prev, "I1": _nb("n11", 0)}))
+        prev = out
+    design.build_indices()
+    original = copy.deepcopy(design)
+
+    result = optimize_depth(design)
+
+    assert result.changed, result.failure
+    assert result.failure is None
+    assert _tap_gates(result.design) == []
+    eq = verify_equivalence(original, result.design)
+    assert eq.equivalent, eq.detail
+    driver0 = result.design.net_driver.get(_nb("n11", 0))
+    assert driver0 is not None and driver0.gate_type == GateType.DFF
+    # the PO bit read by an internal gate is still driven (by a non-DFF gate)
+    driver1 = result.design.net_driver.get(_nb("n11", 1))
+    assert driver1 is not None and driver1.gate_type != GateType.DFF
+
+
+def test_pi_passthrough_q_po_and_floating_po_keep_their_behavior() -> None:
+    design = Design(module_name="top")
+    for n in ("a", "b", "c", "clk", "rn"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    for n in ("pt", "q", "fl", "y"):
+        design.signals[n] = Signal(n, None, None, Direction.OUTPUT)
+    design.ports = [Port(n, Direction.INPUT) for n in ("a", "b", "c", "clk", "rn")] + [
+        Port(n, Direction.OUTPUT) for n in ("pt", "q", "fl", "y")
+    ]
+    design.add_gate(Gate("bp", GateType.BUF, {"O": _nb("pt"), "I0": _nb("a")}))
+    design.add_gate(
+        Gate("dff0", GateType.DFF, {"RN": _nb("rn"), "SN": Const.ONE, "CK": _nb("clk"), "D": _nb("b"), "Q": _nb("q")})
+    )
+    prev = _nb("a")
+    for i, n in enumerate(("b", "c", "a", "b", "c")):
+        last = i == 4
+        out = _nb("y") if last else design.fresh_net("t_")
+        design.add_gate(Gate(f"h{i}", GateType.AND, {"O": out, "I0": prev, "I1": _nb(n)}))
+        prev = out
+    design.build_indices()
+    original = copy.deepcopy(design)
+
+    result = optimize_depth(design)
+    # Without this, a rejected candidate (the original design handed back)
+    # passes every assertion below.
+    assert result.changed, result.failure
+
+    eq = verify_equivalence(original, result.design)
+    assert eq.equivalent, eq.detail
+    out = result.design
+    # Q stays driven by its DFF; PI passthrough PO still has a driver and
+    # keeps its name; the floating PO stays floating.
+    assert out.net_driver[_nb("q")].gate_type == GateType.DFF
+    assert _nb("pt") in out.net_driver
+    assert "pt" in out.signals and out.signals["pt"].direction == Direction.OUTPUT
+    assert _nb("fl") not in out.net_driver
+
+
+def _build_shared_target_design() -> Design:
+    """`m` is an internal net at the end of a deep AND chain, read both by the
+    chain's cone and (outside it) by `y = NOT m`."""
+    design = Design(module_name="top")
+    names = [f"a{i}" for i in range(8)]
+    for n in names:
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.signals["m"] = Signal("m", None, None, Direction.INTERNAL)
+    design.ports = [Port(n, Direction.INPUT) for n in names] + [Port("y", Direction.OUTPUT)]
+    prev = _nb(names[0])
+    for i in range(1, 8):
+        out = _nb("m") if i == 7 else design.fresh_net("t_")
+        design.add_gate(Gate(f"g{i}", GateType.AND, {"O": out, "I0": prev, "I1": _nb(names[i])}))
+        prev = out
+    design.add_gate(Gate("gn", GateType.NOT, {"O": _nb("y"), "I0": _nb("m")}))
+    design.build_indices()
+    return design
+
+
+def test_cone_target_is_driven_directly_and_outside_reader_still_reads_it(monkeypatch) -> None:
+    design = _build_shared_target_design()
+    original = copy.deepcopy(design)
+    result = optimize_cone_depth(design, _nb("m"))
+    assert result.changed
+    assert _tap_gates(result.design) == []
+    driver = result.design.net_driver[_nb("m")]
+    assert driver.inst_name.startswith("t_depth_opt_gate_")
+    readers = [g.inst_name for g in result.design.net_fanout.get(_nb("m"), [])]
+    assert "gn" in readers
+    eq = verify_equivalence(original, result.design)
+    assert eq.equivalent, eq.detail
+
+    _force_retap(monkeypatch)
+    tapped = optimize_cone_depth(copy.deepcopy(original), _nb("m"))
+    assert len(_tap_gates(tapped.design)) == 1
+    assert result.depth_after == tapped.depth_after - 1
+
+
+def test_gate_count_optimization_leaves_no_tap_gate(monkeypatch) -> None:
+    design = _redundant_design()
+    original = copy.deepcopy(design)
+    result = optimize_gate_count(design)
+    assert isinstance(result, AreaOptResult)
+    assert result.changed
+    assert _tap_gates(result.design) == []
+    assert len(result.design.gates) < len(original.gates)
+    eq = verify_equivalence(original, result.design)
+    assert eq.equivalent, eq.detail
+
+    _force_retap(monkeypatch)
+    tapped = optimize_gate_count(copy.deepcopy(original))
+    assert len(_tap_gates(tapped.design)) == 1
+
+
+def test_depth_change_sentence_wording() -> None:
+    from netlist_agent.abc_synth import depth_change_sentence
+
+    assert depth_change_sentence("maximum logic depth", 7, 3, 10, 12) == "Reduced maximum logic depth from 7 to 3."
+    same = depth_change_sentence("maximum logic depth", 4, 4, 10, 8)
+    assert same == "Maximum logic depth stays at 4; the resynthesized design has fewer gates (10 to 8)."
+    cone = depth_change_sentence("the depth of the cone of n11[0]", 2, 2, 9, 7)
+    assert cone.startswith("The depth of the cone of n11[0] stays at 2;")
+
+
+_SAME_DEPTH_BLIF = """
+.model top
+.inputs a b
+.outputs y
+.gate and2 a=a b=b O=new_n1
+.gate and2 a=new_n1 b=new_n1 O=y
+.end
+"""
+
+
+def _redundant_design() -> Design:
+    """y = AND(AND(a,b), AND(a,b)): depth 2, 3 gates."""
+    design = Design(module_name="top")
+    for n in ("a", "b"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port("a", Direction.INPUT), Port("b", Direction.INPUT), Port("y", Direction.OUTPUT)]
+    t1, t2 = design.fresh_net("t_"), design.fresh_net("t_")
+    design.add_gate(Gate("g1", GateType.AND, {"O": t1, "I0": _nb("a"), "I1": _nb("b")}))
+    design.add_gate(Gate("g2", GateType.AND, {"O": t2, "I0": _nb("a"), "I1": _nb("b")}))
+    design.add_gate(Gate("g3", GateType.AND, {"O": _nb("y"), "I0": t1, "I1": t2}))
+    design.build_indices()
+    return design
+
+
+def test_same_depth_fewer_gates_note_is_not_from_x_to_x(monkeypatch) -> None:
+    blif_out = parse_blif(_SAME_DEPTH_BLIF)
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", lambda view, basis, timeout, opt_script=None: blif_out)
+    whole = optimize_depth(_redundant_design())
+    assert whole.changed and whole.depth_before == whole.depth_after == 2
+    assert whole.note.startswith("Maximum logic depth stays at 2; the resynthesized design has fewer gates (3 to 2)")
+    assert "from 2 to 2" not in whole.note
+
+    cone_blif = parse_blif(_SAME_DEPTH_BLIF.replace("O=y", f"O={abc_synth_module._CONE_OUT_TOKEN}").replace(".outputs y", f".outputs {abc_synth_module._CONE_OUT_TOKEN}"))
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", lambda view, basis, timeout, opt_script=None: cone_blif)
+    cone = optimize_cone_depth(_redundant_design(), _nb("y"))
+    assert cone.changed and cone.depth_before == cone.depth_after == 2
+    assert cone.note.startswith("The depth of the cone of y stays at 2; the resynthesized design has fewer gates (3 to 2)")
+    assert "from 2 to 2" not in cone.note
+
+
+# ----------------------------------------------------------------------
+# 34a-fix: gates that were already dangling do not count as an improvement
+# ----------------------------------------------------------------------
+
+
+def _optimal_design_with_dead_gate(with_dead: bool) -> Design:
+    """y = AND(a, b): one gate, already optimal for depth (1) and area (1).
+    With `with_dead`, also a NOT(c) whose output nobody reads (dangling)."""
+    design = Design(module_name="top")
+    for n in ("a", "b", "c"):
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port(n, Direction.INPUT) for n in ("a", "b", "c")] + [Port("y", Direction.OUTPUT)]
+    design.add_gate(Gate("g1", GateType.AND, {"O": _nb("y"), "I0": _nb("a"), "I1": _nb("b")}))
+    if with_dead:
+        design.add_gate(Gate("gdead", GateType.NOT, {"O": design.fresh_net("dead_"), "I0": _nb("c")}))
+    design.build_indices()
+    return design
+
+
+def test_fix_whole_depth_preexisting_dangling_gate_is_not_an_improvement() -> None:
+    control = optimize_depth(_optimal_design_with_dead_gate(False))
+    assert control.changed is False
+    design = _optimal_design_with_dead_gate(True)
+    result = optimize_depth(design)
+    assert result.changed is False
+    assert result.design is design
+    assert len(design.gates) == 2
+
+
+def test_fix_cone_depth_preexisting_dangling_gate_is_not_an_improvement() -> None:
+    control = optimize_cone_depth(_optimal_design_with_dead_gate(False), _nb("y"))
+    assert control.changed is False
+    design = _optimal_design_with_dead_gate(True)
+    result = optimize_cone_depth(design, _nb("y"))
+    assert result.changed is False
+    assert result.design is design
+    assert len(design.gates) == 2
+
+
+def test_fix_cone_gate_count_preexisting_dangling_gate_is_not_an_improvement() -> None:
+    control = optimize_cone_gate_count(_optimal_design_with_dead_gate(False), _nb("y"))
+    assert control.changed is False
+    design = _optimal_design_with_dead_gate(True)
+    result = optimize_cone_gate_count(design, _nb("y"))
+    assert result.changed is False
+    assert result.design is design
+    assert result.gates_before == 2
+    assert result.gates_after == 2
+
+
+def test_fix_whole_gate_count_still_counts_removing_a_dangling_gate_as_an_improvement() -> None:
+    """SPEC_34 F1: whole-design gate-count optimization deliberately keeps the
+    plain `len(design.gates)` criterion -- dropping dead logic is a legitimate
+    area saving there, unlike the depth/cone tie-breaks."""
+    result = optimize_gate_count(_optimal_design_with_dead_gate(True))
+    assert result.changed is True
+    assert result.gates_before == 2 and result.gates_after == 1
+
+
+def _redundant_design_with_dead_gate(with_dead: bool) -> Design:
+    """`_redundant_design()` (3 gates -> 2 after resynthesis, same depth), plus
+    optionally one NOT(a) nobody reads. Correct baseline is 3 either way;
+    subtracting the dangling gate twice would give 2 and reject `2 < 2`."""
+    design = _redundant_design()
+    if with_dead:
+        design.add_gate(Gate("gdead", GateType.NOT, {"O": design.fresh_net("dead_"), "I0": _nb("a")}))
+        design.build_indices()
+    return design
+
+
+def _patch_same_depth_blif(monkeypatch, cone: bool) -> None:
+    text = _SAME_DEPTH_BLIF
+    if cone:
+        tok = abc_synth_module._CONE_OUT_TOKEN
+        text = text.replace("O=y", f"O={tok}").replace(".outputs y", f".outputs {tok}")
+    blif_out = parse_blif(text)
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", lambda view, basis, timeout, opt_script=None: blif_out)
+
+
+def test_fix_whole_depth_real_improvement_with_dangling_gate_is_still_accepted(monkeypatch) -> None:
+    _patch_same_depth_blif(monkeypatch, cone=False)
+    control = optimize_depth(_redundant_design_with_dead_gate(False))
+    assert control.changed is True
+    design = _redundant_design_with_dead_gate(True)
+    assert len(design.gates) == 4
+    result = optimize_depth(design)
+    assert result.changed is True
+    assert len(result.design.gates) == 2
+    # The reply reports the design's actual gate counts (dangling gate included), not the baseline.
+    assert "(4 to 2)" in result.note
+
+
+def test_fix_cone_depth_real_improvement_with_dangling_gate_is_still_accepted(monkeypatch) -> None:
+    _patch_same_depth_blif(monkeypatch, cone=True)
+    control = optimize_cone_depth(_redundant_design_with_dead_gate(False), _nb("y"))
+    assert control.changed is True
+    design = _redundant_design_with_dead_gate(True)
+    assert len(design.gates) == 4
+    result = optimize_cone_depth(design, _nb("y"))
+    assert result.changed is True
+    assert len(result.design.gates) == 2
+    assert "(4 to 2)" in result.note
+
+
+def test_fix_cone_gate_count_real_improvement_with_dangling_gate_is_still_accepted(monkeypatch) -> None:
+    _patch_same_depth_blif(monkeypatch, cone=True)
+    control = optimize_cone_gate_count(_redundant_design_with_dead_gate(False), _nb("y"))
+    assert control.changed is True
+    design = _redundant_design_with_dead_gate(True)
+    assert len(design.gates) == 4
+    result = optimize_cone_gate_count(design, _nb("y"))
+    assert result.changed is True
+    assert len(result.design.gates) == 2
+    assert result.gates_before == 4 and result.gates_after == 2
+    assert result.note == "Reduced gate count from 4 to 2."
+
+
+def test_fix_count_dangling_gates_counts_and_does_not_mutate() -> None:
+    from netlist_agent.transform import count_dangling_gates
+
+    assert count_dangling_gates(_optimal_design_with_dead_gate(False)) == 0
+    design = _optimal_design_with_dead_gate(True)
+    gate_ids = [id(g) for g in design.gates]
+    assert count_dangling_gates(design) == 1
+    assert len(design.gates) == 2
+    assert [id(g) for g in design.gates] == gate_ids
+    assert remove_dangling_gates(design) == 1
+    assert count_dangling_gates(design) == 0
+
+
+def test_fix_count_dangling_gates_counts_a_whole_dead_chain() -> None:
+    """A dead chain NOT(c) -> NOT -> NOT -> (unread): only the last gate's
+    output is unread, so a shallow "output nobody reads" count would say 1,
+    and "unread plus its direct driver" would say 2. Three gates tell both
+    apart from the full backward closure."""
+    from netlist_agent.transform import count_dangling_gates
+
+    design = _optimal_design_with_dead_gate(False)
+    mid0 = design.fresh_net("dead_")
+    mid1 = design.fresh_net("dead_")
+    design.add_gate(Gate("gdead0", GateType.NOT, {"O": mid0, "I0": _nb("c")}))
+    design.add_gate(Gate("gdead1", GateType.NOT, {"O": mid1, "I0": mid0}))
+    design.add_gate(Gate("gdead2", GateType.NOT, {"O": design.fresh_net("dead_"), "I0": mid1}))
+    design.build_indices()
+    assert count_dangling_gates(design) == 3
+    assert remove_dangling_gates(design) == 3

@@ -87,7 +87,7 @@ from netlist_agent.abc_bridge import (
 from netlist_agent.graph import NetlistGraph
 from netlist_agent.ir import Const, Design, Direction, Gate, GateType, NetBit, OUTPUT_PIN, Pin
 from netlist_agent.netref import netbit_token, parse_net
-from netlist_agent.transform import remove_dangling_gates
+from netlist_agent.transform import count_dangling_gates, remove_dangling_gates
 
 # ----------------------------------------------------------------------
 # Genlib generation (empirical finding 1 & 2 above)
@@ -308,6 +308,18 @@ def quick_fallback_sentence(primary: str) -> str:
     )
 
 
+def depth_change_sentence(subject: str, depth_before: int, depth_after: int, gates_before: int, gates_after: int) -> str:
+    """The accepted-result sentence shared by every depth-optimization reply
+    (whole/cone `note` and the router responses). An accepted result may keep
+    the depth and only save gates; "from X to X" would read as a bug there."""
+    if depth_after < depth_before:
+        return f"Reduced {subject} from {depth_before} to {depth_after}."
+    return (
+        f"{subject[:1].upper()}{subject[1:]} stays at {depth_before}; "
+        f"the resynthesized design has fewer gates ({gates_before} to {gates_after})."
+    )
+
+
 def _verify_failure_prefix(exc: ABCBridgeError) -> str:
     """Wording for a `verify_equivalence` error: a timeout / undecided miter
     (`ABCInconclusiveError`) gave no verdict, so it must not be phrased like a
@@ -415,19 +427,29 @@ def _run_abc_synthesis(view: Design, basis: Optional[str], timeout: float, opt_s
 
 
 def _token_resolver(
-    work: Design, pi_tokens: frozenset[str], promoted_q_source: dict[str, NetBit], net_prefix: str
+    work: Design,
+    pi_tokens: frozenset[str],
+    promoted_q_source: dict[str, NetBit],
+    net_prefix: str,
+    direct: Optional[dict[str, NetBit]] = None,
 ) -> Callable[[str], NetBit]:
     """Builds a memoized token -> NetBit resolver for `work`'s namespace: a
     PI token resolves to the REAL net it stands for (a DFF's Q net via
     `promoted_q_source`, or an ordinary PI parsed by name and required to be
     a declared bit of an INPUT signal of `work`); every
     other token (an ABC-invented internal wire, or one of our own PO/D-tap
-    output names) gets a brand-new net freshly allocated in `work` -- this is
-    the "duplication" half of the splice-by-duplication approach: nothing
-    here ever reuses an existing internal net name from the pre-optimization
-    cone/design.
+    output names, except those listed in `direct`, see below) gets a
+    brand-new net freshly allocated in `work` -- this is
+    the "duplication" half of the splice-by-duplication approach: apart from
+    the `direct` nets, nothing here ever reuses an existing internal net name
+    from the pre-optimization cone/design.
+
+    `direct` maps output tokens that the caller has decided to wire straight
+    onto a real net (a PO bit / cone target) to that net: such a token
+    resolves to the real net instead of a fresh one, so the synthesized gate
+    that drives it drives the real net itself (no tap BUF, no orphan net).
     """
-    cache: dict[str, NetBit] = {}
+    cache: dict[str, NetBit] = dict(direct) if direct else {}
 
     def resolve(token: str) -> NetBit:
         if token in cache:
@@ -513,11 +535,28 @@ def _retap_output(work: Design, real_out: NetBit, fresh_source: NetBit) -> None:
     )
 
 
+def _can_wire_directly(work: Design, real_out: NetBit, token: str, pi_tokens: frozenset[str], gate_out_tokens: frozenset[str]) -> bool:
+    """True when the synthesized gate driving `token` may drive `real_out`
+    itself instead of going through a tap BUF: `real_out` has a driver that is
+    not a DFF (a DFF's Q pin is a source, never retapped), `token` is the O
+    pin of some BLIF gate, and it is not a primary-input token."""
+    old_driver = work.net_driver.get(real_out)
+    if old_driver is None or old_driver.gate_type == GateType.DFF:
+        return False
+    return token in gate_out_tokens and token not in pi_tokens
+
+
+def _detach_old_driver(work: Design, real_out: NetBit) -> None:
+    """Rewire `real_out`'s old driver off to a fresh dead net (first half of
+    `_retap_output`); the net is then free for a synthesized gate to drive."""
+    old_driver = work.net_driver.get(real_out)
+    if old_driver is not None:
+        dead = work.fresh_net("t_depth_opt_dead_")
+        work.rewire_pin(old_driver, OUTPUT_PIN[old_driver.gate_type], dead)
+
+
 def _splice_whole_design(work: Design, blif: _BlifNetlist, promoted_q_source: dict[str, NetBit]) -> None:
     pi_tokens = frozenset(blif.inputs)
-    resolve = _token_resolver(work, pi_tokens, promoted_q_source, "t_depth_opt_net_")
-    out_map = _add_synth_gates(work, blif, resolve, "t_depth_opt_gate_")
-
     dff_gates = [g for g in work.gates if g.gate_type == GateType.DFF]
     dff_by_inst = {g.inst_name: g for g in dff_gates}
     # A DFF's Q net can appear as one of `blif.outputs`: in the extracted
@@ -526,6 +565,25 @@ def _splice_whole_design(work: Design, blif: _BlifNetlist, promoted_q_source: di
     # to retap -- retapping would disconnect the real DFF's Q pin -- so any
     # such token is skipped.
     dff_q_bits = {g.pins["Q"] for g in dff_gates if isinstance(g.pins.get("Q"), NetBit)}
+    # Decide BEFORE adding gates which POs the synthesized gate drives
+    # directly (no tap BUF): the resolver then hands those tokens their real
+    # net, so BLIF readers of the token read the real net too.
+    gate_out_tokens = frozenset(g.pins["O"] for g in blif.gates if "O" in g.pins)
+    direct: dict[str, NetBit] = {}
+    direct_bits: set[NetBit] = set()
+    for token in blif.outputs:
+        if token.startswith(_DFF_D_TAP_PREFIX):
+            continue
+        po_nb = parse_net(token)
+        if po_nb in dff_q_bits or po_nb in direct_bits:
+            continue
+        if _can_wire_directly(work, po_nb, token, pi_tokens, gate_out_tokens):
+            direct[token] = po_nb
+            direct_bits.add(po_nb)
+    for po_nb in direct.values():
+        _detach_old_driver(work, po_nb)
+    resolve = _token_resolver(work, pi_tokens, promoted_q_source, "t_depth_opt_net_", direct)
+    out_map = _add_synth_gates(work, blif, resolve, "t_depth_opt_gate_")
     for token in blif.outputs:
         fresh_nb = out_map[token]
         if token.startswith(_DFF_D_TAP_PREFIX):
@@ -536,6 +594,8 @@ def _splice_whole_design(work: Design, blif: _BlifNetlist, promoted_q_source: di
             # A gate's D pin, unlike a PO, is not pinned to a fixed net name
             # -- a plain rewire (no dead-net/BUF dance) suffices.
             work.rewire_pin(dff_gate, "D", fresh_nb)
+            continue
+        if token in direct:
             continue
         po_nb = parse_net(token)
         if po_nb in dff_q_bits:
@@ -552,9 +612,15 @@ def _splice_cone(
     work: Design, target: NetBit, blif: _BlifNetlist, out_token: str, promoted_q_source: dict[str, NetBit]
 ) -> None:
     pi_tokens = frozenset(blif.inputs)
-    resolve = _token_resolver(work, pi_tokens, promoted_q_source, "t_depth_opt_net_")
+    gate_out_tokens = frozenset(g.pins["O"] for g in blif.gates if "O" in g.pins)
+    direct: dict[str, NetBit] = {}
+    if _can_wire_directly(work, target, out_token, pi_tokens, gate_out_tokens):
+        _detach_old_driver(work, target)
+        direct[out_token] = target
+    resolve = _token_resolver(work, pi_tokens, promoted_q_source, "t_depth_opt_net_", direct)
     out_map = _add_synth_gates(work, blif, resolve, "t_depth_opt_gate_")
-    _retap_output(work, target, out_map[out_token])
+    if out_token not in direct:
+        _retap_output(work, target, out_map[out_token])
 
 
 # ----------------------------------------------------------------------
@@ -645,6 +711,8 @@ def optimize_depth(
     acceptance-gating contract): accept if the resynthesized depth is
     STRICTLY lower, or equal with a lower total gate count (a tie-breaker
     favoring the smaller of two equal-depth designs); otherwise reject. The
+    gate-count comparison baseline is the original gate count minus the gates
+    that were already dangling (those are swept and must not count as a gain). The
     original is reported as already optimal only when the full script ran to
     completion; after a quick-script fallback the rejection is a `failure`.
 
@@ -652,6 +720,7 @@ def optimize_depth(
     separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
+    baseline = len(design.gates) - count_dangling_gates(design)
     depth_before = NetlistGraph(design).max_design_depth()
     if depth_before == 0:
         return DepthOptResult(design, False, 0, 0, "Design has zero combinational depth already; nothing to optimize.")
@@ -707,8 +776,10 @@ def optimize_depth(
         )
 
     depth_after = NetlistGraph(work).max_design_depth()
-    if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < len(design.gates)):
-        note = f"Reduced maximum logic depth from {depth_before} to {depth_after}."
+    if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < baseline):
+        note = depth_change_sentence(
+            "maximum logic depth", depth_before, depth_after, len(design.gates), len(work.gates)
+        )
         if primary is not None:
             note = f"{note} {quick_fallback_sentence(primary)}"
         return DepthOptResult(work, True, depth_before, depth_after, note, quick_fallback=primary)
@@ -724,21 +795,24 @@ def optimize_cone_depth(
 ) -> DepthOptResult:
     """Cone-restricted depth optimization: re-synthesize only `target`'s
     fanin cone via ABC, honoring `basis` if given, leaving every other gate
-    in `design` completely untouched.
+    in `design` completely untouched (gates that were already dangling in
+    `design` are swept too, but do not count toward an improvement).
 
     Splice-by-duplication (never deletes the old cone up front): a cone gate
     may still drive logic OUTSIDE the cone via some other net, so the old
     cone is never removed directly. Instead the newly-synthesized logic is
     added as entirely new gates computing `target` from the same PI/DFF.Q
     support, `target`'s own old driver (if any) is rewired off to a dead net,
-    and a fresh BUF drives `target` from the new logic -- then
+    and the new logic drives `target` directly (a fresh tap BUF is used only
+    when `target` does not qualify for direct wiring) -- then
     `remove_dangling_gates` sweeps whatever of the old cone became
     unreachable as a result (a gate the old cone shared with live logic
     elsewhere survives automatically, since it's still reachable from
     there).
 
     Same never-mutates-`design`-in-place, always-verify, same accept/reject
-    rule as `optimize_depth` (see its docstring) -- restricted to a single
+    rule as `optimize_depth` (see its docstring, including that the gate-count
+    baseline excludes gates that were already dangling) -- restricted to a single
     net-bit's cone depth (`NetlistGraph.depth_to_sink`) rather than the whole
     design's.
 
@@ -746,6 +820,7 @@ def optimize_cone_depth(
     separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
+    baseline = len(design.gates) - count_dangling_gates(design)
     depth_before = NetlistGraph(design).depth_to_sink(target)
     if depth_before == 0:
         return DepthOptResult(design, False, 0, 0, f"Depth of the cone of {netbit_token(target)} is already 0; nothing to optimize.")
@@ -805,8 +880,10 @@ def optimize_cone_depth(
         )
 
     depth_after = NetlistGraph(work).depth_to_sink(target)
-    if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < len(design.gates)):
-        note = f"Reduced the depth of the cone of {netbit_token(target)} from {depth_before} to {depth_after}."
+    if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < baseline):
+        note = depth_change_sentence(
+            f"the depth of the cone of {netbit_token(target)}", depth_before, depth_after, len(design.gates), len(work.gates)
+        )
         if primary is not None:
             note = f"{note} {quick_fallback_sentence(primary)}"
         return DepthOptResult(work, True, depth_before, depth_after, note, quick_fallback=primary)
@@ -983,13 +1060,15 @@ def optimize_cone_gate_count(
     duplication discipline `optimize_cone_depth` uses), `max_depth` (if
     given) is checked against `NetlistGraph.depth_to_sink(target)` after
     splicing, not the whole design's depth. Every other gate in `design` is
-    left completely untouched, same as `optimize_cone_depth`.
+    left completely untouched, same as `optimize_cone_depth` (gates that were
+    already dangling are swept too, but do not count toward an improvement).
 
     `verify_timeout` bounds the final `cec` equivalence check only; it is
     separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
     gates_before = len(design.gates)
+    baseline = gates_before - count_dangling_gates(design)
     depth_before = NetlistGraph(design).depth_to_sink(target)
     if depth_before == 0:
         return AreaOptResult(
@@ -1032,7 +1111,7 @@ def optimize_cone_gate_count(
         depth_after = NetlistGraph(work).depth_to_sink(target)
         if max_depth is not None and depth_after > max_depth:
             continue
-        if gates_after >= gates_before:
+        if gates_after >= baseline:
             continue
         if best_gates is None or gates_after < best_gates:
             best_work, best_gates, best_depth = work, gates_after, depth_after

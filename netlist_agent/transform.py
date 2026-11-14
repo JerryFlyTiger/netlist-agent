@@ -166,13 +166,8 @@ def collapse_inverter_buffer_chains(design: Design) -> int:
 # ----------------------------------------------------------------------
 
 
-def remove_dangling_gates(design: Design) -> int:
-    """Remove every non-DFF gate that cannot reach a primary output or any
-    DFF's D/CK/RN/SN pin. DFFs themselves are never removed by this sweep --
-    they are treated as protected state elements, matching graph.py's
-    sequential-boundary convention (a DFF is always a pseudo-source/sink,
-    never itself analyzed for further reachability).
-    """
+def _dangling_gates(design: Design) -> list[Gate]:
+    """The non-DFF gates `remove_dangling_gates` would remove. Read-only."""
     graph = NetlistGraph(design)
     starts: list[NetBit] = list(graph.po_bits)
     for dff in graph.dff_gates:
@@ -181,7 +176,23 @@ def remove_dangling_gates(design: Design) -> int:
             if isinstance(v, NetBit):
                 starts.append(v)
     live = graph.backward_reachable_gates_from(starts)
-    dangling = [g for g in design.gates if g.gate_type != GateType.DFF and g.inst_name not in live]
+    return [g for g in design.gates if g.gate_type != GateType.DFF and g.inst_name not in live]
+
+
+def count_dangling_gates(design: Design) -> int:
+    """How many gates `remove_dangling_gates` would remove, without removing
+    any. Does not modify `design`."""
+    return len(_dangling_gates(design))
+
+
+def remove_dangling_gates(design: Design) -> int:
+    """Remove every non-DFF gate that cannot reach a primary output or any
+    DFF's D/CK/RN/SN pin. DFFs themselves are never removed by this sweep --
+    they are treated as protected state elements, matching graph.py's
+    sequential-boundary convention (a DFF is always a pseudo-source/sink,
+    never itself analyzed for further reachability).
+    """
+    dangling = _dangling_gates(design)
     for g in dangling:
         design.remove_gate(g)
     return len(dangling)

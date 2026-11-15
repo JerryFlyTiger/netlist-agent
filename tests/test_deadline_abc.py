@@ -350,14 +350,15 @@ def test_optimize_depth_with_spent_budget_returns_original(monkeypatch, clock, t
     assert spawns.timeouts == []
 
 
-def test_optimize_depth_budget_clamped_timeout_triggers_quick_script(monkeypatch, clock, tmp_path) -> None:
-    """kills: the clamped-timeout `_SynthTimeout` not being recognized as a timeout by the depth
-    path (no quick-script retry). Real `_run_abc_synthesis`; only `subprocess.run` is fake."""
+def test_optimize_depth_budget_clamped_timeout_skips_the_remaining_candidates(monkeypatch, clock, tmp_path) -> None:
+    """kills: the clamped-timeout `_SynthTimeout` escaping, or later candidates being started with
+    no budget left (34b-1 D10: from the 2nd candidate on, `remaining - 0.35 * budget` must be >= 10s).
+    Was the batch-30 quick-script retry test. Real `_run_abc_synthesis`; only `subprocess.run` is fake."""
     design = _design(tmp_path, _CHAIN_V)
     monkeypatch.setattr(abc_synth_module, "_resolve_abc", lambda: "/fake/abc")
 
     def first_times_out(t):
-        clock["t"] = 9.8  # the full script ate the budget; the quick retry cannot start
+        clock["t"] = 9.8  # the first candidate ate the budget; no other can start
         _raise_timeout(t)
 
     spawns = _Spawns(monkeypatch, first_times_out)
@@ -368,5 +369,6 @@ def test_optimize_depth_budget_clamped_timeout_triggers_quick_script(monkeypatch
     assert len(spawns.timeouts) == 1
     assert result.failure is not None
     assert _BUDGET_MSG in result.failure
-    assert "the quick fallback script also failed" in result.failure
-    assert "was not started" in result.failure
+    assert "more candidate(s) did not complete" in result.failure
+    skipped = "skipped: not enough of this request's time budget was left for another candidate"
+    assert result.incomplete[1:] == (skipped,) * (result.candidates - 1)

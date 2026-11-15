@@ -1300,7 +1300,7 @@ def test_optimize_depth_tool_contract(tmp_path) -> None:
     depth_before = TOOL_REGISTRY["get_max_design_depth"](session)["depth"]
 
     result = TOOL_REGISTRY["do_optimize_depth"](session)
-    assert set(result) == {"changed", "depth_before", "depth_after", "note", "failure"}
+    assert set(result) == {"changed", "depth_before", "depth_after", "note", "failure", "incomplete"}
     assert result["depth_before"] == depth_before
     assert result["depth_after"] <= depth_before
     assert isinstance(result["changed"], bool)
@@ -1363,6 +1363,40 @@ def test_area_optimize_tools_report_incomplete_candidates(tmp_path, monkeypatch,
     assert result["incomplete"] == ["first candidate broken"]
 
 
+@pytest.mark.parametrize(
+    "tool,kwargs",
+    [("do_optimize_depth", {}), ("do_optimize_cone_depth", {"net": "n20"})],
+)
+def test_depth_optimize_tools_report_incomplete_candidates(tmp_path, monkeypatch, tool, kwargs) -> None:
+    """Batch 34b-2: a depth candidate script that failed while another
+    completed leaves `failure` None but must show up in `incomplete`."""
+    from netlist_agent import abc_synth
+    from netlist_agent.abc_bridge import ABCBridgeError
+
+    real_run = abc_synth._run_abc_synthesis
+
+    def _non_first_fail(view, basis, timeout, opt_script=abc_synth._OPT_SCRIPT):
+        if opt_script != abc_synth._OPT_SCRIPT:
+            raise ABCBridgeError("later candidate broken")
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth, "_run_abc_synthesis", _non_first_fail)
+    session = _new_session(tmp_path)
+    result = TOOL_REGISTRY[tool](session, **kwargs)
+    assert result["failure"] is None
+    assert result["incomplete"] == ["later candidate broken"] * 3
+
+
+@pytest.mark.parametrize("name", ["do_optimize_depth", "do_optimize_cone_depth"])
+def test_depth_opt_tool_descriptions_warn_incomplete_is_not_optimal(name) -> None:
+    spec = next(t for t in TOOL_SCHEMA if t.name == name)
+    assert "`incomplete`" in spec.description
+    assert "do NOT say" in spec.description and "not ruled out" in spec.description
+    assert "equivalence check FAILED" in spec.description
+    assert "reports the design as already optimal" not in spec.description
+    assert "reports the cone as already optimal" not in spec.description
+
+
 def test_optimize_depth_tool_rejects_unknown_basis(tmp_path) -> None:
     session = _new_session(tmp_path)
     with pytest.raises(ToolError):
@@ -1374,7 +1408,7 @@ def test_optimize_cone_depth_tool_contract(tmp_path) -> None:
     depth_before = TOOL_REGISTRY["get_depth_of_cone"](session, net="n20")["depth"]
 
     result = TOOL_REGISTRY["do_optimize_cone_depth"](session, net="n20", basis="and_not")
-    assert set(result) == {"changed", "depth_before", "depth_after", "note", "failure"}
+    assert set(result) == {"changed", "depth_before", "depth_after", "note", "failure", "incomplete"}
     assert result["depth_before"] == depth_before
     assert result["depth_after"] <= depth_before
     assert TOOL_REGISTRY["get_depth_of_cone"](session, net="n20")["depth"] == result["depth_after"]

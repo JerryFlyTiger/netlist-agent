@@ -32,16 +32,19 @@ abc_bridge.py's module docstring for the same discipline applied to stage 4):
      `map`. Every genlib generated here therefore always includes both
      constant gates, unconditionally.
 
-  3. Depth-oriented pre-map script: `strash; balance; dch` beats every other
-     sequence tried (`rewrite`/`refactor` rounds, `dch` followed by more
-     `balance`/`rewrite`, resyn2-style scripts) on real corpus files, judged
-     by the FINAL MAPPED depth (`map`'s reported `lev`, not the AIG's own
-     level count): test22's combinational view maps to depth 47 (vs. 48-49
-     for balance/rewrite-only scripts), and test28's (an AND/NOT-only,
-     48k-gate design after an earlier `remap_to_basis` step) maps to depth
-     104 (vs. 125-130 for scripts that add more balance/rewrite AFTER dch --
-     empirically that makes this particular design's mapped depth WORSE, not
-     better, so the script stops at plain `dch`).
+  3. Pre-map scripts, judged by the FINAL MAPPED depth (`map`'s reported
+     `lev`, not the AIG's own level count). `strash; balance; dch` beat or
+     tied the `rewrite`/`refactor` rounds, `dch` followed by more
+     `balance`/`rewrite` and resyn2-style scripts on real corpus files
+     (basis `and_not`, re-checked 2026-11-15: test22's combinational view
+     maps to depth 47 vs. 47-49, the tie being dch followed by more
+     balance/rewrite; test28 after remap to AND/NOT, 48k gates, to 102 vs.
+     130-131), so it remains the area path's candidate #1. For DEPTH it is
+     not always the best: batch 34 measured SOP-balancing chains
+     (`if -g -K 6`) at test22 depth 13 (basis unrestricted; vs. 41
+     unoptimized, 24 with `_OPT_SCRIPT`; SPEC_34 G3), so the depth paths try
+     several candidate scripts (`_DEPTH_SMALL_SCRIPTS` /
+     `_DEPTH_LARGE_SCRIPTS`) and keep the best.
 
   4. The mapped BLIF's `.gate` lines are read back via a small
      hand-written parser (not a general BLIF library): `.inputs`/`.outputs`
@@ -173,7 +176,8 @@ class _SynthError(Exception):
 class _SynthTimeout(_SynthError):
     """The ABC subprocess hit its timeout (as opposed to crashing or erroring).
     A subclass so every existing `except _SynthError` still catches it; the
-    depth paths use the distinction to retry once with `_FAST_OPT_SCRIPT`."""
+    depth paths record it as that candidate's `incomplete` reason and go on
+    to the next candidate script."""
 
 
 @dataclass(frozen=True)
@@ -260,7 +264,9 @@ def parse_blif(text: str) -> _BlifNetlist:
 # depth-oriented member of _AREA_CANDIDATE_SCRIPTS below).
 _OPT_SCRIPT = "strash; balance; dch"
 
-# Quick depth script, only ever tried after `_OPT_SCRIPT` timed out (batch 30).
+# Quick depth script, the first candidate of the large-design list (batch 30
+# introduced it as the retry after `_OPT_SCRIPT` timed out; batch 34b-1 made it
+# candidate #1 for views above `_DEPTH_LARGE_THRESHOLD`).
 # Measured on a 213k-gate design: `strash; balance` takes 2.7s and reaches the
 # same depth (48) as the full script, which took 65s at load 10 and hit the
 # 120s cap in another run at load 20-48. The two are separate measurements
@@ -279,33 +285,39 @@ _FAST_OPT_SCRIPT = "strash; balance"
 # including any caller-supplied hard depth budget).
 _AREA_CANDIDATE_SCRIPTS: tuple[str, ...] = (_OPT_SCRIPT, "strash; dc2; resub; dc2")
 
-
-def _run_depth_synthesis(
-    view: Design, basis: Optional[str], timeout: float
-) -> tuple[_BlifNetlist, Optional[str]]:
-    """Run the full depth script; if (and only if) it TIMED OUT, retry once
-    with `_FAST_OPT_SCRIPT`. Returns `(blif, primary)` where `primary` is the
-    full script's timeout text when the quick script produced the BLIF, else
-    None. A quick-script failure is re-raised as a plain `_SynthError` that
-    carries both reasons; a non-timeout failure of the full script is not
-    retried (a crash or unparseable BLIF would fail again)."""
-    try:
-        return _run_abc_synthesis(view, basis, timeout), None
-    except _SynthTimeout as exc:
-        primary = str(exc)
-    try:
-        return _run_abc_synthesis(view, basis, timeout, _FAST_OPT_SCRIPT), primary
-    except (ABCBridgeError, _SynthError) as fast_exc:
-        raise _SynthError(f"{primary}; the quick fallback script also failed: {fast_exc}") from fast_exc
+# Depth candidate scripts (batch 34b-1, D6). Source: FINDINGS.md of the batch-34
+# experiment (13 scripts measured): test051 (213k gates) cannot finish the full
+# script in 120s but `&sopb` x2 (no dch) reaches 18-25s; on small designs the
+# `if -g -K 6` (SOP balancing) chain x4 was best of 13; test064 is only best
+# with the current script and test062 only with the XOR one, so both stay.
+_DEPTH_LARGE_THRESHOLD = 150_000  # gates in the view ABC gets
+_DEPTH_SOP_ROUNDS_SMALL = 4
+_DEPTH_SOP_ROUNDS_LONG = 8
 
 
-def quick_fallback_sentence(primary: str) -> str:
-    """The honest tail appended to a successful depth reduction that came from
-    the quick script (shared by the result `note` and the router response)."""
-    return (
-        f"ABC's full script timed out ({primary}), so this used a quicker script "
-        f"and a lower depth may exist."
-    )
+def _sop_script(rounds: int) -> str:
+    return "strash; " + "if -g -K 6; strash; " * rounds + "balance; dch"
+
+
+_DEPTH_SMALL_SCRIPTS: tuple[str, ...] = (
+    _OPT_SCRIPT,
+    _sop_script(_DEPTH_SOP_ROUNDS_SMALL),
+    "strash; balance; dch; if -x -K 6; strash; balance",
+    _sop_script(_DEPTH_SOP_ROUNDS_LONG),
+)
+_DEPTH_LARGE_SCRIPTS: tuple[str, ...] = (
+    _FAST_OPT_SCRIPT,
+    "strash; &get -n; &st; &sopb; &sopb; &put; balance",
+)
+
+# Budget for candidates 2.. when the request has a time budget (D10): keep
+# `reserve = 0.35 * budget` (about 95s of 270s) for cec and Python-side work,
+# and do not start a candidate with less than 10s of the remainder. Source:
+# FINDINGS test051 measurement -- cec 66s, Python about 23s.
+# The same constant also guards the post-cec rebuild of a runner-up, but there
+# it is compared against the raw `remaining()` (no reserve subtracted).
+_DEPTH_RESERVE_FRACTION = 0.35
+_DEPTH_MIN_CANDIDATE_SECONDS = 10.0
 
 
 def depth_change_sentence(subject: str, depth_before: int, depth_after: int, gates_before: int, gates_after: int) -> str:
@@ -635,51 +647,207 @@ class DepthOptResult:
     depth_before: int
     depth_after: int
     note: str
-    # Non-None: optimization did NOT complete (ABC crashed/errored/timed out,
-    # produced an unparseable BLIF, or the post-synthesis equivalence check
-    # itself raised or found a mismatch) -- a short, human-readable reason,
-    # never derived from `note` (router reads this field, not `note`, to
-    # decide how to phrase failure). None says nothing about whether
-    # anything ran: it is also the value of the depth-0 early return, where
-    # ABC never ran. It only means "no failure was recorded".
+    # Non-None: optimization did NOT complete (every candidate script failed or
+    # was skipped, or the winner's post-synthesis equivalence check raised or
+    # found a mismatch) -- a short, human-readable reason, never derived from
+    # `note` (router reads this field, not `note`, to decide how to phrase
+    # failure). None says nothing about whether anything ran: it is also the
+    # value of the depth-0 early return, where ABC never ran. It only means
+    # "no failure was recorded". Some candidate completed and none was
+    # accepted => None (see `incomplete`).
     failure: Optional[str] = None
-    # Non-None: the full script timed out and the committed result came from
-    # `_FAST_OPT_SCRIPT`; holds the full script's timeout text.
-    quick_fallback: Optional[str] = None
+    # One reason per candidate script that did not run to completion (synthesis
+    # error/timeout or skipped for lack of time budget, in script order; then
+    # the reasons from ranking: an inconclusive equivalence check, a failed
+    # rebuild, or a skipped rebuild). Filled on success too:
+    # it says "a lower depth may exist". When the equivalence check finds a
+    # mismatch, the last entry is the `failure` itself.
+    # Always len(incomplete) <= candidates.
+    incomplete: tuple[str, ...] = ()
+    # Number of candidate scripts in the list for this design size.
+    candidates: int = 1
 
 
 _CONE_OUT_TOKEN = "__depth_opt_cone_out__"
 
 
-def _failure_with_primary(detail: str, primary: Optional[str]) -> str:
-    """`failure` text for an error raised after the quick script produced the
-    BLIF (splice, equivalence-check or mismatch step): it must still carry the
-    full script's timeout. `primary` None (full script ran) leaves it as is."""
-    if primary is None:
-        return detail
-    return f"{primary}; the quick fallback script's result was rejected: {detail}"
+def _depth_candidate_scripts(gate_count: int) -> tuple[str, ...]:
+    """The candidate list for a view of `gate_count` gates (D6)."""
+    if gate_count > _DEPTH_LARGE_THRESHOLD:
+        return _DEPTH_LARGE_SCRIPTS
+    return _DEPTH_SMALL_SCRIPTS
 
 
-def _no_improvement_result(design: Design, depth_before: int, primary: Optional[str]) -> DepthOptResult:
-    """The accept gate rejected the result. "Already optimal" is only true when
-    the full script ran to completion; after a quick-script fallback it is a
-    failure, never an optimality claim."""
-    if primary is not None:
-        failure = f"{primary}; the quick fallback script found no improvement"
+@dataclass
+class _Accepted:
+    """A candidate that passed the accept gate (not yet equivalence-checked)."""
+
+    depth: int
+    gates: int
+    order: int
+    work: Optional[Design]  # only the current best keeps its Design (the loop body also holds the one being built)
+    blif: _BlifNetlist
+
+
+def _optimize_depth_candidates(
+    design: Design,
+    basis: Optional[str],
+    timeout: float,
+    verify_timeout: float,
+    depth_before: int,
+    baseline: int,
+    subject: str,
+    prepare: Callable[[], tuple[Design, Design, dict[str, NetBit]]],
+    splice: Callable[[Design, _BlifNetlist, dict[str, NetBit]], None],
+    measure: Callable[[Design], int],
+) -> DepthOptResult:
+    """Shared body of `optimize_depth` / `optimize_cone_depth` (D6-D12).
+
+    `prepare()` deep-copies `design` and returns `(work, view, promoted_q_source)`
+    where `view` is what ABC gets (whole comb view, or the restricted cone)."""
+
+    def failure_result(failure: str, incomplete: tuple[str, ...], n: int, note: Optional[str] = None) -> DepthOptResult:
         return DepthOptResult(
             design,
             False,
             depth_before,
             depth_before,
-            f"ABC could not improve depth ({failure}); kept the original design.",
+            note or f"ABC could not improve depth ({failure}); kept the original design.",
             failure=failure,
+            incomplete=incomplete,
+            candidates=n,
         )
+
+    try:
+        first = prepare()
+    except (ABCBridgeError, _SynthError) as exc:
+        return failure_result(str(exc), (str(exc),), 1)
+    scripts = _depth_candidate_scripts(len(first[1].gates))
+    n = len(scripts)
+
+    incomplete: list[str] = []
+    completed = 0
+    accepted: list[_Accepted] = []  # in candidate order
+    best: Optional[_Accepted] = None
+    out_of_time = False
+    for order, script in enumerate(scripts):
+        cand_timeout = timeout
+        if order >= 1:
+            left = deadline.remaining()
+            if left is not None:
+                avail = left - _DEPTH_RESERVE_FRACTION * (deadline.current_budget() or 0.0)
+                if out_of_time or avail < _DEPTH_MIN_CANDIDATE_SECONDS:
+                    out_of_time = True
+                    incomplete.append(
+                        "skipped: not enough of this request's time budget was left for another candidate"
+                    )
+                    continue
+                cand_timeout = min(timeout, avail)
+        try:
+            if order == 0:
+                work, view, promoted_q_source = first
+                first = None  # drop the extra reference: it must not outlive candidate 0
+            else:
+                work = view = promoted_q_source = None  # free the previous candidate before building the next
+                work, view, promoted_q_source = prepare()
+            blif = _run_abc_synthesis(view, basis, cand_timeout, script)
+            splice(work, blif, promoted_q_source)
+            remove_dangling_gates(work)
+        except (ABCBridgeError, _SynthError) as exc:
+            incomplete.append(str(exc))
+            continue
+        completed += 1
+        depth_after = measure(work)
+        if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < baseline):
+            cand = _Accepted(depth_after, len(work.gates), order, work, blif)
+            accepted.append(cand)
+            if best is None or (cand.depth, cand.gates, cand.order) < (best.depth, best.gates, best.order):
+                if best is not None:
+                    best.work = None
+                best = cand
+            else:
+                cand.work = None
+
+    work = view = promoted_q_source = None
+    # Rank the accepted candidates; cec only the first, then (undecided) the next.
+    ranked = sorted(accepted, key=lambda c: (c.depth, c.gates, c.order))
+    cec_reasons: list[str] = []
+    rebuild_out_of_time = False
+    for cand in ranked:
+        work = cand.work
+        if work is None:
+            if not rebuild_out_of_time:
+                left = deadline.remaining()
+                rebuild_out_of_time = left is not None and left < _DEPTH_MIN_CANDIDATE_SECONDS
+            if rebuild_out_of_time:
+                reason = "skipped: not enough of this request's time budget was left to rebuild and verify another candidate"
+                incomplete.append(reason)
+                continue
+            try:
+                work, view, promoted_q_source = prepare()
+                splice(work, cand.blif, promoted_q_source)
+                remove_dangling_gates(work)
+            except (ABCBridgeError, _SynthError) as exc:
+                reason = f"could not rebuild a candidate result: {exc}"
+                incomplete.append(reason)
+                cec_reasons.append(reason)
+                continue
+        try:
+            eq = verify_equivalence(design, work, timeout=verify_timeout)
+        except ABCBridgeError as exc:
+            # "Inconclusive" (timeout / undecided) is not "failed": ABC gave no
+            # verdict, which must not read as a mismatch. Any other bridge error
+            # stays loud under the old prefix.
+            reason = f"{_verify_failure_prefix(exc)}: {exc}"
+            incomplete.append(reason)
+            cec_reasons.append(reason)
+            continue
+        if not eq.equivalent:
+            # Not equivalent means the splice or ABC has a bug: never swap in
+            # the next candidate to hide it.
+            failure = f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}"
+            return failure_result(
+                failure,
+                tuple(incomplete) + (failure,),
+                n,
+                note=(
+                    f"Equivalence check failed after resynthesis (this indicates a bug, not a normal outcome) -- "
+                    f"kept the original design untouched. Detail: {eq.detail}"
+                ),
+            )
+        note = depth_change_sentence(subject, depth_before, cand.depth, len(design.gates), len(work.gates))
+        if incomplete:
+            note += (
+                f" {len(incomplete)} of {n} candidate scripts did not finish ({incomplete[0]}), "
+                f"so a lower depth may exist."
+            )
+        return DepthOptResult(
+            work, True, depth_before, cand.depth, note, incomplete=tuple(incomplete), candidates=n
+        )
+
+    inc = tuple(incomplete)
+    if cec_reasons:
+        # Every accepted candidate's equivalence check was undecided.
+        return failure_result(cec_reasons[0], inc, n)
+    if completed == 0:
+        failure = incomplete[0]
+        if len(incomplete) > 1:
+            failure += f"; and {len(incomplete) - 1} more candidate(s) did not complete"
+        return failure_result(failure, inc, n)
+    if incomplete:
+        note = (
+            f"Depth {depth_before} was not reduced by the candidate scripts that completed, but "
+            f"{len(incomplete)} of {n} could not be completed ({incomplete[0]}), so a lower depth is "
+            f"not ruled out; design unchanged."
+        )
+        return DepthOptResult(design, False, depth_before, depth_before, note, incomplete=inc, candidates=n)
     return DepthOptResult(
         design,
         False,
         depth_before,
         depth_before,
         f"Depth {depth_before} is already optimal under the given constraints; design unchanged.",
+        candidates=n,
     )
 
 
@@ -695,28 +863,32 @@ def optimize_depth(
     primitives plus NOT/BUF), then splice the result back in place of the
     original combinational gates.
 
-    Never mutates `design` in place: all work happens on a `copy.deepcopy`,
-    committed (returned as `result.design`) only if ABC synthesis succeeds,
-    the spliced result verifies functionally equivalent to the untouched
-    `design` (via `verify_equivalence`, across the same DFF boundary
-    convention used everywhere else in this codebase), AND depth genuinely
-    improved. Every failure mode -- ABC crashing/erroring, a timeout the
-    single `_FAST_OPT_SCRIPT` retry could not recover from, a BLIF this module
-    can't parse, or (should it ever happen) a failed equivalence check --
-    degrades to `changed=False` with `design` (the original, untouched object)
-    returned unchanged, never raises out of this function and never leaves
-    `design` partially mutated.
+    Several candidate scripts are tried (`_DEPTH_SMALL_SCRIPTS`, or
+    `_DEPTH_LARGE_SCRIPTS` above `_DEPTH_LARGE_THRESHOLD` gates), each as a
+    full round trip on its own deep copy. Candidates passing the accept gate
+    are ranked by `(depth, gate count, script order)`; only the first is
+    equivalence-checked. An undecided check falls back to the next (rebuilt
+    from its BLIF, no second ABC run); a NOT-equivalent verdict stops at once
+    and returns the original (it means a bug).
 
-    Accept-or-reject rule (judgment call, documented per the project's
-    acceptance-gating contract): accept if the resynthesized depth is
-    STRICTLY lower, or equal with a lower total gate count (a tie-breaker
-    favoring the smaller of two equal-depth designs); otherwise reject. The
-    gate-count comparison baseline is the original gate count minus the gates
-    that were already dangling (those are swept and must not count as a gain). The
-    original is reported as already optimal only when the full script ran to
-    completion; after a quick-script fallback the rejection is a `failure`.
+    Never mutates `design` in place: all work happens on `copy.deepcopy`s,
+    committed (returned as `result.design`) only if a candidate verifies
+    functionally equivalent to the untouched `design` (via
+    `verify_equivalence`, across the same DFF boundary convention used
+    everywhere else in this codebase) AND depth genuinely improved. Every
+    failure mode degrades to `changed=False` with `design` (the original,
+    untouched object) returned unchanged, never raises out of this function
+    and never leaves `design` partially mutated.
 
-    `verify_timeout` bounds the final `cec` equivalence check only; it is
+    Accept rule: a candidate is accepted if its depth is STRICTLY lower, or
+    equal with a lower total gate count (a tie-breaker favoring the smaller of
+    two equal-depth designs). The gate-count comparison baseline is the
+    original gate count minus the gates that were already dangling (those are
+    swept and must not count as a gain). "Already optimal" is only claimed
+    when every candidate ran to completion; otherwise `incomplete` says which
+    did not and the note says a lower depth is not ruled out.
+
+    `verify_timeout` bounds each `cec` equivalence check only; it is
     separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
@@ -725,65 +897,24 @@ def optimize_depth(
     if depth_before == 0:
         return DepthOptResult(design, False, 0, 0, "Design has zero combinational depth already; nothing to optimize.")
 
-    work = copy.deepcopy(design)
-    primary: Optional[str] = None
-    try:
+    def prepare() -> tuple[Design, Design, dict[str, NetBit]]:
+        work = copy.deepcopy(design)
         promoted_q_source: dict[str, NetBit] = {}
         comb = extract_combinational_view(work, "free_pi", promoted_q_source)
-        blif, primary = _run_depth_synthesis(comb, basis, timeout)
-        _splice_whole_design(work, blif, promoted_q_source)
-        remove_dangling_gates(work)
-    except (ABCBridgeError, _SynthError) as exc:
-        failure = _failure_with_primary(str(exc), primary)
-        return DepthOptResult(
-            design,
-            False,
-            depth_before,
-            depth_before,
-            f"ABC could not improve depth ({failure}); kept the original design.",
-            failure=failure,
-        )
+        return work, comb, promoted_q_source
 
-    try:
-        eq = verify_equivalence(design, work, timeout=verify_timeout)
-    except ABCBridgeError as exc:
-        # "Inconclusive" (timeout / undecided) is not "failed": ABC gave no
-        # verdict, which must not read as a mismatch. Any other bridge error
-        # stays loud under the old prefix.
-        prefix = _verify_failure_prefix(exc)
-        failure = _failure_with_primary(f"{prefix}: {exc}", primary)
-        return DepthOptResult(
-            design,
-            False,
-            depth_before,
-            depth_before,
-            f"ABC could not improve depth ({failure}); kept the original design.",
-            failure=failure,
-        )
-    if not eq.equivalent:
-        failure = _failure_with_primary(
-            f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}", primary
-        )
-        return DepthOptResult(
-            design,
-            False,
-            depth_before,
-            depth_before,
-            f"Equivalence check failed after resynthesis (this indicates a bug, not a normal outcome) -- "
-            f"kept the original design untouched. Detail: {eq.detail}"
-            + ("" if primary is None else f" (Context: {primary}; the result came from the quick fallback script.)"),
-            failure=failure,
-        )
-
-    depth_after = NetlistGraph(work).max_design_depth()
-    if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < baseline):
-        note = depth_change_sentence(
-            "maximum logic depth", depth_before, depth_after, len(design.gates), len(work.gates)
-        )
-        if primary is not None:
-            note = f"{note} {quick_fallback_sentence(primary)}"
-        return DepthOptResult(work, True, depth_before, depth_after, note, quick_fallback=primary)
-    return _no_improvement_result(design, depth_before, primary)
+    return _optimize_depth_candidates(
+        design,
+        basis,
+        timeout,
+        verify_timeout,
+        depth_before,
+        baseline,
+        "maximum logic depth",
+        prepare,
+        _splice_whole_design,
+        lambda w: NetlistGraph(w).max_design_depth(),
+    )
 
 
 def optimize_cone_depth(
@@ -810,13 +941,13 @@ def optimize_cone_depth(
     elsewhere survives automatically, since it's still reachable from
     there).
 
-    Same never-mutates-`design`-in-place, always-verify, same accept/reject
-    rule as `optimize_depth` (see its docstring, including that the gate-count
-    baseline excludes gates that were already dangling) -- restricted to a single
-    net-bit's cone depth (`NetlistGraph.depth_to_sink`) rather than the whole
-    design's.
+    Same never-mutates-`design`-in-place, always-verify, same multi-candidate
+    and accept/reject rule as `optimize_depth` (see its docstring, including
+    that the gate-count baseline excludes gates that were already dangling)
+    -- restricted to a single net-bit's cone depth
+    (`NetlistGraph.depth_to_sink`) rather than the whole design's.
 
-    `verify_timeout` bounds the final `cec` equivalence check only; it is
+    `verify_timeout` bounds each `cec` equivalence check only; it is
     separate from `timeout` (ABC synthesis), default `DEFAULT_VERIFY_TIMEOUT`.
     """
     _validate_basis(basis)
@@ -825,69 +956,28 @@ def optimize_cone_depth(
     if depth_before == 0:
         return DepthOptResult(design, False, 0, 0, f"Depth of the cone of {netbit_token(target)} is already 0; nothing to optimize.")
 
-    work = copy.deepcopy(design)
-    primary: Optional[str] = None
-    try:
+    def prepare() -> tuple[Design, Design, dict[str, NetBit]]:
+        work = copy.deepcopy(design)
         promoted_q_source: dict[str, NetBit] = {}
         # Every original net (Q nets included) keeps its name in `comb`:
         # a Q net is just re-driven by a BUF from its `__dff_Q__<inst>` PI,
         # so `target` needs no mapping.
         comb = extract_combinational_view(work, "free_pi", promoted_q_source)
         cone = _restrict_to_fanin_cone(comb, target, _CONE_OUT_TOKEN)
-        blif, primary = _run_depth_synthesis(cone, basis, timeout)
-        _splice_cone(work, target, blif, _CONE_OUT_TOKEN, promoted_q_source)
-        remove_dangling_gates(work)
-    except (ABCBridgeError, _SynthError) as exc:
-        failure = _failure_with_primary(str(exc), primary)
-        return DepthOptResult(
-            design,
-            False,
-            depth_before,
-            depth_before,
-            f"ABC could not improve depth ({failure}); kept the original design.",
-            failure=failure,
-        )
+        return work, cone, promoted_q_source
 
-    try:
-        eq = verify_equivalence(design, work, timeout=verify_timeout)
-    except ABCBridgeError as exc:
-        # "Inconclusive" (timeout / undecided) is not "failed": ABC gave no
-        # verdict, which must not read as a mismatch. Any other bridge error
-        # stays loud under the old prefix.
-        prefix = _verify_failure_prefix(exc)
-        failure = _failure_with_primary(f"{prefix}: {exc}", primary)
-        return DepthOptResult(
-            design,
-            False,
-            depth_before,
-            depth_before,
-            f"ABC could not improve depth ({failure}); kept the original design.",
-            failure=failure,
-        )
-    if not eq.equivalent:
-        failure = _failure_with_primary(
-            f"equivalence check found the resynthesized design not equivalent to the original: {eq.detail}", primary
-        )
-        return DepthOptResult(
-            design,
-            False,
-            depth_before,
-            depth_before,
-            f"Equivalence check failed after resynthesis (this indicates a bug, not a normal outcome) -- "
-            f"kept the original design untouched. Detail: {eq.detail}"
-            + ("" if primary is None else f" (Context: {primary}; the result came from the quick fallback script.)"),
-            failure=failure,
-        )
-
-    depth_after = NetlistGraph(work).depth_to_sink(target)
-    if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < baseline):
-        note = depth_change_sentence(
-            f"the depth of the cone of {netbit_token(target)}", depth_before, depth_after, len(design.gates), len(work.gates)
-        )
-        if primary is not None:
-            note = f"{note} {quick_fallback_sentence(primary)}"
-        return DepthOptResult(work, True, depth_before, depth_after, note, quick_fallback=primary)
-    return _no_improvement_result(design, depth_before, primary)
+    return _optimize_depth_candidates(
+        design,
+        basis,
+        timeout,
+        verify_timeout,
+        depth_before,
+        baseline,
+        f"the depth of the cone of {netbit_token(target)}",
+        prepare,
+        lambda w, b, p: _splice_cone(w, target, b, _CONE_OUT_TOKEN, p),
+        lambda w: NetlistGraph(w).depth_to_sink(target),
+    )
 
 
 # ----------------------------------------------------------------------

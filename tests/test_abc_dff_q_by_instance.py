@@ -525,7 +525,9 @@ def test_verify_equivalence_default_timeout_is_verify_timeout(monkeypatch) -> No
 @pytest.mark.parametrize(
     "fn, path, target",
     [
-        (optimize_depth, BUS_A, None),
+        # BUS_C, not BUS_A: depth optimization only runs cec on a candidate that improves depth (34b-1 D9),
+        # and no candidate improves BUS_A, so the verify timeout would never be exercised.
+        (optimize_depth, BUS_C, None),
         (optimize_gate_count, BUS_A, None),
         (optimize_cone_depth, BUS_C, NetBit("y", None)),
         (optimize_cone_gate_count, BUS_C, NetBit("y", None)),
@@ -561,7 +563,9 @@ def test_default_timeout_constants() -> None:
 @pytest.mark.parametrize(
     "fn, path, target",
     [
-        (optimize_depth, BUS_A, None),
+        # BUS_C, not BUS_A: depth optimization only runs cec on a candidate that improves depth (34b-1 D9),
+        # and no candidate improves BUS_A, so the verify timeout would never be exercised.
+        (optimize_depth, BUS_C, None),
         (optimize_gate_count, BUS_A, None),
         (optimize_cone_depth, BUS_C, NetBit("y", None)),
         (optimize_cone_gate_count, BUS_C, NetBit("y", None)),

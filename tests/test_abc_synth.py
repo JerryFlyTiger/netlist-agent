@@ -1165,12 +1165,17 @@ def test_optimize_depth_locator_failure_is_one_clean_line(monkeypatch) -> None:
 
 
 # ----------------------------------------------------------------------
-# Batch 30: a timed-out full depth script retries once with the quick script
-# (`strash; balance`). Only a TIMEOUT retries; the quick result goes through
-# the same acceptance gates; "already optimal" is never claimed after it.
+# Batch 30 -> 34b-1: the single quick-script retry was replaced by a candidate
+# list (`_DEPTH_SMALL_SCRIPTS`). A candidate that times out / errors is recorded
+# in `incomplete` and the others still run; "already optimal" is never claimed
+# while any candidate did not finish; the winner's `cec` result decides.
+# (These tests were the batch-30 quick-fallback tests; each was rewritten for
+# the new behavior, see the 34b-1 report. The old `quick_fallback` field was
+# removed in 34b-2.)
 # ----------------------------------------------------------------------
 
 _PRIMARY_TIMEOUT = "ABC synthesis timed out after 120s"
+_SMALL = abc_synth_module._DEPTH_SMALL_SCRIPTS
 _QUICK_CASES = [
     ("whole", _build_and_chain, lambda d: optimize_depth(d)),
     ("cone", _build_two_cone_design, lambda d: optimize_cone_depth(d, _nb("y"))),
@@ -1178,9 +1183,9 @@ _QUICK_CASES = [
 _QUICK_IDS = [c[0] for c in _QUICK_CASES]
 
 
-def _times_out_then(monkeypatch, fast):
-    """Full script raises `_SynthTimeout`; the quick script runs `fast(real_run,
-    view, basis, timeout)`. Returns the list of `opt_script`s it was called with."""
+def _times_out_then(monkeypatch, rest):
+    """The first candidate (`_OPT_SCRIPT`) raises `_SynthTimeout`; every later one runs
+    `rest(real_run, view, basis, timeout, opt_script)`. Returns the list of `opt_script`s."""
     real_run = abc_synth_module._run_abc_synthesis
     scripts: list[str] = []
 
@@ -1188,13 +1193,13 @@ def _times_out_then(monkeypatch, fast):
         scripts.append(opt_script)
         if opt_script == abc_synth_module._OPT_SCRIPT:
             raise abc_synth_module._SynthTimeout(_PRIMARY_TIMEOUT)
-        return fast(real_run, view, basis, timeout, opt_script)
+        return rest(real_run, view, basis, timeout, opt_script)
 
     monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
     return scripts
 
 
-def _real_fast(real_run, view, basis, timeout, opt_script):
+def _real_rest(real_run, view, basis, timeout, opt_script):
     return real_run(view, basis, timeout, opt_script)
 
 
@@ -1203,60 +1208,66 @@ def test_synth_timeout_is_a_synth_error() -> None:
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_improvement_is_committed_with_honest_note(monkeypatch, name, build, call) -> None:
-    """spec 1 + D9."""
-    scripts = _times_out_then(monkeypatch, _real_fast)
+def test_timed_out_first_candidate_improvement_is_committed_with_honest_note(monkeypatch, name, build, call) -> None:
+    """was: quick fallback improvement committed. Now the other candidates win and the note says one did not finish."""
+    scripts = _times_out_then(monkeypatch, _real_rest)
     design = build()
     result = call(design)
-    assert scripts == [abc_synth_module._OPT_SCRIPT, abc_synth_module._FAST_OPT_SCRIPT]
+    assert scripts == list(_SMALL)
     assert result.changed is True
     assert result.design is not design
     assert result.failure is None
-    assert result.quick_fallback == _PRIMARY_TIMEOUT
+    assert result.incomplete == (_PRIMARY_TIMEOUT,)
+    assert result.candidates == len(_SMALL)
     assert result.depth_after < result.depth_before
     assert result.note.startswith("Reduced ")
     assert result.note.endswith(
-        f"ABC's full script timed out ({_PRIMARY_TIMEOUT}), so this used a quicker script and a lower depth may exist."
+        f" 1 of {len(_SMALL)} candidate scripts did not finish ({_PRIMARY_TIMEOUT}), so a lower depth may exist."
     )
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_without_improvement_is_a_failure_not_already_optimal(monkeypatch, name, build, call) -> None:
-    """spec 2 + D7: the full script never completed, so no optimality claim."""
-    scripts = _times_out_then(monkeypatch, _real_fast)
+def test_no_improvement_with_a_timed_out_candidate_is_not_ruled_out_not_a_failure(monkeypatch, name, build, call) -> None:
+    """was: quick fallback without improvement is a failure. Now (D12) the other candidates
+    completed, so it is no failure, but no optimality claim either."""
+    scripts = _times_out_then(monkeypatch, _real_rest)
     design = _build_single_and()
     result = call(design) if name == "whole" else optimize_cone_depth(design, _nb("y"))
-    assert len(scripts) == 2
+    assert len(scripts) == len(_SMALL)
     assert result.changed is False
     assert result.design is design
-    assert result.failure == f"{_PRIMARY_TIMEOUT}; the quick fallback script found no improvement"
+    assert result.failure is None
     assert "already optimal" not in result.note
-    assert result.quick_fallback is None
+    assert "a lower depth is not ruled out" in result.note
+    assert f"1 of {len(_SMALL)} could not be completed ({_PRIMARY_TIMEOUT})" in result.note
+    assert result.incomplete == (_PRIMARY_TIMEOUT,)
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
 @pytest.mark.parametrize(
-    "fast_exc",
-    [abc_synth_module._SynthError("quick broke"), abc_synth_module._SynthTimeout("quick also timed out")],
+    "later_exc",
+    [abc_synth_module._SynthError("later broke"), abc_synth_module._SynthTimeout("later also timed out")],
     ids=["error", "timeout"],
 )
-def test_quick_fallback_failure_keeps_both_reasons(monkeypatch, name, build, call, fast_exc) -> None:
-    """spec 3 + D8."""
+def test_all_candidates_failing_keeps_every_reason(monkeypatch, name, build, call, later_exc) -> None:
+    """was: both reasons kept when the quick script also failed."""
 
-    def _fast_fails(real_run, view, basis, timeout, opt_script):
-        raise fast_exc
+    def _later_fails(real_run, view, basis, timeout, opt_script):
+        raise later_exc
 
-    _times_out_then(monkeypatch, _fast_fails)
+    _times_out_then(monkeypatch, _later_fails)
     design = build()
     result = call(design)
     assert result.changed is False
     assert result.design is design
-    assert result.failure == f"{_PRIMARY_TIMEOUT}; the quick fallback script also failed: {fast_exc}"
+    assert result.failure == f"{_PRIMARY_TIMEOUT}; and {len(_SMALL) - 1} more candidate(s) did not complete"
+    assert result.incomplete == (_PRIMARY_TIMEOUT,) + (str(later_exc),) * (len(_SMALL) - 1)
+    assert len(result.incomplete) <= result.candidates
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_non_timeout_synth_error_is_not_retried(monkeypatch, name, build, call) -> None:
-    """spec 4 + D1."""
+def test_a_non_timeout_synth_error_does_not_stop_the_other_candidates(monkeypatch, name, build, call) -> None:
+    """was: a non-timeout error is not retried. Now every candidate is independent: all are tried."""
     scripts: list[str] = []
 
     def _crash(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
@@ -1266,15 +1277,15 @@ def test_non_timeout_synth_error_is_not_retried(monkeypatch, name, build, call) 
     monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _crash)
     design = build()
     result = call(design)
-    assert scripts == [abc_synth_module._OPT_SCRIPT]
+    assert scripts == list(_SMALL)
     assert result.changed is False
     assert result.design is design
-    assert result.failure == "ABC synthesis process exited with code 1"
+    assert result.failure == f"ABC synthesis process exited with code 1; and {len(_SMALL) - 1} more candidate(s) did not complete"
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_full_script_success_runs_once_and_keeps_the_old_sentence(monkeypatch, name, build, call) -> None:
-    """spec 5."""
+def test_all_candidates_complete_keeps_the_old_sentence(monkeypatch, name, build, call) -> None:
+    """was: full script success runs once. Now all candidates run; nothing incomplete => the plain sentence."""
     real_run = abc_synth_module._run_abc_synthesis
     scripts: list[str] = []
 
@@ -1284,9 +1295,9 @@ def test_full_script_success_runs_once_and_keeps_the_old_sentence(monkeypatch, n
 
     monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _spy)
     result = call(build())
-    assert scripts == [abc_synth_module._OPT_SCRIPT]
+    assert scripts == list(_SMALL)
     assert result.changed is True
-    assert result.quick_fallback is None
+    assert result.incomplete == ()
     if name == "whole":
         assert result.note == f"Reduced maximum logic depth from {result.depth_before} to {result.depth_after}."
     else:
@@ -1296,9 +1307,9 @@ def test_full_script_success_runs_once_and_keeps_the_old_sentence(monkeypatch, n
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_result_must_still_verify_equivalent(monkeypatch, name, build, call) -> None:
-    """spec 6 + D6."""
-    _times_out_then(monkeypatch, _real_fast)
+def test_winner_must_still_verify_equivalent(monkeypatch, name, build, call) -> None:
+    """was: the quick result must still verify equivalent (unchanged assertions)."""
+    _times_out_then(monkeypatch, _real_rest)
     monkeypatch.setattr(
         abc_synth_module, "verify_equivalence", lambda *a, **k: EquivResult(False, "counterexample: a=1")
     )
@@ -1306,14 +1317,14 @@ def test_quick_fallback_result_must_still_verify_equivalent(monkeypatch, name, b
     result = call(design)
     assert result.changed is False
     assert result.design is design
-    assert result.quick_fallback is None
     assert result.failure is not None and "not equivalent" in result.failure
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_verify_inconclusive_keeps_primary(monkeypatch, name, build, call) -> None:
-    """F1: the quick result's verification raising inconclusive must not drop the full script's timeout."""
-    _times_out_then(monkeypatch, _real_fast)
+def test_verify_inconclusive_for_every_winner_reports_the_cec_reason(monkeypatch, name, build, call) -> None:
+    """was: inconclusive keeps the primary reason in `failure`. Now (D12) `failure` is the first cec
+    reason and the timed-out candidate's reason lives in `incomplete`."""
+    _times_out_then(monkeypatch, _real_rest)
 
     def _inconclusive(*a, **k):
         raise abc_bridge_module.ABCInconclusiveError("cec gave up")
@@ -1323,18 +1334,18 @@ def test_quick_fallback_verify_inconclusive_keeps_primary(monkeypatch, name, bui
     result = call(design)
     assert result.changed is False
     assert result.design is design
-    assert result.quick_fallback is None
     assert "already optimal" not in result.note
-    assert result.failure is not None
-    assert _PRIMARY_TIMEOUT in result.failure
-    assert "equivalence check was inconclusive: cec gave up" in result.failure
-    assert _PRIMARY_TIMEOUT in result.note
+    assert result.failure == "equivalence check was inconclusive: cec gave up"
+    assert result.incomplete[0] == _PRIMARY_TIMEOUT
+    assert "equivalence check was inconclusive: cec gave up" in result.incomplete[1:]
+    assert len(result.incomplete) <= result.candidates
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_not_equivalent_keeps_primary(monkeypatch, name, build, call) -> None:
-    """F1: a mismatch on the quick result carries the full script's timeout too, and the old note text."""
-    _times_out_then(monkeypatch, _real_fast)
+def test_not_equivalent_stops_with_the_old_bug_note(monkeypatch, name, build, call) -> None:
+    """was: a mismatch carries the primary timeout. Now the note has no quick-fallback context; the
+    earlier reasons are in `incomplete`."""
+    _times_out_then(monkeypatch, _real_rest)
     monkeypatch.setattr(
         abc_synth_module, "verify_equivalence", lambda *a, **k: EquivResult(False, "counterexample: a=1")
     )
@@ -1344,16 +1355,17 @@ def test_quick_fallback_not_equivalent_keeps_primary(monkeypatch, name, build, c
     assert result.design is design
     assert "already optimal" not in result.note
     assert result.note.startswith("Equivalence check failed after resynthesis (this indicates a bug")
+    assert result.note.endswith("Detail: counterexample: a=1")
     assert result.failure is not None
-    assert _PRIMARY_TIMEOUT in result.failure
     assert "not equivalent" in result.failure and "counterexample: a=1" in result.failure
-    assert result.note.endswith(f"(Context: {_PRIMARY_TIMEOUT}; the result came from the quick fallback script.)")
+    assert result.incomplete[0] == _PRIMARY_TIMEOUT
+    assert result.incomplete == (_PRIMARY_TIMEOUT, result.failure)  # non-empty prefix: the failure is appended last
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_splice_rejection_keeps_primary(monkeypatch, name, build, call) -> None:
-    """F6: an unrecognized gate in the quick script's BLIF goes through the real splice and is
-    reported as a rejected result (not as a script failure), with the full script's timeout."""
+def test_splice_rejection_is_recorded_per_candidate(monkeypatch, name, build, call) -> None:
+    """was: F6, a bogus gate from the quick script is a rejected result. The splice runs inside each
+    candidate, so a bogus BLIF is that candidate's failure; the first (timed-out) reason leads."""
 
     def _bogus(real_run, view, basis, timeout, opt_script):
         real = real_run(view, basis, timeout, opt_script)
@@ -1367,17 +1379,14 @@ def test_quick_fallback_splice_rejection_keeps_primary(monkeypatch, name, build,
     result = call(design)
     assert result.changed is False
     assert result.design is design
-    assert result.failure is not None
-    assert _PRIMARY_TIMEOUT in result.failure
-    assert "result was rejected" in result.failure
-    assert "bogus_gate9" in result.failure
-    assert "also failed" not in result.failure
-    assert _PRIMARY_TIMEOUT in result.note
+    assert result.failure == f"{_PRIMARY_TIMEOUT}; and {len(_SMALL) - 1} more candidate(s) did not complete"
+    assert len(result.incomplete) == len(_SMALL)
+    assert all("bogus_gate9" in r for r in result.incomplete[1:])
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_quick_fallback_uses_same_basis_and_timeout(monkeypatch, name, build, call) -> None:
-    """F5: both ABC calls get the caller's basis and synthesis timeout."""
+def test_every_candidate_gets_the_same_basis_and_timeout(monkeypatch, name, build, call) -> None:
+    """was: F5, both ABC calls get the caller's basis and synthesis timeout (no request scope here)."""
     real_run = abc_synth_module._run_abc_synthesis
     calls: list[tuple] = []
 
@@ -1393,25 +1402,21 @@ def test_quick_fallback_uses_same_basis_and_timeout(monkeypatch, name, build, ca
         optimize_depth(design, basis="and_or_not", timeout=77.0)
     else:
         optimize_cone_depth(design, _nb("y"), basis="and_or_not", timeout=77.0)
-    assert calls == [
-        ("and_or_not", 77.0, abc_synth_module._OPT_SCRIPT),
-        ("and_or_not", 77.0, abc_synth_module._FAST_OPT_SCRIPT),
-    ]
+    assert calls == [("and_or_not", 77.0, s) for s in _SMALL]
 
 
 @pytest.mark.parametrize("name,build,call", _QUICK_CASES, ids=_QUICK_IDS)
-def test_real_subprocess_full_script_times_out_quick_script_wins(monkeypatch, tmp_path, name, build, call) -> None:
-    """spec 7: a wrapper around the real ABC sleeps whenever the command has
-    `; dch;` (the full script's `dch` step as `_run_abc_synthesis` assembles it;
-    the quick script's command does not contain it, and a bare `*dch*` could match
-    a random temp-dir name). `exec` makes the sleep replace the shell, so the timeout kill hits
-    the sleep itself (no orphan holding the stdout pipe past this test)."""
+def test_real_subprocess_some_candidates_time_out_others_win(monkeypatch, tmp_path, name, build, call) -> None:
+    """was: spec 7, the full script times out in a real subprocess and the quick one wins. Now a
+    wrapper around the real ABC sleeps whenever the command has `if -g` (the two SOP candidates);
+    `exec` makes the sleep replace the shell, so the timeout kill hits the sleep itself (no orphan
+    holding the stdout pipe past this test). The other two candidates run for real."""
     real_abc = abc_synth_module._resolve_abc()
     wrapper = tmp_path / "abc_wrapper.sh"
     wrapper.write_text(
         "#!/bin/sh\n"
         'case "$2" in\n'
-        '  *"; dch;"*) exec sleep 60 ;;\n'
+        '  *"if -g"*) exec sleep 60 ;;\n'
         "esac\n"
         f'exec "{real_abc}" "$@"\n'
     )
@@ -1424,7 +1429,8 @@ def test_real_subprocess_full_script_times_out_quick_script_wins(monkeypatch, tm
         result = optimize_cone_depth(design, _nb("y"), timeout=2.0)
     assert result.failure is None, result.failure
     assert result.changed is True
-    assert result.quick_fallback == "ABC synthesis timed out after 2.0s"
+    assert result.incomplete == ("ABC synthesis timed out after 2.0s",) * 2
+    assert f"2 of {len(_SMALL)} candidate scripts did not finish" in result.note
     assert result.depth_after < result.depth_before
     # Re-check with the same `verify_equivalence`, here through the real (unwrapped) cec.
     assert verify_equivalence(design, result.design).equivalent
@@ -1788,3 +1794,745 @@ def test_fix_count_dangling_gates_counts_a_whole_dead_chain() -> None:
     design.build_indices()
     assert count_dangling_gates(design) == 3
     assert remove_dangling_gates(design) == 3
+
+
+# ----------------------------------------------------------------------
+# Batch 34b-1 (U1-U3): multi-candidate ranking, cec fallback, stop on mismatch.
+# `_run_abc_synthesis` is faked, so no real ABC runs here; `verify_equivalence`
+# is faked too (the fake BLIFs are not functionally the chain).
+# ----------------------------------------------------------------------
+
+
+def _fake_chain_blif(depth: int, extra: int = 0, tag: int = 0, out: str = "y") -> "abc_synth_module._BlifNetlist":
+    """A BLIF over a0..a7 -> y with exactly `depth` AND levels and `depth + extra` gates.
+    Gate 0 = and(a0, a1); gate i = and(prev, b_i), b_i = a_{i+1}, except that the first `extra`
+    of gates 1.. read b_i through a leaf buf1 (a gate that adds count, not depth). `tag`
+    only changes which input the LAST gate reads (a{7-tag}), so ties can be told apart.
+    `out` is the output token (the cone path expects `_CONE_OUT_TOKEN`)."""
+    assert 1 <= depth <= 7 and 0 <= extra <= depth - 1
+    gates = [_BlifGate("and2", {"a": "a0", "b": "a1", "O": "n0" if depth > 1 else out})]
+    for i in range(1, depth):
+        last = i == depth - 1
+        b = f"a{7 - tag}" if last else f"a{i + 1}"
+        if i <= extra:
+            gates.append(_BlifGate("buf1", {"a": b, "O": f"e{i}"}))
+            b = f"e{i}"
+        gates.append(_BlifGate("and2", {"a": f"n{i - 1}", "b": b, "O": out if last else f"n{i}"}))
+    return abc_synth_module._BlifNetlist([f"a{i}" for i in range(8)], [out], gates)
+
+
+def _fake_candidates(monkeypatch, specs, out: str = "y"):
+    """Candidate k (in `_DEPTH_SMALL_SCRIPTS` order) returns `_fake_chain_blif(*specs[k])`.
+    Returns the list of scripts it was called with."""
+    scripts: list[str] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        return _fake_chain_blif(*specs[abc_synth_module._DEPTH_SMALL_SCRIPTS.index(opt_script)], out=out)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    return scripts
+
+
+def _always_equivalent(monkeypatch):
+    calls: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        calls.append(candidate)
+        return EquivResult(True, "")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    return calls
+
+
+def _count_extracts(monkeypatch) -> list[int]:
+    """Spy on `extract_combinational_view` (one call per prepare()); returns a list with one entry per call."""
+    calls: list[int] = []
+    real = abc_synth_module.extract_combinational_view
+
+    def _spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(abc_synth_module, "extract_combinational_view", _spy)
+    return calls
+
+
+def _y_last_input(design: Design) -> str:
+    (g,) = [g for g in design.gates if g.pins["O"] == _nb("y")]
+    return g.pins["I1"].name
+
+
+def test_u1_picks_the_lowest_depth(monkeypatch) -> None:
+    """kills: ranking that ignores depth (e.g. first accepted wins)."""
+    _fake_candidates(monkeypatch, [(5, 0), (3, 0), (4, 0), (6, 0)])
+    _always_equivalent(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert result.changed and result.failure is None
+    assert result.depth_after == 3
+    assert NetlistGraph(result.design).max_design_depth() == 3
+    assert result.candidates == 4 and result.incomplete == ()
+
+
+def test_u1_same_depth_picks_the_fewest_gates(monkeypatch) -> None:
+    """kills: dropping the gate count from the ranking key (then the first depth-4 candidate, 7 gates, wins)."""
+    _fake_candidates(monkeypatch, [(4, 3), (4, 1), (4, 2), (5, 0)])
+    _always_equivalent(monkeypatch)
+    extracts = _count_extracts(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert result.depth_after == 4
+    assert len(result.design.gates) == 5
+    # Each candidate is extracted once; the winner is kept, never rebuilt. (Kills: the running-best
+    # comparison losing its gate count, which would discard and rebuild the winner.)
+    assert extracts == [1] * 4
+
+
+def test_u1_full_tie_picks_the_first_candidate(monkeypatch) -> None:
+    """kills: a tie broken by the LAST candidate (>= instead of > on the order)."""
+    _fake_candidates(monkeypatch, [(4, 1, 0), (4, 1, 1), (4, 1, 2), (4, 1, 3)])
+    _always_equivalent(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert result.depth_after == 4
+    assert _y_last_input(result.design) == "a7"
+
+
+def test_u1_cone_version_ranks_the_same_way(monkeypatch) -> None:
+    """The cone path shares the ranking; here the gate-count tie-break picks candidate 2."""
+    _fake_candidates(monkeypatch, [(4, 3), (4, 2), (4, 1), (5, 0)], out=abc_synth_module._CONE_OUT_TOKEN)
+    _always_equivalent(monkeypatch)
+    result = optimize_cone_depth(_build_and_chain(), _nb("y"))
+    assert result.depth_after == 4
+    assert len(result.design.gates) == 5
+
+
+def test_u2_undecided_cec_falls_back_to_the_next_best(monkeypatch) -> None:
+    """kills: giving up when the best candidate's cec is undecided; running cec on every candidate;
+    re-running ABC to rebuild the runner-up."""
+    scripts = _fake_candidates(monkeypatch, [(3, 0, 0), (4, 0, 1), (5, 0, 2), (6, 0, 3)])
+    verified: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        verified.append(candidate)
+        if len(verified) == 1:
+            raise abc_bridge_module.ABCInconclusiveError("cec gave up")
+        return EquivResult(True, "")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    design = _build_and_chain()
+    result = optimize_depth(design)
+    assert result.changed and result.failure is None
+    assert result.depth_after == 4
+    assert _y_last_input(result.design) == "a6"
+    assert len(verified) == 2  # the best (undecided) and the runner-up, not all four
+    assert len(scripts) == 4  # the runner-up was rebuilt from its BLIF, no extra ABC run
+    assert result.incomplete == ("equivalence check was inconclusive: cec gave up",)
+    assert result.note.endswith(
+        " 1 of 4 candidate scripts did not finish (equivalence check was inconclusive: cec gave up), "
+        "so a lower depth may exist."
+    )
+    assert result.design is verified[1]
+
+
+def test_u2_cec_runs_only_for_the_first_ranked_when_it_is_decided(monkeypatch) -> None:
+    """kills: running cec on every accepted candidate."""
+    _fake_candidates(monkeypatch, [(5, 0), (3, 0), (4, 0), (6, 0)])
+    calls = _always_equivalent(monkeypatch)
+    optimize_depth(_build_and_chain())
+    assert len(calls) == 1
+
+
+def test_u3_not_equivalent_stops_and_does_not_try_the_next(monkeypatch) -> None:
+    """kills: treating a mismatch like an undecided cec (falling back to the runner-up)."""
+    scripts = _fake_candidates(monkeypatch, [(3, 0), (4, 0), (5, 0), (6, 0)])
+    calls: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        calls.append(candidate)
+        return EquivResult(False, "counterexample: a0=1")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    design = _build_and_chain()
+    result = optimize_depth(design)
+    assert len(calls) == 1
+    assert len(scripts) == 4
+    assert result.changed is False
+    assert result.design is design
+    assert "indicates a bug" in result.note
+    assert result.failure is not None and "not equivalent" in result.failure
+    assert result.depth_after == result.depth_before
+    assert len(result.incomplete) <= result.candidates
+    assert result.incomplete[-1] == result.failure
+
+
+def test_u3_cone_not_equivalent_stops(monkeypatch) -> None:
+    _fake_candidates(monkeypatch, [(3, 0), (4, 0), (5, 0), (6, 0)], out=abc_synth_module._CONE_OUT_TOKEN)
+    calls: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        calls.append(candidate)
+        return EquivResult(False, "counterexample")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    design = _build_and_chain()
+    result = optimize_cone_depth(design, _nb("y"))
+    assert len(calls) == 1 and result.design is design and "indicates a bug" in result.note
+
+
+def test_budget_reserve_decides_whether_candidates_after_the_first_run(monkeypatch) -> None:
+    """D10: from the 2nd candidate on, avail = remaining - 0.35 * budget; avail < 10s => skipped
+    (one `incomplete` entry each), else the candidate gets min(timeout, avail).
+    kills: reserve 0 (would run with 100s); the 10s floor; no clamp to avail."""
+    timeouts: list[float] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        timeouts.append(timeout)
+        return _fake_chain_blif(3)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    _always_equivalent(monkeypatch)
+    monkeypatch.setattr(abc_synth_module.deadline, "current_budget", lambda: 270.0)
+    skipped = "skipped: not enough of this request's time budget was left for another candidate"
+
+    # 270 * 0.35 = 94.5 reserved: 100 left => avail 5.5 < 10 => the 3 later candidates are skipped.
+    monkeypatch.setattr(abc_synth_module.deadline, "remaining", lambda: 100.0)
+    result = optimize_depth(_build_and_chain(), timeout=120.0)
+    assert timeouts == [120.0]
+    assert result.incomplete == (skipped,) * 3
+    assert len(result.incomplete) <= result.candidates
+    assert result.changed and "3 of 4 candidate scripts did not finish" in result.note
+
+    # 110 left => avail 15.5: all run, candidates 2.. clamped to 15.5; the first keeps `timeout`.
+    timeouts.clear()
+    monkeypatch.setattr(abc_synth_module.deadline, "remaining", lambda: 110.0)
+    result = optimize_depth(_build_and_chain(), timeout=120.0)
+    assert timeouts == [120.0, 15.5, 15.5, 15.5]
+    assert result.incomplete == ()
+
+
+# ----------------------------------------------------------------------
+# Batch 34b-1b (U4-U12): failures/budget/size groups/cone ranking/real ABC value/
+# basis/dangling baseline. U8 (all fail) and U9 (completed but not improved, another
+# failed) are the rewritten batch-30 tests above (`test_all_candidates_failing_keeps_every_reason`,
+# `test_no_improvement_with_a_timed_out_candidate_is_not_ruled_out_not_a_failure`).
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [abc_synth_module._SynthTimeout("ABC synthesis timed out after 120s"), ABCBridgeError("ABC exploded")],
+    ids=["timeout", "bridge-error"],
+)
+def test_u4_a_failed_candidate_is_recorded_and_the_others_still_run(monkeypatch, exc) -> None:
+    """kills: not recording the failure in `incomplete`; `continue` turned into `break`
+    (the later candidates would not run); a failure becoming `result.failure` although others won."""
+    scripts: list[str] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        k = abc_synth_module._DEPTH_SMALL_SCRIPTS.index(opt_script)
+        if k == 1:
+            raise exc
+        return _fake_chain_blif(5 - k)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    _always_equivalent(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert scripts == list(abc_synth_module._DEPTH_SMALL_SCRIPTS)
+    assert result.incomplete == (str(exc),)
+    assert result.failure is None and result.changed
+    assert result.depth_after == 2  # candidate 3 (k=3) gives depth 2
+    assert result.candidates == 4
+    assert result.note.endswith(f" 1 of 4 candidate scripts did not finish ({exc}), so a lower depth may exist.")
+
+
+def test_u4_a_failed_first_candidate_does_not_stop_the_rest(monkeypatch) -> None:
+    """kills: candidate 1 failing aborting the loop (the first candidate is `prepare()`d outside the loop body)."""
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        if opt_script == abc_synth_module._OPT_SCRIPT:
+            raise abc_synth_module._SynthTimeout("ABC synthesis timed out after 120s")
+        return _fake_chain_blif(4)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    _always_equivalent(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert result.changed and result.depth_after == 4
+    assert result.incomplete == ("ABC synthesis timed out after 120s",)
+
+
+_SKIPPED = "skipped: not enough of this request's time budget was left for another candidate"
+
+
+def _timeouts_recorder(monkeypatch, depth: int = 3) -> list[float]:
+    timeouts: list[float] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        timeouts.append(timeout)
+        return _fake_chain_blif(depth)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    _always_equivalent(monkeypatch)
+    return timeouts
+
+
+def test_u5_budget_running_out_midway_skips_the_rest_one_entry_each(monkeypatch) -> None:
+    """kills: not recording the skipped candidates; recording one entry for all; skipping only one
+    candidate (no `continue` for later ones); the skip decision ignoring the shrinking remainder."""
+    timeouts = _timeouts_recorder(monkeypatch)
+    monkeypatch.setattr(abc_synth_module.deadline, "current_budget", lambda: 270.0)
+    left = iter([200.0, 100.0, 100.0])
+    monkeypatch.setattr(abc_synth_module.deadline, "remaining", lambda: next(left))
+    result = optimize_depth(_build_and_chain(), timeout=120.0)
+    # candidate 2: avail = 200 - 94.5 = 105.5 -> runs, clamped; candidates 3, 4: avail 5.5 < 10 -> skipped.
+    assert timeouts == [120.0, 105.5]
+    assert result.incomplete == (_SKIPPED, _SKIPPED)
+    assert len(result.incomplete) <= result.candidates
+    assert "2 of 4 candidate scripts did not finish" in result.note
+
+
+def test_u5_with_a_real_request_scope_a_tiny_budget_skips_candidates_after_the_first(monkeypatch) -> None:
+    """kills: ignoring `deadline.remaining()` (all four would run)."""
+    timeouts = _timeouts_recorder(monkeypatch)
+    with abc_synth_module.deadline.request_scope(12.0):  # reserve 4.2s -> avail < 10
+        result = optimize_depth(_build_and_chain(), timeout=120.0)
+    assert timeouts == [120.0]
+    assert result.incomplete == (_SKIPPED,) * 3
+
+
+def test_u5_without_a_request_scope_every_candidate_runs_with_the_full_timeout(monkeypatch) -> None:
+    """kills: treating "no scope" (remaining() is None) as "no time left"; clamping without a scope."""
+    timeouts = _timeouts_recorder(monkeypatch)
+    assert abc_synth_module.deadline.remaining() is None
+    result = optimize_depth(_build_and_chain(), timeout=77.0)
+    assert timeouts == [77.0] * 4
+    assert result.incomplete == ()
+
+
+def _record_scripts(monkeypatch, out: str = "y") -> list[str]:
+    scripts: list[str] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        return _fake_chain_blif(3, out=out)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    _always_equivalent(monkeypatch)
+    return scripts
+
+
+# The view ABC gets: 7 gates for the whole `_build_and_chain()`; 8 for y's restricted cone
+# (`_restrict_to_fanin_cone` adds the output buffer).
+_U6_VIEW_GATES = {False: 7, True: 8}
+
+
+@pytest.mark.parametrize("cone", [False, True], ids=["whole", "cone"])
+def test_u6_a_design_above_the_threshold_gets_the_large_group(monkeypatch, cone) -> None:
+    """kills: always using the small list; the large list being used for the wrong comparison direction."""
+    monkeypatch.setattr(abc_synth_module, "_DEPTH_LARGE_THRESHOLD", _U6_VIEW_GATES[cone] - 1)
+    scripts = _record_scripts(monkeypatch, out=abc_synth_module._CONE_OUT_TOKEN if cone else "y")
+    design = _build_and_chain()
+    result = optimize_cone_depth(design, _nb("y")) if cone else optimize_depth(design)
+    assert scripts == list(abc_synth_module._DEPTH_LARGE_SCRIPTS)
+    assert result.candidates == len(abc_synth_module._DEPTH_LARGE_SCRIPTS)
+
+
+@pytest.mark.parametrize("cone", [False, True], ids=["whole", "cone"])
+def test_u6_a_design_exactly_at_the_threshold_gets_the_small_group(monkeypatch, cone) -> None:
+    """kills: `<=` turned into `<` in the threshold comparison (view gates == threshold)."""
+    monkeypatch.setattr(abc_synth_module, "_DEPTH_LARGE_THRESHOLD", _U6_VIEW_GATES[cone])
+    scripts = _record_scripts(monkeypatch, out=abc_synth_module._CONE_OUT_TOKEN if cone else "y")
+    design = _build_and_chain()
+    result = optimize_cone_depth(design, _nb("y")) if cone else optimize_depth(design)
+    assert scripts == list(abc_synth_module._DEPTH_SMALL_SCRIPTS)
+    assert result.candidates == len(abc_synth_module._DEPTH_SMALL_SCRIPTS)
+
+
+def test_u7_cone_version_ranks_by_the_cone_depth_not_the_whole_design_depth(monkeypatch) -> None:
+    """y's cone is 7 deep, z's chain (untouched) is 5 deep, so the whole-design depth is 5 for every
+    candidate (a tie) while the cone depths differ. Candidate 0: cone depth 4, 4 gates; candidate 1:
+    cone depth 3, 5 gates. Ranking by whole-design depth would tie and pick candidate 0 on gate count.
+    kills: the cone measure replaced by `max_design_depth`."""
+    design = _build_two_cone_design(8)
+    graph = NetlistGraph(design)
+    assert graph.depth_to_sink(_nb("y")) == 7 and graph.depth_to_sink(_nb("z")) == 5
+    _fake_candidates(monkeypatch, [(4, 0), (3, 2), (6, 0), (6, 0)], out=abc_synth_module._CONE_OUT_TOKEN)
+    _always_equivalent(monkeypatch)
+    result = optimize_cone_depth(design, _nb("y"))
+    assert result.changed
+    assert NetlistGraph(result.design).depth_to_sink(_nb("y")) == 3
+    assert result.depth_after == 3
+    assert NetlistGraph(result.design).max_design_depth() == 5
+
+
+# U10: AND-OR alternating chain c[i+1] = (c[i] & a[i]) | b[i], 60 stages (depth 120).
+# Measured locally (ABC vendored): `_OPT_SCRIPT` alone leaves depth 120 (unchanged);
+# `optimize_depth` (all candidates) reaches 11; SOP x4/x8 alone 11, `&sopb` x2 alone 20,
+# XOR script and `strash; balance` alone 120. The thresholds sit between those.
+_U10_STAGES = 60
+
+
+def _build_and_or_chain(stages: int = _U10_STAGES) -> Design:
+    design = Design(module_name="top")
+    names = ["c0"] + [f"a{i}" for i in range(stages)] + [f"b{i}" for i in range(stages)]
+    for n in names:
+        design.signals[n] = Signal(n, None, None, Direction.INPUT)
+    design.signals["y"] = Signal("y", None, None, Direction.OUTPUT)
+    design.ports = [Port(n, Direction.INPUT) for n in names] + [Port("y", Direction.OUTPUT)]
+    prev = _nb("c0")
+    for i in range(stages):
+        t = design.fresh_net("t_")
+        out = _nb("y") if i == stages - 1 else design.fresh_net("t_")
+        design.add_gate(Gate(f"ga{i}", GateType.AND, {"O": t, "I0": prev, "I1": _nb(f"a{i}")}))
+        design.add_gate(Gate(f"go{i}", GateType.OR, {"O": out, "I0": t, "I1": _nb(f"b{i}")}))
+        prev = out
+    design.build_indices()
+    return design
+
+
+def test_u10_real_abc_candidates_beat_the_single_opt_script_on_an_and_or_chain(monkeypatch) -> None:
+    """kills: the candidate list collapsing to `_OPT_SCRIPT` only (depth stays 120 and `changed` False)."""
+    design = _build_and_or_chain()
+    assert NetlistGraph(design).max_design_depth() == 2 * _U10_STAGES
+    original = copy.deepcopy(design)
+    with monkeypatch.context() as m:
+        m.setattr(abc_synth_module, "_depth_candidate_scripts", lambda gate_count: (abc_synth_module._OPT_SCRIPT,))
+        single = optimize_depth(design)
+    assert single.failure is None
+    assert single.depth_after >= 100  # measured: 120 (no change)
+    result = optimize_depth(design)
+    assert result.failure is None and result.incomplete == ()
+    assert result.changed and result.depth_after <= 30  # measured: 11
+    assert result.depth_after < single.depth_after - 60
+    assert NetlistGraph(result.design).max_design_depth() == result.depth_after
+    assert verify_equivalence(original, result.design).equivalent
+
+
+@pytest.mark.parametrize("script", [abc_synth_module._DEPTH_SMALL_SCRIPTS[1], abc_synth_module._DEPTH_SMALL_SCRIPTS[2], abc_synth_module._DEPTH_LARGE_SCRIPTS[1]], ids=["if-g", "if-x", "sopb"])
+def test_u10_each_non_default_candidate_script_runs_in_the_local_abc(script) -> None:
+    """`if -g`, `if -x` and `&sopb` all exist in the vendored ABC and produce a usable BLIF
+    (a script ABC rejects would be silently recorded as an `incomplete` candidate in production)."""
+    design = _build_and_or_chain(10)
+    comb = abc_synth_module.extract_combinational_view(copy.deepcopy(design), "free_pi", {})
+    blif = abc_synth_module._run_abc_synthesis(comb, None, 60.0, opt_script=script)
+    assert blif.gates and blif.outputs == ["y"]
+
+
+@pytest.mark.parametrize("basis", ["nand_not", "nor_not", "and_or_not"])
+def test_u11_multi_candidate_result_stays_inside_the_basis_and_equivalent(basis) -> None:
+    """kills: a candidate path (e.g. rebuilt BLIF / later script) not honoring the basis."""
+    design = _build_and_chain(16)
+    original = copy.deepcopy(design)
+    result = optimize_depth(design, basis=basis)
+    assert result.failure is None and result.changed and result.candidates == 4
+    allowed = allowed_gate_types(basis)
+    assert {g.gate_type for g in result.design.gates} <= allowed
+    assert verify_equivalence(original, result.design).equivalent
+
+
+def test_u11_every_candidate_receives_the_basis(monkeypatch) -> None:
+    real_run = abc_synth_module._run_abc_synthesis
+    bases: list = []
+
+    def _spy(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        bases.append(basis)
+        return real_run(view, basis, timeout, opt_script)
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _spy)
+    optimize_depth(_build_and_chain(16), basis="nand_not")
+    assert bases == ["nand_not"] * 4
+
+
+_ONE_AND_BLIF = """.model top
+.inputs a b c
+.outputs y
+.gate and2 a=a b=b O=y
+.end
+"""
+
+
+def _u12_fake(monkeypatch, text: str, cone: bool) -> list[str]:
+    if cone:
+        tok = abc_synth_module._CONE_OUT_TOKEN
+        text = text.replace("O=y", f"O={tok}").replace(".outputs y", f".outputs {tok}")
+    blif = parse_blif(text)
+    scripts: list[str] = []
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        scripts.append(opt_script)
+        return blif
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+    return scripts
+
+
+@pytest.mark.parametrize("cone", [False, True], ids=["whole", "cone"])
+def test_u12_multi_candidate_preexisting_dangling_gate_does_not_turn_optimal_into_changed(monkeypatch, cone) -> None:
+    """Every candidate returns the same 1-gate result; the dead NOT(c) is swept from each, giving
+    1 gate < len(design.gates)=2 but not < baseline=1. kills: baseline = `len(design.gates)`."""
+    call = (lambda d: optimize_cone_depth(d, _nb("y"))) if cone else optimize_depth
+    scripts = _u12_fake(monkeypatch, _ONE_AND_BLIF.replace(" c\n", "\n"), cone)
+    control = call(_optimal_design_with_dead_gate(False))
+    assert control.changed is False and len(scripts) == 4
+    scripts.clear()
+    design = _optimal_design_with_dead_gate(True)
+    result = call(design)
+    assert len(scripts) == 4
+    assert result.changed is False and result.design is design and result.failure is None
+    assert "already optimal" in result.note
+    assert len(design.gates) == 2
+
+
+@pytest.mark.parametrize("cone", [False, True], ids=["whole", "cone"])
+def test_u12_multi_candidate_real_improvement_with_dangling_gate_is_still_changed(monkeypatch, cone) -> None:
+    """Same depth, 2 gates vs baseline 3 (4 gates incl. the dead one). kills: baseline subtracting
+    the dangling gates twice (2 < 2 would reject); baseline ignoring the dead gate is covered above."""
+    call = (lambda d: optimize_cone_depth(d, _nb("y"))) if cone else optimize_depth
+    scripts = _u12_fake(monkeypatch, _SAME_DEPTH_BLIF, cone)
+    design = _redundant_design_with_dead_gate(True)
+    result = call(design)
+    assert len(scripts) == 4
+    assert result.changed is True and len(result.design.gates) == 2
+    assert "(4 to 2)" in result.note
+
+
+# ----------------------------------------------------------------------
+# Batch 34b-1 repair round 1: rebuild budget, boundary, rebuild failure, D6 pin
+# ----------------------------------------------------------------------
+
+_SKIPPED_REBUILD = (
+    "skipped: not enough of this request's time budget was left to rebuild and verify another candidate"
+)
+
+
+def test_f1_no_time_left_after_the_first_cec_skips_rebuilding_the_runners_up(monkeypatch) -> None:
+    """kills: rebuilding runner-ups without checking the request's remaining time."""
+    _fake_candidates(monkeypatch, [(3, 0), (4, 0), (5, 0), (6, 0)])
+    state = {"cec_done": False}
+
+    def _eq(original, candidate, timeout=None):
+        state["cec_done"] = True
+        raise abc_bridge_module.ABCInconclusiveError("cec gave up")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    monkeypatch.setattr(abc_synth_module.deadline, "current_budget", lambda: 270.0)
+    monkeypatch.setattr(abc_synth_module.deadline, "remaining", lambda: 0.0 if state["cec_done"] else 1000.0)
+    extracts = _count_extracts(monkeypatch)
+    design = _build_and_chain()
+    result = optimize_depth(design)
+    assert len(extracts) == 4  # the four candidates only; no rebuild
+    cec = "equivalence check was inconclusive: cec gave up"
+    assert result.incomplete == (cec,) + (_SKIPPED_REBUILD,) * 3
+    assert len(result.incomplete) <= result.candidates
+    assert result.changed is False and result.design is design
+    assert result.failure == cec
+
+
+def _undecided_first_then_equivalent(monkeypatch, remaining_after_cec: float) -> None:
+    """First cec is undecided, the rest are equivalent. `remaining()` reads 1000 until the first cec has run,
+    then `remaining_after_cec`; `current_budget()` is 270 (a request scope is active)."""
+    state = {"cec_done": False}
+    verified: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        verified.append(candidate)
+        if len(verified) == 1:
+            state["cec_done"] = True
+            raise abc_bridge_module.ABCInconclusiveError("cec gave up")
+        return EquivResult(True, "")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    monkeypatch.setattr(abc_synth_module.deadline, "current_budget", lambda: 270.0)
+    monkeypatch.setattr(
+        abc_synth_module.deadline, "remaining", lambda: remaining_after_cec if state["cec_done"] else 1000.0
+    )
+
+
+@pytest.mark.parametrize("remaining_after_cec", [1000.0, 50.0, 10.0])
+def test_g1_enough_time_left_after_an_undecided_cec_still_rebuilds_the_runner_up(
+    monkeypatch, remaining_after_cec
+) -> None:
+    """kills: a rebuild guard that fires too often -- threshold raised (e.g. 10 -> 100, which 50 catches),
+    `left < 10` turned into `left <= 10` (10.0 catches), or a guard that skips whenever a request scope exists
+    (1000 catches)."""
+    _fake_candidates(monkeypatch, [(3, 0), (4, 0), (5, 0), (6, 0)])
+    _undecided_first_then_equivalent(monkeypatch, remaining_after_cec)
+    extracts = _count_extracts(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert len(extracts) == 5  # four candidates + one rebuild
+    assert result.changed and result.depth_after == 4
+    assert result.failure is None
+    assert result.incomplete == ("equivalence check was inconclusive: cec gave up",)
+
+
+def test_g1_just_under_ten_seconds_left_skips_the_rebuild(monkeypatch) -> None:
+    """kills: `left < 10` turned into `left < 9` / a threshold lowered below 10 (9.99 must skip)."""
+    _fake_candidates(monkeypatch, [(3, 0), (4, 0), (5, 0), (6, 0)])
+    _undecided_first_then_equivalent(monkeypatch, 9.99)
+    extracts = _count_extracts(monkeypatch)
+    design = _build_and_chain()
+    result = optimize_depth(design)
+    assert len(extracts) == 4
+    assert result.changed is False and result.design is design
+    assert result.incomplete == ("equivalence check was inconclusive: cec gave up",) + (_SKIPPED_REBUILD,) * 3
+
+
+def test_f1_without_a_request_scope_the_runner_up_is_still_rebuilt(monkeypatch) -> None:
+    """kills: skipping the rebuild when `remaining()` is None (no request scope)."""
+    _fake_candidates(monkeypatch, [(3, 0), (4, 0), (5, 0), (6, 0)])
+    verified: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        verified.append(candidate)
+        if len(verified) == 1:
+            raise abc_bridge_module.ABCInconclusiveError("cec gave up")
+        return EquivResult(True, "")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    monkeypatch.setattr(abc_synth_module.deadline, "remaining", lambda: None)
+    extracts = _count_extracts(monkeypatch)
+    result = optimize_depth(_build_and_chain())
+    assert result.changed and result.depth_after == 4
+    assert len(extracts) == 5  # four candidates + one rebuild
+
+
+def test_t_b_exactly_ten_seconds_of_avail_still_runs_the_candidate(monkeypatch) -> None:
+    """kills: `avail <= 10` (boundary); reserve 0.35 * 270 = 94.5, so remaining 104.5 leaves exactly 10.0."""
+    timeouts = _timeouts_recorder(monkeypatch)
+    monkeypatch.setattr(abc_synth_module.deadline, "current_budget", lambda: 270.0)
+    monkeypatch.setattr(abc_synth_module.deadline, "remaining", lambda: 104.5)
+    result = optimize_depth(_build_and_chain(), timeout=120.0)
+    assert timeouts == [120.0, 10.0, 10.0, 10.0]
+    assert result.incomplete == ()
+
+
+def test_t_c_a_failed_rebuild_is_recorded_and_the_next_candidate_is_tried(monkeypatch) -> None:
+    """kills: the rebuild-failure `continue` turned into `break`; an unrecorded rebuild failure."""
+    _fake_candidates(monkeypatch, [(3, 0, 0), (4, 0, 1), (5, 0, 2), (6, 0, 3)])
+    verified: list[Design] = []
+
+    def _eq(original, candidate, timeout=None):
+        verified.append(candidate)
+        if len(verified) == 1:
+            raise abc_bridge_module.ABCInconclusiveError("cec gave up")
+        return EquivResult(True, "")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    real = abc_synth_module.extract_combinational_view
+    n = {"calls": 0}
+
+    def _extract(*a, **k):
+        n["calls"] += 1
+        if n["calls"] == 5:  # the first rebuild (the runner-up)
+            raise ABCBridgeError("rebuild boom")
+        return real(*a, **k)
+
+    monkeypatch.setattr(abc_synth_module, "extract_combinational_view", _extract)
+    result = optimize_depth(_build_and_chain())
+    assert result.changed and result.depth_after == 5  # the third-ranked candidate
+    assert result.incomplete == (
+        "equivalence check was inconclusive: cec gave up",
+        "could not rebuild a candidate result: rebuild boom",
+    )
+    assert len(result.incomplete) <= result.candidates
+
+
+def test_g4_candidate_results_are_released_as_soon_as_they_are_no_longer_needed(monkeypatch) -> None:
+    """F4. Candidates are (6,0),(3,0),(4,0),(5,0): #0 is the first best, #1 replaces it, #2 and #3 lose.
+    #0 must beat the original (depth 7) to be accepted at all: with (7,0) it tied the 7-gate original,
+    was never the best, and dropping `best.work = None` went unobserved (knife G4-c survived).
+    kills: keeping `first` alive after candidate 0 (drop `first = None`); dropping the pre-`prepare()`
+    `work = view = ... = None` (previous view/work alive inside prepare); dropping `best.work = None` when
+    a better candidate replaces the best; dropping `cand.work = None` for a candidate that is not the best;
+    dropping the `work = view = ... = None` after the loop (last view alive at the cec)."""
+    import gc
+    import weakref
+
+    views: list = []  # weakrefs to the view given to ABC, per candidate
+    works: list = []  # weakrefs to the work design, per candidate (taken at remove_dangling_gates)
+    events: dict[str, bool] = {}
+
+    def alive(refs, k):
+        gc.collect()
+        return refs[k]() is not None
+
+    specs = [(6, 0), (3, 0), (4, 0), (5, 0)]
+
+    def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
+        k = abc_synth_module._DEPTH_SMALL_SCRIPTS.index(opt_script)
+        assert k == len(views)
+        views.append(weakref.ref(view))
+        if k >= 1:
+            events[f"run{k}: view{k - 1} alive"] = alive(views, k - 1)
+        if k == 2:
+            events["run2: work0 alive"] = alive(works, 0)  # replaced as best by #1
+            events["run2: work1 alive"] = alive(works, 1)  # the current best
+        if k == 3:
+            events["run3: work2 alive"] = alive(works, 2)  # lost to the best, not kept
+            events["run3: work1 alive"] = alive(works, 1)
+        return _fake_chain_blif(*specs[k])
+
+    monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
+
+    real_rdg = abc_synth_module.remove_dangling_gates
+
+    def _rdg(work):
+        works.append(weakref.ref(work))
+        return real_rdg(work)
+
+    monkeypatch.setattr(abc_synth_module, "remove_dangling_gates", _rdg)
+
+    real_extract = abc_synth_module.extract_combinational_view
+    n_extract = {"n": 0}
+
+    def _extract(*a, **k):
+        i = n_extract["n"]  # prepare() number i builds candidate i
+        n_extract["n"] += 1
+        if i >= 1:
+            events[f"prepare{i}: view{i - 1} alive"] = alive(views, i - 1)
+            if i == 3:
+                events["prepare3: work2 alive"] = alive(works, 2)
+        return real_extract(*a, **k)
+
+    monkeypatch.setattr(abc_synth_module, "extract_combinational_view", _extract)
+
+    def _eq(original, candidate, timeout=None):
+        gc.collect()
+        for k in range(4):
+            events[f"cec: view{k} alive"] = views[k]() is not None
+        for k in (0, 2, 3):
+            events[f"cec: work{k} alive"] = works[k]() is not None
+        events["cec: work1 alive"] = works[1]() is not None
+        events["cec: candidate is work1"] = works[1]() is candidate
+        return EquivResult(True, "")
+
+    monkeypatch.setattr(abc_synth_module, "verify_equivalence", _eq)
+    result = optimize_depth(_build_and_chain())
+    assert result.changed and result.depth_after == 3
+
+    alive_expected = {"run2: work1 alive", "run3: work1 alive", "cec: work1 alive", "cec: candidate is work1"}
+    assert alive_expected <= events.keys()
+    for name, is_alive in events.items():
+        assert is_alive == (name in alive_expected), name
+    # every observation point actually fired
+    assert {"run1: view0 alive", "run3: view2 alive", "prepare3: view2 alive", "run2: work0 alive",
+            "prepare3: work2 alive", "cec: view3 alive", "cec: work3 alive"} <= events.keys()
+
+
+def test_t_d_the_candidate_lists_match_spec_d6_verbatim() -> None:
+    """Hand-written from SPEC_34 D6 on purpose (not built with `_sop_script`): a changed list must fail here."""
+    sop4 = "strash; " + "if -g -K 6; strash; " * 4 + "balance; dch"
+    assert sop4 == (
+        "strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; balance; dch"
+    )
+    assert abc_synth_module._DEPTH_SMALL_SCRIPTS == (
+        "strash; balance; dch",
+        "strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; balance; dch",
+        "strash; balance; dch; if -x -K 6; strash; balance",
+        "strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; "
+        "if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; if -g -K 6; strash; balance; dch",
+    )
+    assert abc_synth_module._DEPTH_LARGE_SCRIPTS == (
+        "strash; balance",
+        "strash; &get -n; &st; &sopb; &sopb; &put; balance",
+    )
+    assert abc_synth_module._DEPTH_LARGE_THRESHOLD == 150_000

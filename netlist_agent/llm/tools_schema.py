@@ -1591,6 +1591,11 @@ def do_optimize_depth(session: Session, basis: Optional[str] = None) -> dict[str
         # None does NOT mean the optimization ran: a depth-0 early exit is
         # also None, so read `changed`/`note` for what actually happened.
         "failure": result.failure,
+        # One reason per candidate script that did not run to completion, even
+        # when another candidate did (then `failure` is None). With
+        # changed=False it means "already optimal" was not established by every
+        # candidate; with changed=True, a lower depth may exist.
+        "incomplete": list(result.incomplete),
     }
 
 
@@ -1609,6 +1614,11 @@ def do_optimize_cone_depth(session: Session, net: str, basis: Optional[str] = No
         # None does NOT mean the optimization ran: a depth-0 early exit is
         # also None, so read `changed`/`note` for what actually happened.
         "failure": result.failure,
+        # One reason per candidate script that did not run to completion, even
+        # when another candidate did (then `failure` is None). With
+        # changed=False it means "already optimal" was not established by every
+        # candidate; with changed=True, a lower depth may exist.
+        "incomplete": list(result.incomplete),
     }
 
 
@@ -2273,8 +2283,13 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "Reduce the design's maximum combinational logic depth (critical path) via ABC-backed logic "
         "restructuring, preserving functional equivalence exactly. Optionally restricts the resynthesized "
         "logic to a fixed gate basis. Only actually changes the design if a verified-equivalent, "
-        "genuinely-better result was found; otherwise reports the design as already optimal and leaves it "
-        "untouched.",
+        "genuinely-better result was found; otherwise leaves it untouched. "
+        "With changed=false, read the result fields before saying why: `failure` (a string) means no result "
+        "could be accepted -- every candidate failed or was skipped, the equivalence check of every better result "
+        "was undecided, or a result was found not equivalent -- so nothing was established about the optimum "
+        "(`failure` may therefore also mean the equivalence check FAILED, not only that it was undecided); "
+        "`incomplete` (a non-empty list) means some candidate script(s) could not be completed, so say a lower depth "
+        "is not ruled out. Also do NOT say the design is already optimal unless both are empty. With changed=true a lower depth may exist if `incomplete` is non-empty.",
         _schema({"basis": _s("Restrict resynthesized logic to this gate basis: one of 'and_not', 'and_or_not', 'nand_not', 'nor_not' (optional; unrestricted if omitted). NOT the same vocabulary as do_remap_to_basis's 'basis' -- see that tool's description.", _DEPTH_BASIS_VALUES)}),
     ),
     ToolSpec(
@@ -2282,7 +2297,13 @@ TOOL_SCHEMA: list[ToolSpec] = [
         "Reduce the maximum combinational depth of one net's fanin cone via ABC-backed logic restructuring, "
         "leaving every other gate in the design untouched. Optionally restricts the resynthesized cone to a "
         "fixed gate basis. Only actually changes the design if a verified-equivalent, genuinely-better result "
-        "was found; otherwise reports the cone as already optimal and leaves the design untouched.",
+        "was found; otherwise leaves the design untouched. "
+        "With changed=false, read the result fields before saying why: `failure` (a string) means no result "
+        "could be accepted -- every candidate failed or was skipped, the equivalence check of every better result "
+        "was undecided, or a result was found not equivalent -- so nothing was established about the optimum "
+        "(`failure` may therefore also mean the equivalence check FAILED, not only that it was undecided); "
+        "`incomplete` (a non-empty list) means some candidate script(s) could not be completed, so say a lower depth "
+        "is not ruled out. Also do NOT say the cone is already optimal unless both are empty. With changed=true a lower depth may exist if `incomplete` is non-empty.",
         _schema(
             {
                 "net": _s(_NET_DESC),

@@ -301,8 +301,8 @@ def _sop_script(rounds: int) -> str:
 
 _DEPTH_SMALL_SCRIPTS: tuple[str, ...] = (
     _OPT_SCRIPT,
-    _sop_script(_DEPTH_SOP_ROUNDS_SMALL),
     "strash; balance; dch; if -x -K 6; strash; balance",
+    _sop_script(_DEPTH_SOP_ROUNDS_SMALL),
     _sop_script(_DEPTH_SOP_ROUNDS_LONG),
 )
 _DEPTH_LARGE_SCRIPTS: tuple[str, ...] = (
@@ -316,7 +316,19 @@ _DEPTH_LARGE_SCRIPTS: tuple[str, ...] = (
 # FINDINGS test051 measurement -- cec 66s, Python about 23s.
 # The same constant also guards the post-cec rebuild of a runner-up, but there
 # it is compared against the raw `remaining()` (no reserve subtracted).
+#
+# Batch 35 (D1): the small list is ordered by cost (test062 measured 22 / 25 /
+# 45 / >65s for the four scripts), so cheap candidates run first.
+# Batch 35 (D2): the reserve also scales with machine speed. `t0` is the time
+# prepare() + candidate 0 + its depth measurement took (only when candidate 0
+# completed); the reserve is `max(0.35 * budget, _DEPTH_CEC_T0_FACTOR * t0)`.
+# Source: experiments/test062_slow_machine_2026-11-16/SPEC.md, measured on
+# test062 with every cost scaled by s (deadline clock x s, subprocess timeouts
+# / s): cec / t0 was about 83.3 / 29 = 2.9 at s=1 and about 2.3 at s=1.5; 3.5
+# leaves about 20% over the worst. This is a "every cost slows down in
+# proportion" model, NOT a measurement on a really slower machine.
 _DEPTH_RESERVE_FRACTION = 0.35
+_DEPTH_CEC_T0_FACTOR = 3.5
 _DEPTH_MIN_CANDIDATE_SECONDS = 10.0
 
 
@@ -718,6 +730,7 @@ def _optimize_depth_candidates(
             candidates=n,
         )
 
+    remaining_start = deadline.remaining()
     try:
         first = prepare()
     except (ABCBridgeError, _SynthError) as exc:
@@ -730,12 +743,17 @@ def _optimize_depth_candidates(
     accepted: list[_Accepted] = []  # in candidate order
     best: Optional[_Accepted] = None
     out_of_time = False
+    t0 = 0.0  # time spent on prepare + candidate 0; stays 0 unless candidate 0 completed
     for order, script in enumerate(scripts):
         cand_timeout = timeout
+        cand_budget_clock = False
+        reserve = 0.0
         if order >= 1:
             left = deadline.remaining()
             if left is not None:
-                avail = left - _DEPTH_RESERVE_FRACTION * (deadline.current_budget() or 0.0)
+                cand_budget_clock = True
+                reserve = max(_DEPTH_RESERVE_FRACTION * (deadline.current_budget() or 0.0), _DEPTH_CEC_T0_FACTOR * t0)
+                avail = left - reserve
                 if out_of_time or avail < _DEPTH_MIN_CANDIDATE_SECONDS:
                     out_of_time = True
                     incomplete.append(
@@ -750,6 +768,19 @@ def _optimize_depth_candidates(
             else:
                 work = view = promoted_q_source = None  # free the previous candidate before building the next
                 work, view, promoted_q_source = prepare()
+                if cand_budget_clock:
+                    # prepare() (deepcopy + extract) ate part of what avail was computed from: re-read it.
+                    left = deadline.remaining()
+                    if left is not None:
+                        avail = left - reserve
+                        if avail < _DEPTH_MIN_CANDIDATE_SECONDS:
+                            out_of_time = True
+                            incomplete.append(
+                                "skipped: not enough of this request's time budget was left for another candidate"
+                            )
+                            work = view = promoted_q_source = None
+                            continue
+                        cand_timeout = min(timeout, avail)
             blif = _run_abc_synthesis(view, basis, cand_timeout, script)
             splice(work, blif, promoted_q_source)
             remove_dangling_gates(work)
@@ -758,6 +789,10 @@ def _optimize_depth_candidates(
             continue
         completed += 1
         depth_after = measure(work)
+        if order == 0 and remaining_start is not None:
+            remaining_now = deadline.remaining()
+            if remaining_now is not None:
+                t0 = max(0.0, remaining_start - remaining_now)
         if depth_after < depth_before or (depth_after == depth_before and len(work.gates) < baseline):
             cand = _Accepted(depth_after, len(work.gates), order, work, blif)
             accepted.append(cand)

@@ -44,7 +44,7 @@ Needs the contest's released testcases under `Alpha_Testcase/testcase/testNN/`
 | `./demo/run_demo.sh --list` | every released testcase, with request count and design size |
 | `./demo/run_demo.sh --ask [case]` | interactive against a named testcase instead of your own file |
 | `./demo/run_demo.sh --file req.txt [case]` | your own request file against a named testcase |
-| `./demo/run_demo.sh --verify [case]` | after the run, prove the written netlist is still equivalent to the original with ABC `cec` |
+| `./demo/run_demo.sh --verify [case]` | after the run, prove the written netlist is still equivalent to the original with ABC |
 
 `--verify` is opt-in because it is only meaningful for a run whose requests are
 all equivalence-preserving. One transform deliberately changes function.

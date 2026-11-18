@@ -7,6 +7,7 @@ subprocess is a fake."""
 from __future__ import annotations
 
 import subprocess
+import threading
 
 import pytest
 
@@ -315,20 +316,59 @@ def test_synthesis_clamps_timeout_and_messages(monkeypatch, clock, tmp_path) -> 
 # ----------------------------------------------------------------------
 
 
+class _RaceProc:
+    """Fake `Popen` for one side of `_run_cec`'s race. `communicate()` runs `action()` and returns its
+    `(stdout)`; `action=None` blocks until `kill()` (a process that never answers)."""
+
+    pid = 1
+
+    def __init__(self, action=None):
+        self.action = action
+        self.returncode = None
+        self._killed = threading.Event()
+
+    def communicate(self):
+        if self.action is None:
+            self._killed.wait(30)
+            self.returncode = -9
+            return "", ""
+        out = self.action()
+        self.returncode = 0
+        return out, ""
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        if self.returncode is None:
+            self.returncode = -9
+        self._killed.set()
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 def test_is_constant_second_cec_not_started(monkeypatch, clock, tmp_path) -> None:
-    """kills: _run_abc not re-checking the budget per spawn."""
+    """kills: _run_abc / _run_cec not re-checking the budget per spawn (the race must re-check before it
+    starts the second pair of processes)."""
     design = _design(tmp_path, _CONST_V)
     monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
+    started: list = []
 
-    def first_cec(t):
-        clock["t"] = 9.8
-        return _Result(stdout="Networks are NOT EQUIVALENT.  Time = 0.00 sec\n")
+    def first_cec():
+        clock["t"] = 9.8  # the first race ate the budget; P never gives a verdict
+        return "Networks are NOT EQUIVALENT.  Time = 0.00 sec\n"
 
-    spawns = _Spawns(monkeypatch, first_cec)
+    def fake_start(abc_path, script):
+        started.append(script)
+        # First race: L (`cec`) answers, P hangs. A second race would never get here.
+        return _RaceProc(None if script.startswith("miter") else first_cec)
+
+    monkeypatch.setattr(abc_bridge_module, "_start_abc", fake_start)
     with deadline.request_scope(10.0):
         with pytest.raises(ABCTimeoutError, match="was not started"):
             is_constant(design, NetBit("n1", None))
-    assert len(spawns.timeouts) == 1
+    assert len(started) == 2  # one P + one L; the second cec started nothing
 
 
 # ----------------------------------------------------------------------

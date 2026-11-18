@@ -327,8 +327,14 @@ _DEPTH_LARGE_SCRIPTS: tuple[str, ...] = (
 # / s): cec / t0 was about 83.3 / 29 = 2.9 at s=1 and about 2.3 at s=1.5; 3.5
 # leaves about 20% over the worst. This is a "every cost slows down in
 # proportion" model, NOT a measurement on a really slower machine.
+# Batch 36: 3.5 was calibrated with the legacy `cec`. `_run_cec` now races a
+# fast prover against the legacy cec (both run at once, the first verdict
+# wins); on test062 cec / t0 is about 0.15-0.3 with it
+# (experiments/cec_cost_2026-11-17/FINDINGS.md), so the factor drops to 1.0.
+# When the prover stalls, the legacy cec's own time still applies, so 1.0 is
+# not a worst-case bound.
 _DEPTH_RESERVE_FRACTION = 0.35
-_DEPTH_CEC_T0_FACTOR = 3.5
+_DEPTH_CEC_T0_FACTOR = 1.0
 _DEPTH_MIN_CANDIDATE_SECONDS = 10.0
 
 

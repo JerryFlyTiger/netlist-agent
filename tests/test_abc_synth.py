@@ -2570,30 +2570,30 @@ def _clocked_candidates(monkeypatch, state, first_cost: float, first_exc=None):
     return timeouts
 
 
-def test_d2_a_big_t0_raises_the_reserve_to_3_5_t0(monkeypatch) -> None:
-    """t0 = 40 -> reserve = max(94.5, 140) = 140. remaining after #0 = 300 - 40 = 260 -> avail 120 -> candidates
-    2.. get min(timeout=200, 120). With the old fixed 94.5 they would get 165.5.
-    kills: dropping the t0 term; factor != 3.5."""
-    state = _advancing_clock(monkeypatch, 300.0)
-    timeouts = _clocked_candidates(monkeypatch, state, 40.0)
+def test_d2_a_big_t0_raises_the_reserve_to_1_0_t0(monkeypatch) -> None:
+    """t0 = 140 -> reserve = max(94.5, 1.0 * 140) = 140. remaining after #0 = 400 - 140 = 260 -> avail 120 ->
+    candidates 2.. get min(timeout=200, 120). With the old fixed 94.5 they would get 165.5.
+    kills: dropping the t0 term; factor != 1.0 (batch 36: was 3.5)."""
+    state = _advancing_clock(monkeypatch, 400.0)
+    timeouts = _clocked_candidates(monkeypatch, state, 140.0)
     result = optimize_depth(_build_and_chain(), timeout=200.0)
     assert timeouts == [200.0, 120.0, 120.0, 120.0]
     assert result.incomplete == ()
 
 
 def test_d2_a_big_t0_makes_later_candidates_get_skipped(monkeypatch) -> None:
-    """t0 = 50 -> reserve 175; remaining 150 - 50 = 100 -> avail < 0 -> 3 skipped (the fixed reserve 94.5 would
-    leave avail 5.5, also skipped, so use remaining 170: 170 - 50 = 120 -> fixed avail 25.5 runs, t0 avail -55 skips).
+    """t0 = 175 -> reserve 175; start 295, remaining after #0 = 120 -> the fixed reserve 94.5 would leave avail 25.5
+    (runs), the t0 reserve leaves -55 -> 3 skipped.
     kills: the t0 term not applied to the skip decision."""
-    state = _advancing_clock(monkeypatch, 170.0)
-    timeouts = _clocked_candidates(monkeypatch, state, 50.0)
+    state = _advancing_clock(monkeypatch, 295.0)
+    timeouts = _clocked_candidates(monkeypatch, state, 175.0)
     result = optimize_depth(_build_and_chain(), timeout=200.0)
     assert timeouts == [200.0]
     assert result.incomplete == (_SKIPPED,) * 3
 
 
 def test_d2_a_small_t0_keeps_the_fraction_reserve(monkeypatch) -> None:
-    """t0 = 10 -> 3.5 * 10 = 35 < 94.5 -> reserve stays 0.35 * 270. remaining 200 - 10 = 190 -> avail 95.5.
+    """t0 = 10 -> 1.0 * 10 = 10 < 94.5 -> reserve stays 0.35 * 270. remaining 200 - 10 = 190 -> avail 95.5.
     kills: reserve = t0-term only; max turned into min or sum."""
     state = _advancing_clock(monkeypatch, 200.0)
     timeouts = _clocked_candidates(monkeypatch, state, 10.0)
@@ -2602,12 +2602,12 @@ def test_d2_a_small_t0_keeps_the_fraction_reserve(monkeypatch) -> None:
 
 
 def test_d2_a_failed_first_candidate_does_not_scale_the_reserve(monkeypatch) -> None:
-    """Candidate 0 times out after burning 120s of the clock: that time says nothing about cec cost, so t0 = 0.
-    remaining 400 - 120 = 280 -> avail 185.5 -> clamped to timeout 150 (with t0=120 the reserve 420 would skip all).
+    """Candidate 0 times out after burning 200s of the clock: that time says nothing about cec cost, so t0 = 0.
+    remaining 480 - 200 = 280 -> avail 185.5 -> clamped to timeout 150 (with t0=200 the reserve 200 would give 80).
     kills: using t0 although candidate 0 failed."""
-    state = _advancing_clock(monkeypatch, 400.0)
+    state = _advancing_clock(monkeypatch, 480.0)
     timeouts = _clocked_candidates(
-        monkeypatch, state, 120.0, first_exc=abc_synth_module._SynthTimeout("ABC synthesis timed out after 120s")
+        monkeypatch, state, 200.0, first_exc=abc_synth_module._SynthTimeout("ABC synthesis timed out after 120s")
     )
     result = optimize_depth(_build_and_chain(), timeout=150.0)
     assert timeouts == [150.0, 150.0, 150.0, 150.0]
@@ -2616,9 +2616,9 @@ def test_d2_a_failed_first_candidate_does_not_scale_the_reserve(monkeypatch) -> 
 
 def test_d2_t0_is_measured_across_prepare_not_only_the_abc_run(monkeypatch) -> None:
     """The clock advances inside `prepare()` (the deepcopy + extract), not in ABC: t0 must include it.
-    prepare costs 40 -> reserve 140 -> avail = 260 - 140 = 120.
+    prepare costs 140 -> reserve 140 -> avail = 260 - 140 = 120.
     kills: starting the t0 measurement after prepare()."""
-    state = _advancing_clock(monkeypatch, 300.0)
+    state = _advancing_clock(monkeypatch, 400.0)
     timeouts = _clocked_candidates(monkeypatch, state, 0.0)
     real_extract = abc_synth_module.extract_combinational_view
     calls = {"n": 0}
@@ -2626,7 +2626,7 @@ def test_d2_t0_is_measured_across_prepare_not_only_the_abc_run(monkeypatch) -> N
     def _slow_extract(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            state["elapsed"] += 40.0
+            state["elapsed"] += 140.0
         return real_extract(*a, **k)
 
     monkeypatch.setattr(abc_synth_module, "extract_combinational_view", _slow_extract)
@@ -2675,29 +2675,29 @@ def test_d2_prepare_that_leaves_under_10s_is_skipped(monkeypatch) -> None:
 
 
 def test_d2_t0_is_taken_from_candidate_0_only(monkeypatch) -> None:
-    """Candidate 0 advances the clock 10 (t0 = 10 -> reserve max(94.5, 35) = 94.5); every later candidate advances 30.
-    Start 400, timeout 300: #1 avail 400-10-94.5 = 295.5; #2 295.5-30 = 265.5; #3 265.5-30 = 235.5.
-    Without the order == 0 guard t0 would be re-measured (40 after #1 -> reserve 140) and #3 would not be 235.5.
+    """Candidate 0 advances the clock 10 (t0 = 10 -> reserve max(94.5, 10) = 94.5); every later candidate advances 100.
+    Start 700, timeout 500: #1 avail 700-10-94.5 = 595.5 -> 500; #2 590-94.5 = 495.5; #3 490-94.5 = 395.5.
+    Without the order == 0 guard t0 would be re-measured (110 after #1 -> reserve 110) and #2 would not be 495.5.
     kills: removing the `order == 0` guard (t0 updated for every candidate)."""
-    state = _advancing_clock(monkeypatch, 400.0)
+    state = _advancing_clock(monkeypatch, 700.0)
     timeouts: list[float] = []
 
     def _fake(view, basis, timeout, opt_script=abc_synth_module._OPT_SCRIPT):
         timeouts.append(timeout)
-        state["elapsed"] += 10.0 if opt_script == abc_synth_module._OPT_SCRIPT else 30.0
+        state["elapsed"] += 10.0 if opt_script == abc_synth_module._OPT_SCRIPT else 100.0
         return _fake_chain_blif(3)
 
     monkeypatch.setattr(abc_synth_module, "_run_abc_synthesis", _fake)
     _always_equivalent(monkeypatch)
-    optimize_depth(_build_and_chain(), timeout=300.0)
-    assert timeouts == [300.0, 295.5, 265.5, 235.5]
+    optimize_depth(_build_and_chain(), timeout=500.0)
+    assert timeouts == [500.0, 500.0, 495.5, 395.5]
 
 
 def test_d2_t0_includes_the_splice_and_dangling_removal(monkeypatch) -> None:
-    """The clock advances 40 inside the first `remove_dangling_gates` (after ABC and splice, before measure).
-    t0 = 40 -> reserve 140 -> avail 260 - 140 = 120 (measuring t0 before it would give reserve 94.5 -> avail 165.5 -> min(200, 165.5) = 165.5).
+    """The clock advances 140 inside the first `remove_dangling_gates` (after ABC and splice, before measure).
+    t0 = 140 -> reserve 140 -> avail 260 - 140 = 120 (measuring t0 before it would give reserve 94.5 -> avail 165.5 -> min(200, 165.5) = 165.5).
     kills: measuring t0 before splice/remove_dangling_gates."""
-    state = _advancing_clock(monkeypatch, 300.0)
+    state = _advancing_clock(monkeypatch, 400.0)
     timeouts = _clocked_candidates(monkeypatch, state, 0.0)
     real_remove = abc_synth_module.remove_dangling_gates
     calls = {"n": 0}
@@ -2705,7 +2705,7 @@ def test_d2_t0_includes_the_splice_and_dangling_removal(monkeypatch) -> None:
     def _slow_remove(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            state["elapsed"] += 40.0
+            state["elapsed"] += 140.0
         return real_remove(*a, **k)
 
     monkeypatch.setattr(abc_synth_module, "remove_dangling_gates", _slow_remove)
@@ -2726,11 +2726,11 @@ def test_d2_prepare_that_leaves_between_0_and_10s_is_skipped(monkeypatch) -> Non
 
 
 def test_d2_t0_ends_after_measuring_the_depth_of_candidate_0(monkeypatch) -> None:
-    """The clock advances 40 inside the depth measurement of candidate 0 (`max_design_depth` call 2; call 1 is
+    """The clock advances 140 inside the depth measurement of candidate 0 (`max_design_depth` call 2; call 1 is
     depth_before). t0 must include it (SPEC D2: t0 ends after candidate 0's depth is measured):
-    t0 = 40 -> reserve 140 -> avail 260 - 140 = 120. Ending t0 before measure would give avail 165.5.
+    t0 = 140 -> reserve 140 -> avail 260 - 140 = 120. Ending t0 before measure would give avail 165.5.
     kills: taking the t0 reading before `depth_after = measure(work)`."""
-    state = _advancing_clock(monkeypatch, 300.0)
+    state = _advancing_clock(monkeypatch, 400.0)
     timeouts = _clocked_candidates(monkeypatch, state, 0.0)
     real_depth = abc_synth_module.NetlistGraph.max_design_depth
     calls = {"n": 0}
@@ -2738,7 +2738,7 @@ def test_d2_t0_ends_after_measuring_the_depth_of_candidate_0(monkeypatch) -> Non
     def _slow_depth(self, *a, **k):
         calls["n"] += 1
         if calls["n"] == 2:
-            state["elapsed"] += 40.0
+            state["elapsed"] += 140.0
         return real_depth(self, *a, **k)
 
     monkeypatch.setattr(abc_synth_module.NetlistGraph, "max_design_depth", _slow_depth)

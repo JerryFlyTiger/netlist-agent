@@ -205,7 +205,7 @@ if [ "$VERIFY" = "1" ]; then
     dim "no ${CASE}_out.v was written, so there is nothing to verify."
   else
     echo
-    bold "Equivalence check: ${CASE}_out.v vs the original, via ABC cec"
+    bold "Equivalence check: ${CASE}_out.v vs the original, via ABC"
     dim  "(Only meaningful for a run whose requests are all equivalence-preserving."
     dim  " scripts/run_corpus.py is the harness that tracks that properly.)"
     PYTHONPATH="$REPO_ROOT" "$PY" - "$CASE_ROOT/$CASE/$CASE.v" "$OUT_V" <<'PYEOF'

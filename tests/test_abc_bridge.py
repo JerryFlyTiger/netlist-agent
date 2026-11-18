@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
+import sys
+import threading
+import time
 
 import pytest
 
@@ -657,21 +661,19 @@ def test_scrub_abc_output_unit() -> None:
 
 
 def _patch_abc(monkeypatch, make_result):
-    """Patch ABC out; `make_result(tmpdir)` builds the fake CompletedProcess
-    from the real temp dir recovered out of the script string."""
+    """Patch ABC out; `make_result(tmpdir)` builds the `(returncode, stdout, stderr)` that both race processes
+    (P and L) finish with at once, the real temp dir recovered out of the script string. Which of the two reaches
+    the queue first is not fixed; callers only use outcomes that do not depend on it."""
     import re
-    import subprocess as subprocess_module
-    import types
 
     from netlist_agent import abc_bridge as abc_bridge_module
 
-    def _fake_run(argv, **k):
-        tmpdir = re.search(r'"(.*?)/a\.blif"', argv[2]).group(1)
-        rc, out, err = make_result(tmpdir)
-        return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+    def _fake_start(abc_path, script):
+        tmpdir = re.search(r'"(.*?)/a\.blif"', script).group(1)
+        return _FakeProc("X", make_result(tmpdir))
 
     monkeypatch.setattr(abc_bridge_module, "_resolve_abc", lambda: "/fake/abc")
-    monkeypatch.setattr(subprocess_module, "run", _fake_run)
+    monkeypatch.setattr(abc_bridge_module, "_start_abc", _fake_start)
 
 
 def _tiny_designs(tmp_path):
@@ -1374,3 +1376,695 @@ def test_resolve_abc_path_replacement_escapes_regex_metacharacters(monkeypatch) 
     with pytest.raises(ABCBridgeError) as exc:
         _resolve_abc()
     assert "): /tmp/aXb+c/x y <repo> done /tmp/aXbbc end;" in str(exc.value)
+
+
+# ----------------------------------------------------------------------
+# Batch 36: `_run_cec` races the fast prover P (miter; &fraig -x; iprove) against the legacy `cec` L
+# ----------------------------------------------------------------------
+
+_CEC_EQ = "Networks are equivalent.  Time = 0.00 sec\n"
+_CEC_NEQ = "Networks are NOT EQUIVALENT.  Time = 0.00 sec\nInput pattern: 10\n"
+_P_UNSAT = "UNSATISFIABLE   Time = 0.1 sec\n"
+_P_SAT = "SATISFIABLE (output = 0)  Time = 0.00 sec\n"
+_NEVER = None  # outcome of a process that only ends when it is killed
+
+
+class _FakeProc:
+    """Stands in for a `subprocess.Popen`. `outcome` is `(returncode, stdout, stderr)` or `_NEVER`. `communicate()`
+    blocks on `gate` (when given) and, for `_NEVER`, on `kill()`. `delay` (seconds) makes a finishing process wait
+    that long, killable -- only for the deadline-relative test."""
+
+    _pid = 1000
+
+    def __init__(self, key, outcome, gate=None, delay=0.0):
+        _FakeProc._pid += 1
+        self.pid = _FakeProc._pid
+        self.key, self.outcome, self.gate, self.delay = key, outcome, gate, delay
+        self.returncode = None
+        self.killed = False
+        self.waited = False
+        self._kill_ev = threading.Event()
+        self._exited = threading.Event()
+
+    def communicate(self):
+        if self.outcome is _NEVER:
+            self._kill_ev.wait(30)
+            self.returncode = -9
+            self._exited.set()
+            return "", ""
+        if self.gate is not None:
+            self.gate()
+        if self.delay and self._kill_ev.wait(self.delay):
+            self.returncode = -9
+            self._exited.set()
+            return "", ""
+        if isinstance(self.outcome, BaseException):
+            self.returncode = 0
+            self._exited.set()
+            raise self.outcome  # a read failure (e.g. UnicodeDecodeError)
+        self.returncode, out, err = self.outcome
+        self._exited.set()
+        return out, err
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        if self.returncode is None:
+            self.returncode = -9
+        self._kill_ev.set()
+
+    def wait(self, timeout=None):
+        self.waited = True
+        self._exited.wait(10)
+        return self.returncode
+
+
+def _as_outcome(x):
+    return x if x is _NEVER or isinstance(x, (tuple, BaseException)) else (0, x, "")
+
+
+class _Race:
+    """Replaces `_resolve_abc`, `_start_abc` and `_race_reader` inside abc_bridge. `p` / `l` are the outcomes of
+    the two processes (a str = rc 0 with that stdout, a tuple = (rc, stdout, stderr), `_NEVER`). `order` is who
+    reaches the queue first when both finish: the second finisher's `communicate()` waits until the first one's
+    `_race_reader` has returned (so already put on the queue). No sleeps decide the order."""
+
+    def __init__(self, monkeypatch, p, l, order=("P", "L"), p_delay=0.0):
+        from netlist_agent import abc_bridge as m
+
+        self.scripts: dict[str, str] = {}
+        self.procs: dict[str, _FakeProc] = {}
+        self.start_calls = 0
+        self._done = {"P": threading.Event(), "L": threading.Event()}
+        outcomes = {"P": _as_outcome(p), "L": _as_outcome(l)}
+        delays = {"P": p_delay, "L": 0.0}
+        first = order[0]
+        orig_reader = m._race_reader
+
+        def _gate_for(key):
+            if key == first or outcomes[first] is _NEVER:
+                return None
+            return lambda: self._done[first].wait(10)
+
+        def _start(abc_path, script):
+            self.start_calls += 1
+            key = "P" if script.startswith("miter") else "L"
+            self.scripts[key] = script
+            proc = _FakeProc(key, outcomes[key], gate=_gate_for(key), delay=delays[key])
+            self.procs[key] = proc
+            return proc
+
+        def _reader(key, proc, q):
+            orig_reader(key, proc, q)
+            self._done[key].set()
+
+        monkeypatch.setattr(m, "_resolve_abc", lambda: "/fake/abc")
+        monkeypatch.setattr(m, "_start_abc", _start)
+        monkeypatch.setattr(m, "_race_reader", _reader)
+
+
+def _timed(fn):
+    """`(fn(), wall seconds)`."""
+    start = time.monotonic()
+    result = fn()
+    return result, time.monotonic() - start
+
+
+def test_run_cec_p_unsat_first_is_equivalent_and_kills_legacy(monkeypatch, tmp_path) -> None:
+    """kills: P's UNSAT not taken as a verdict; the detail built from anything but the matched verdict line; the
+    legacy process left running (not killed / not waited for); the call waiting for L."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    race = _Race(monkeypatch, "Networks are equivalent after sweeping.\n" + _P_UNSAT, _NEVER)
+    a, b = _tiny_designs(tmp_path)
+    res, wall = _timed(lambda: _run_cec(a, b, 100.0))
+    assert res.equivalent
+    assert res.detail == "Networks are equivalent (proved by SAT sweeping: UNSATISFIABLE   Time = 0.1 sec)"
+    assert race.start_calls == 2
+    assert 'miter "' in race.scripts["P"] and "&fraig -x" in race.scripts["P"]
+    assert race.scripts["L"].startswith('cec "')
+    assert race.procs["L"].killed and race.procs["L"].waited and race.procs["P"].waited
+    assert wall < 5
+
+
+def test_run_cec_legacy_equivalent_first_does_not_wait_for_p(monkeypatch, tmp_path) -> None:
+    """kills: the call waiting for P (or giving P priority) before taking L's verdict; P not killed; L's detail
+    replaced by P-style text."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    race = _Race(monkeypatch, _NEVER, _CEC_EQ)
+    a, b = _tiny_designs(tmp_path)
+    res, wall = _timed(lambda: _run_cec(a, b, 100.0))
+    assert res.equivalent and res.detail == _CEC_EQ.strip()
+    assert race.procs["P"].killed and race.procs["P"].waited
+    assert wall < 5
+
+
+def test_run_cec_legacy_counterexample_first_does_not_wait_for_p(monkeypatch, tmp_path) -> None:
+    """kills: a NOT EQUIVALENT answer from L held back until P finishes; the counterexample text altered."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    race = _Race(monkeypatch, _NEVER, _CEC_NEQ)
+    a, b = _tiny_designs(tmp_path)
+    res, wall = _timed(lambda: _run_cec(a, b, 100.0))
+    assert not res.equivalent and res.detail == _CEC_NEQ.strip()
+    assert "Input pattern:" in res.detail
+    assert race.procs["P"].killed and race.procs["P"].waited
+    assert wall < 5
+
+
+def test_run_cec_p_sat_then_legacy_equivalent_is_a_loud_error(monkeypatch, tmp_path) -> None:
+    """kills: the engine-disagreement check removed (SAT from P silently overridden by L's equivalent), or `p_sat`
+    only recorded when P is still running."""
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    _Race(monkeypatch, _P_SAT, _CEC_EQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError, match="disagree"):
+        _run_cec(a, b, 100.0)
+
+
+def test_run_cec_p_sat_then_legacy_not_equivalent_returns_legacy_verbatim(monkeypatch, tmp_path) -> None:
+    """kills: P's SAT taken as the answer (it has no counterexample text); L's result not passed through."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    _Race(monkeypatch, _P_SAT, _CEC_NEQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 100.0)
+    assert not res.equivalent and res.detail == _CEC_NEQ.strip()
+
+
+# Real ABC words the warning `Warning: Constant-0 drivers added to N non-driven nets in network "top":` and then
+# prints each such net's bare name on its own line. The production path never reaches it (`write_blif` ties every
+# undriven net explicitly); these fixtures are defense in depth.
+_WARN = 'Warning: Constant-0 drivers added to 1 non-driven nets in network "top":\n'
+_FORGED = _WARN + "UNSATISFIABLE\nSATISFIABLE (output = 0)  Time = 0.00 sec\n"
+
+
+def _non_unsat_p_outcomes():
+    return [
+        pytest.param("UNDECIDED\n", id="undecided"),
+        pytest.param("something ABC never prints\n", id="unrecognized"),
+        pytest.param("", id="empty"),
+        pytest.param((134, "", "Assertion failed"), id="crash"),
+        pytest.param((1, _P_UNSAT, ""), id="unsat-text-but-nonzero-exit"),
+        pytest.param("the answer is not UNSATISFIABLE  Time = 0.00 sec\n", id="unsat-mid-line"),
+        pytest.param("UNSATISFIABLE\nTime = 0.00 sec\n", id="unsat-spans-lines"),
+        pytest.param(_WARN + "SATISFIABLE\nUNDECIDED      Time = 0.00 sec\n", id="bare-sat-net-name"),
+        pytest.param("note: SATISFIABLE (output = 0) was not printed here\n", id="sat-mid-line"),
+        pytest.param("SATISFIABLE\n(output = 0) Time = 0.00 sec\n", id="sat-spans-lines"),
+    ]
+
+
+@pytest.mark.parametrize("p", _non_unsat_p_outcomes())
+def test_run_cec_non_unsat_p_first_then_legacy_equivalent_is_not_a_disagreement(monkeypatch, tmp_path, p) -> None:
+    """kills: any non-UNSAT P outcome taken as a verdict; the SAT regex loosened (bare word / mid-line / spanning
+    lines / `^` or `re.M` dropped) so that it raises "disagree" against L's equivalent; the UNSAT regex loosened
+    (`^`, `[ \\t]+`, rc check dropped) so that P decides equivalence."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    _Race(monkeypatch, p, _CEC_EQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 100.0)
+    assert res.equivalent and res.detail == _CEC_EQ.strip()
+
+
+@pytest.mark.parametrize("p", _non_unsat_p_outcomes())
+def test_run_cec_non_unsat_p_first_then_legacy_not_equivalent_returns_legacy(monkeypatch, tmp_path, p) -> None:
+    """kills: a non-UNSAT P outcome (incl. the forged/bare-name UNSAT lines) turning the result into equivalent."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    _Race(monkeypatch, p, _CEC_NEQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 100.0)
+    assert not res.equivalent and res.detail == _CEC_NEQ.strip()
+
+
+def test_run_cec_forged_unsat_line_is_not_a_verdict(monkeypatch, tmp_path) -> None:
+    """ABC prints an undriven net's name on its own line; a net called UNSATISFIABLE must not prove equivalence.
+    kills: the `Time` suffix dropped from the UNSAT regex (bare `^UNSATISFIABLE` would take line 2)."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    _Race(monkeypatch, _FORGED, _CEC_NEQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 100.0)
+    assert not res.equivalent and res.detail == _CEC_NEQ.strip()
+
+
+def test_run_cec_sat_line_after_a_warning_still_contradicts_legacy(monkeypatch, tmp_path) -> None:
+    """The SAT verdict line is not the first line when ABC printed a warning; the contradiction check must still
+    see it. kills: `re.M` dropped from the SAT regex (the guard goes silently dead)."""
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    _Race(monkeypatch, _WARN + "x\n" + _P_SAT, _CEC_EQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError, match="disagree"):
+        _run_cec(a, b, 100.0)
+
+
+def test_run_cec_legacy_crash_then_p_unsat_is_equivalent(monkeypatch, tmp_path) -> None:
+    """kills: L's failure raised at once while P is still running (L's exception must be held until P is done)."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    _Race(monkeypatch, _P_UNSAT, (134, "", "boom"), order=("L", "P"))
+    a, b = _tiny_designs(tmp_path)
+    res = _run_cec(a, b, 100.0)
+    assert res.equivalent and "proved by SAT sweeping" in res.detail
+
+
+@pytest.mark.parametrize("p", ["UNDECIDED\n", (1, "", "p crashed"), "junk\n"], ids=["undecided", "crash", "junk"])
+def test_run_cec_legacy_crash_then_p_without_verdict_raises_legacy_error(monkeypatch, tmp_path, p) -> None:
+    """kills: P's non-verdict end swallowed (hanging until the deadline / timeout error instead); L's exception
+    replaced by P's; the P branch's `if l_exc is not None: raise l_exc` dropped (the call would wait for the
+    deadline -> the wall check)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCTimeoutError, _run_cec
+
+    _Race(monkeypatch, p, (134, "", "L boom"), order=("L", "P"))
+    monkeypatch.setattr(m, "_real_wait", lambda t: 3.0)
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(ABCBridgeError, match=r"ABC exited with code 134 running 'cec'.*L boom") as exc:
+        _run_cec(a, b, 100.0)
+    assert not isinstance(exc.value, ABCTimeoutError)
+    assert time.monotonic() - start < 2.0
+
+
+def test_run_cec_legacy_crash_then_deadline_raises_legacy_error_not_timeout(monkeypatch, tmp_path) -> None:
+    """L crashed, P never ends, the deadline comes: L's error, not a timeout message.
+    kills: the `queue.Empty` branch raising the timeout without looking at L's held exception."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCTimeoutError, _run_cec
+
+    race = _Race(monkeypatch, _NEVER, (134, "", "L boom"))
+    monkeypatch.setattr(m, "_real_wait", lambda t: 0.3)
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError, match=r"code 134 running 'cec'") as exc:
+        _run_cec(a, b, 100.0)
+    assert not isinstance(exc.value, ABCTimeoutError)
+    assert race.procs["P"].killed and race.procs["P"].waited
+
+
+def test_run_cec_legacy_undecided_then_p_unsat_is_equivalent(monkeypatch, tmp_path) -> None:
+    """kills: `CecUndecidedError` from `_parse_cec_output` raised at once (it is an ABCBridgeError subclass that
+    must be held like any other L failure)."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    _Race(monkeypatch, _P_UNSAT, "Networks are undecided (SAT solver timed out).\n", order=("L", "P"))
+    a, b = _tiny_designs(tmp_path)
+    assert _run_cec(a, b, 100.0).equivalent
+
+
+def test_run_cec_legacy_undecided_then_p_without_verdict_raises_undecided(monkeypatch, tmp_path) -> None:
+    """kills: L's `CecUndecidedError` turned into a different exception type; the P branch's
+    `if l_exc is not None: raise l_exc` dropped (the call would wait for the deadline -> the wall check)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import CecUndecidedError, _run_cec
+
+    _Race(monkeypatch, "UNDECIDED\n", "Networks are undecided (SAT solver timed out).\n", order=("L", "P"))
+    monkeypatch.setattr(m, "_real_wait", lambda t: 3.0)
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(CecUndecidedError):
+        _run_cec(a, b, 100.0)
+    assert time.monotonic() - start < 2.0
+
+
+def test_run_cec_p_without_verdict_then_legacy_crash_raises_at_once(monkeypatch, tmp_path) -> None:
+    """P finished first with no verdict, L fails afterwards: L's exception at once.
+    kills: the `p_done` check dropped (the call would wait for a deadline that never comes -> the wall check)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCBridgeError, _run_cec
+
+    _Race(monkeypatch, "UNDECIDED\n", (134, "", "L boom"), order=("P", "L"))
+    monkeypatch.setattr(m, "_real_wait", lambda t: 3.0)
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(ABCBridgeError, match="code 134"):
+        _run_cec(a, b, 100.0)
+    assert time.monotonic() - start < 2.0
+
+
+def test_run_cec_p_read_failure_does_not_affect_legacy_verdict(monkeypatch, tmp_path) -> None:
+    """P's output is unreadable (`UnicodeDecodeError` from `communicate()`): P counts as "no verdict"; L's
+    verdict stands. kills: P's read error treated as a verdict, or raised instead of ignored; `_race_reader`
+    without the `except` (P's thread dies before `_Race` releases L's gate, which then opens only on its
+    10s fallback -> the wall check)."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    _Race(monkeypatch, err, _CEC_NEQ, order=("P", "L"))
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    res = _run_cec(a, b, 100.0)
+    assert time.monotonic() - start < 5.0
+    assert not res.equivalent and res.detail == _CEC_NEQ.strip()
+
+
+def test_run_cec_legacy_read_failure_with_p_without_verdict_raises_at_once(monkeypatch, tmp_path) -> None:
+    """L's output is unreadable, P ended without a verdict: the read error is raised at once, without a path.
+    kills: `_race_reader` without the `except` (L's thread dies, the main loop waits out the budget and reports
+    a timeout -> the wall and type checks); the L read error not treated as an L failure (e.g. swallowed)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCTimeoutError, _run_cec
+
+    err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    _Race(monkeypatch, "UNDECIDED\n", err, order=("P", "L"))
+    monkeypatch.setattr(m, "_real_wait", lambda t: 3.0)
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 100.0)
+    assert time.monotonic() - start < 2.0
+    assert not isinstance(exc.value, ABCTimeoutError)
+    assert str(exc.value) == "could not read ABC output running 'cec': UnicodeDecodeError"
+
+
+def test_run_cec_legacy_read_failure_then_p_unsat_is_equivalent(monkeypatch, tmp_path) -> None:
+    """L's read error is held like any L failure; P's UNSAT then still wins.
+    kills: the L read error raised at once while P is still running; `_race_reader` without the `except`
+    (L's thread dies before `_Race` releases P's gate, which then opens only on its 10s fallback -> the wall
+    check)."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    _Race(monkeypatch, _P_UNSAT, err, order=("L", "P"))
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    assert _run_cec(a, b, 100.0).equivalent
+    assert time.monotonic() - start < 5.0
+
+
+def test_run_cec_zero_remaining_wait_is_a_timeout_not_a_crash(monkeypatch, tmp_path) -> None:
+    """The wait budget is already gone (`_real_wait` -> 0): `q.get` gets a 0 timeout and the result is
+    `ABCTimeoutError`. kills: the `max(0.0, ...)` clamp dropped (a negative timeout makes `Queue.get` raise
+    `ValueError`; with a tiny positive budget the elapsed time can already exceed it)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCTimeoutError, _run_cec
+
+    _Race(monkeypatch, _NEVER, _NEVER)
+    monkeypatch.setattr(m, "_real_wait", lambda t: 0.0)
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCTimeoutError):
+        _run_cec(a, b, 100.0)
+
+
+def test_run_cec_neither_finishes_times_out_with_the_nominal_wording(monkeypatch, tmp_path) -> None:
+    """No request scope: the timeout message quotes `timeout`, verbatim.
+    kills: the nominal / un-clamped wording changed or given the clamped suffix."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCTimeoutError, _run_cec
+
+    race = _Race(monkeypatch, _NEVER, _NEVER)
+    monkeypatch.setattr(m, "_real_wait", lambda t: 0.2)
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCTimeoutError) as exc:
+        _run_cec(a, b, 600.0)
+    assert str(exc.value) == "ABC invocation timed out after 600.0s running 'cec'"
+    assert all(p.killed and p.waited for p in race.procs.values())
+
+
+def test_run_cec_neither_finishes_clamped_timeout_quotes_the_time_left(monkeypatch, tmp_path) -> None:
+    """Inside a request scope the budget is clamped to the time left (30s of 100s): the message quotes 30.0s with
+    the budget suffix, not the nominal 100.
+    kills: the un-clamped branch used for the clamped message; the `t < timeout` test; `t` not the clamped value."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent import deadline
+    from netlist_agent.abc_bridge import ABCTimeoutError, _run_cec
+
+    _Race(monkeypatch, _NEVER, _NEVER)
+    monkeypatch.setattr(m, "_real_wait", lambda t: 0.2)
+    monkeypatch.setattr(deadline, "_monotonic", lambda: 0.0)
+    a, b = _tiny_designs(tmp_path)
+    with deadline.request_scope(30.0):
+        with pytest.raises(ABCTimeoutError) as exc:
+            _run_cec(a, b, 100.0)
+    assert str(exc.value) == (
+        "ABC invocation timed out after 30.0s running 'cec' (the time left in this request's budget)"
+    )
+
+
+def test_run_cec_not_started_when_the_request_has_no_time_left(monkeypatch, tmp_path) -> None:
+    """kills: processes started although `spawn_timeout` said no; the not-started wording changed."""
+    from netlist_agent import deadline
+    from netlist_agent.abc_bridge import ABCTimeoutError, _run_cec
+
+    race = _Race(monkeypatch, _P_UNSAT, _CEC_EQ)
+    now = {"t": 0.0}
+    monkeypatch.setattr(deadline, "_monotonic", lambda: now["t"])
+    a, b = _tiny_designs(tmp_path)
+    with deadline.request_scope(10.0):
+        now["t"] = 100.0  # the budget is spent before `_run_cec` is reached
+        with pytest.raises(ABCTimeoutError) as exc:
+            _run_cec(a, b, 100.0)
+    assert race.start_calls == 0
+    assert str(exc.value).startswith("ABC was not started for 'cec': this request had less than ")
+    assert "/" not in str(exc.value)
+
+
+def test_run_cec_p_gets_the_whole_budget_not_a_quarter(monkeypatch, tmp_path) -> None:
+    """L never ends; P's UNSAT arrives after 0.6 of the (real) wait budget. A P deadline of a quarter of the
+    budget would give up on P first. The race's real wait is shrunk to 1.0s through `_real_wait`; P's fake process
+    holds its answer for 0.6s (killable). The call must return the P verdict, between 0.6 and 1.0s.
+    kills: a P-specific deadline of 0.25 x t (K8): it expires at 0.25s, before P answers, and the call raises the
+    timeout instead; L's wait budget not being the whole one."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import _run_cec
+
+    race = _Race(monkeypatch, _P_UNSAT, _NEVER, p_delay=0.6)
+    monkeypatch.setattr(m, "_real_wait", lambda t: 1.0)
+    a, b = _tiny_designs(tmp_path)
+    res, wall = _timed(lambda: _run_cec(a, b, 100.0))
+    assert res.equivalent and "proved by SAT sweeping" in res.detail
+    assert wall >= 0.5
+    assert race.procs["L"].killed
+
+
+@pytest.mark.parametrize("fail_on", [0, 1], ids=["p-start-fails", "legacy-start-fails"])
+def test_run_cec_start_oserror_is_a_bridge_error_and_cleans_up(monkeypatch, tmp_path, fail_on) -> None:
+    """kills: the OSError escaping raw or becoming an inconclusive error; the message carrying a path; a process
+    started before the failing one left running (not killed / not waited for)."""
+    import errno
+
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCBridgeError, ABCInconclusiveError, _run_cec
+
+    started: list[_FakeProc] = []
+
+    def _start(abc_path, script):
+        if len(started) == fail_on:
+            raise OSError(errno.ENOENT, "No such file or directory", "/some/where/abc_bridge_x/abc")
+        proc = _FakeProc("P", _NEVER)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(m, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(m, "_start_abc", _start)
+    a, b = _tiny_designs(tmp_path)
+    with pytest.raises(ABCBridgeError) as exc:
+        _run_cec(a, b, 100.0)
+    assert not isinstance(exc.value, ABCInconclusiveError)
+    assert str(exc.value) == "could not run ABC: No such file or directory (abc)"
+    assert len(started) == fail_on
+    assert all(p.killed and p.waited for p in started)
+
+
+def test_run_cec_every_wait_goes_through_real_wait(monkeypatch, tmp_path) -> None:
+    """kills: a wait that bypasses `_real_wait` (sim.py scales only that); the argument not being the budget
+    actually granted (`t`, clamped inside a request scope)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent import deadline
+    from netlist_agent.abc_bridge import _run_cec
+
+    seen: list[float] = []
+
+    def _rw(t):
+        seen.append(t)
+        return t
+
+    _Race(monkeypatch, _P_UNSAT, _NEVER)
+    monkeypatch.setattr(m, "_real_wait", _rw)
+    a, b = _tiny_designs(tmp_path)
+    _run_cec(a, b, 100.0)
+    assert seen == [100.0]
+
+    seen.clear()
+    _Race(monkeypatch, _P_UNSAT, _NEVER)
+    monkeypatch.setattr(deadline, "_monotonic", lambda: 0.0)
+    with deadline.request_scope(30.0):
+        _run_cec(a, b, 100.0)
+    assert seen == [30.0]
+
+
+def test_run_cec_real_wait_scales_the_deadline(monkeypatch, tmp_path) -> None:
+    """kills: `wait_budget` computed from `t` instead of `_real_wait(t)`: with a huge `t` and a tiny real wait the
+    call must time out quickly."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCTimeoutError, _run_cec
+
+    _Race(monkeypatch, _NEVER, _NEVER)
+    monkeypatch.setattr(m, "_real_wait", lambda t: t / 1000.0)
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(ABCTimeoutError):
+        _run_cec(a, b, 200.0)
+    assert time.monotonic() - start < 5
+
+
+
+def test_verify_equivalence_real_abc_fast_path_equivalent(tmp_path) -> None:
+    """Real ABC. kills: the race wired to the wrong scripts (an ABC error would surface or the verdict flip).
+    Which engine wins on a tiny design is not fixed (P's UNSAT text or L's `Networks are equivalent after ...`),
+    so only the verdict and its common prefix are asserted."""
+    path = _write(tmp_path, "fp_eq.v", "module top(a, b, y);\n input a, b;\n output y;\n and g0(y, a, b);\nendmodule\n")
+    original = parse_verilog(path)
+    other = parse_verilog(path)
+    result = verify_equivalence(original, other)
+    assert result.equivalent, result.detail
+    assert result.detail.startswith("Networks are equivalent")
+
+
+def test_verify_equivalence_real_abc_not_equivalent_keeps_input_pattern(tmp_path) -> None:
+    """Real ABC. kills: a SAT result from the fast path being returned instead of the legacy `cec` text (which
+    carries `Input pattern:`)."""
+    path = _write(tmp_path, "fp_neq.v", "module top(a, b, y);\n input a, b;\n output y;\n and g0(y, a, b);\nendmodule\n")
+    original = parse_verilog(path)
+    mutated = parse_verilog(path)
+    mutated.gates[0].gate_type = GateType.OR
+    result = verify_equivalence(original, mutated)
+    assert not result.equivalent
+    assert "Input pattern:" in result.detail
+
+
+def test_fast_cec_script_real_abc_verdict_lines_match_the_regexes(tmp_path) -> None:
+    """Real ABC, P's script run alone (no race). kills: `; iprove` dropped from `_FAST_CEC_SCRIPT` (no verdict
+    line -> the UNSAT assertion); the UNSAT or SAT regex no longer matching real ABC's text; the script wired so
+    the not-equivalent pair also prints UNSAT."""
+    from netlist_agent.abc_bridge import _FAST_CEC_SAT_RE, _FAST_CEC_SCRIPT, _FAST_CEC_UNSAT_RE, _run_abc, write_blif
+
+    path = _write(tmp_path, "fs.v", "module top(a, b, y);\n input a, b;\n output y;\n and g0(y, a, b);\nendmodule\n")
+    same_a, same_b = parse_verilog(path), parse_verilog(path)
+    diff_b = parse_verilog(path)
+    diff_b.gates[0].gate_type = GateType.OR
+    pa, pb, pc = (os.path.join(str(tmp_path), n) for n in ("fa.blif", "fb.blif", "fc.blif"))
+    write_blif(same_a, pa)
+    write_blif(same_b, pb)
+    write_blif(diff_b, pc)
+    eq_out = _run_abc(_FAST_CEC_SCRIPT.format(a=pa, b=pb), timeout=60.0)
+    assert _FAST_CEC_UNSAT_RE.search(eq_out), eq_out
+    assert not _FAST_CEC_SAT_RE.search(eq_out), eq_out
+    neq_out = _run_abc(_FAST_CEC_SCRIPT.format(a=pa, b=pc), timeout=60.0)
+    assert _FAST_CEC_SAT_RE.search(neq_out), neq_out
+    assert not _FAST_CEC_UNSAT_RE.search(neq_out), neq_out
+
+
+# ----------------------------------------------------------------------
+# Batch 36-R2: `_run_cec` leaves no process behind (REAL child processes)
+# ----------------------------------------------------------------------
+
+_SLEEP30 = [sys.executable, "-c", "import time; time.sleep(30)"]
+_PRINT_UNSAT = [sys.executable, "-c", "print('UNSATISFIABLE   Time = 0.1 sec')"]
+
+
+@pytest.fixture
+def real_race(monkeypatch):
+    """`_run_cec` with `_start_abc` replaced by real `subprocess.Popen`s. `cmds` maps "P"/"L" to the argv to
+    start (default: sleep 30s). Every started Popen is recorded in `started`; whatever the test did, the
+    fixture kills and reaps them afterwards so a failing assertion cannot leave a sleeper behind."""
+    from netlist_agent import abc_bridge as m
+
+    cmds = {"P": _SLEEP30, "L": _SLEEP30}
+    started: list = []
+
+    def _start(abc_path, script):
+        key = "P" if script.startswith("miter") else "L"
+        proc = subprocess.Popen(cmds[key], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(m, "_resolve_abc", lambda: "/fake/abc")
+    monkeypatch.setattr(m, "_start_abc", _start)
+    try:
+        yield cmds, started
+    finally:
+        for proc in started:
+            if proc.poll() is None:
+                proc.kill()
+        for proc in started:
+            proc.wait()
+            for f in (proc.stdout, proc.stderr):
+                if f is not None:
+                    f.close()
+
+
+def _assert_reaped(started) -> None:
+    """Every recorded process has exited AND been waited for (a zombie still answers `os.kill(pid, 0)`)."""
+    assert len(started) == 2
+    for proc in started:
+        assert proc.poll() is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+
+def test_run_cec_real_processes_reaped_after_normal_return(real_race, tmp_path) -> None:
+    """P prints UNSAT and exits at once; L is a real 30s sleeper. The call returns the verdict without waiting
+    for L, and L is killed and reaped.
+    kills: the `finally` `kill()` of a still-running process removed (L would sleep on; `proc.wait()` and the
+    reader's `communicate()` then block ~30s -> the wall check). Not claimed: the `wait()` loop removed (the
+    reader's `communicate()` reaps the child by itself)."""
+    from netlist_agent.abc_bridge import _run_cec
+
+    cmds, started = real_race
+    cmds["P"] = _PRINT_UNSAT
+    a, b = _tiny_designs(tmp_path)
+    result, wall = _timed(lambda: _run_cec(a, b, 100.0))
+    assert result.equivalent and "SAT sweeping" in result.detail
+    assert wall < 10.0
+    _assert_reaped(started)
+
+
+def test_run_cec_real_processes_reaped_after_deadline(real_race, monkeypatch, tmp_path) -> None:
+    """Both processes sleep; the 0.3s wait budget runs out -> `ABCTimeoutError`, and both sleepers are killed
+    and reaped.
+    kills: the `finally` `kill()` removed (both sleepers would run ~30s -> the wall check). Not claimed: the
+    `wait()` loop removed (the reader's `communicate()` reaps the child by itself)."""
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import ABCTimeoutError, _run_cec
+
+    _, started = real_race
+    monkeypatch.setattr(m, "_real_wait", lambda t: 0.3)
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(ABCTimeoutError):
+        _run_cec(a, b, 100.0)
+    assert time.monotonic() - start < 10.0
+    _assert_reaped(started)
+
+
+def test_run_cec_real_processes_reaped_after_keyboard_interrupt(real_race, monkeypatch, tmp_path) -> None:
+    """The main thread gets `KeyboardInterrupt` inside the wait (`queue.Queue.get`) while both processes are
+    alive: it propagates, and both are killed and reaped first.
+    kills: the whole cleanup moved out of `finally` (e.g. only on the normal path or only `except Exception`:
+    `KeyboardInterrupt` propagates at once with both sleepers alive -> `_assert_reaped`); the `finally`
+    `kill()` removed with the `wait()` loop kept (the wait blocks ~30s on the sleepers -> the wall check).
+    Not claimed: the `wait()` loop removed (the reader's `communicate()` reaps the child by itself)."""
+    import queue as queue_mod
+    import types
+
+    from netlist_agent import abc_bridge as m
+    from netlist_agent.abc_bridge import _run_cec
+
+    class _InterruptedQueue(queue_mod.Queue):
+        def get(self, *args, **kwargs):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(m, "queue", types.SimpleNamespace(Queue=_InterruptedQueue, Empty=queue_mod.Empty))
+    _, started = real_race
+    a, b = _tiny_designs(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        _run_cec(a, b, 100.0)
+    assert time.monotonic() - start < 10.0
+    _assert_reaped(started)

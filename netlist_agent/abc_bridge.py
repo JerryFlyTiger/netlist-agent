@@ -15,7 +15,13 @@ binary before this module was written -- do not re-derive, just rely on it):
      ABC by this module may ever contain a `dff` instance -- DFF boundaries
      are always turned into ports/ties first (see `extract_combinational_view`).
 
-  2. Equivalence checking is `cec fileA fileB` (two file paths, no prior
+  2. Equivalence checking (`_run_cec`) races a SAT-sweeping prover
+     (`miter; &get -n; &fraig -x; &put; iprove`, see `_FAST_CEC_SCRIPT`)
+     against `cec fileA fileB`, both on the whole budget. It takes only the
+     prover's `UNSATISFIABLE  Time = ...` line as its verdict; every other
+     prover outcome (SATISFIABLE, UNDECIDED, junk, crash) is ignored and `cec`'s
+     result is used, whose output patterns are the ones documented below.
+     The legacy `cec` is `cec fileA fileB` (two file paths, no prior
      `read_*` needed; `_run_cec` passes two `.blif` paths -- see finding 4 --
      but `cec` itself is format-agnostic, confirmed against a `.v`/`.blif`
      mix too). Confirmed verbatim output patterns:
@@ -59,17 +65,21 @@ binary before this module was written -- do not re-derive, just rely on it):
      `_token_resolver`) needed no changes for this switch. Also confirmed:
      an undriven net referenced by `read_blif` (never a `.names`/`.gate`
      output column) gets the identical harmless constant-0-tie treatment as
-     an undriven net under `read_verilog` (point 3) -- so `write_blif` never
-     needs to emit anything explicit for a floating net, only omit it from
-     every output column, exactly as `write_verilog` already implicitly did.
+     an undriven net under `read_verilog` (point 3). `write_blif` still emits
+     an explicit `.names <tok>` constant-0 tie for every such net (see the
+     end of `write_blif`), so ABC never has to add one itself and never
+     prints its "Constant-0 drivers added" warning on this module's paths.
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import re
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -258,8 +268,52 @@ def _os_error_detail(exc: OSError) -> str:
     return detail
 
 
-def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> str:
-    """Production callers must pass `tmpdir` (the directory `script`'s files
+def _abc_not_started_error(script: str) -> "ABCTimeoutError":
+    """The request had no time left to spawn ABC (`deadline.spawn_timeout`
+    returned `None`). Shared by `_run_abc` and the `_run_cec` race."""
+    return ABCTimeoutError(
+        f"ABC was not started for {_script_command(script)!r}: this request had less than "
+        f"{deadline.MIN_SPAWN_REMAINING:g}s of its time budget left"
+    )
+
+
+def _abc_timeout_error(
+    script: str, t: float, timeout: float, nominal_timeout: Optional[float]
+) -> "ABCTimeoutError":
+    """The timeout message. `t` is the time actually given (clamped to the
+    request's remaining time); `t < timeout` means the clamp bit and the
+    message says so, otherwise it quotes `nominal_timeout or timeout`."""
+    if t < timeout:
+        return ABCTimeoutError(
+            f"ABC invocation timed out after {t:.1f}s running {_script_command(script)!r} "
+            f"(the time left in this request's budget)"
+        )
+    quoted = timeout if nominal_timeout is None else nominal_timeout
+    return ABCTimeoutError(f"ABC invocation timed out after {quoted}s running {_script_command(script)!r}")
+
+
+def _abc_finish(script: str, returncode: int, stdout: str, stderr: str, tmpdir: Optional[str]) -> str:
+    """A finished ABC process -> its scrubbed stdout, or `ABCBridgeError`."""
+    if returncode != 0:
+        # A nonzero exit is ABC crashing (e.g. an internal assert/SIGABRT),
+        # distinct from the "always 0" guarantee documented above for the
+        # graceful equivalent/not-equivalent/failure-pattern outcomes of
+        # `cec` -- callers never relied on reading `stdout` when the process
+        # crashed, so raising here instead of returning is safe.
+        stderr_tail = _scrub_abc_output(stderr, tmpdir).strip()[-500:]
+        suffix = f": {stderr_tail}" if stderr_tail else ""
+        raise ABCBridgeError(f"ABC exited with code {returncode} running {_script_command(script)!r}{suffix}")
+    return _scrub_abc_output(stdout, tmpdir)
+
+
+def _run_abc(
+    script: str, timeout: float, *, tmpdir: Optional[str] = None, nominal_timeout: Optional[float] = None
+) -> str:
+    """`nominal_timeout` is only the number quoted in the un-clamped timeout
+    message (a caller that shortened `timeout` by time already spent passes
+    the budget the user asked for); `None` quotes `timeout`.
+
+    Production callers must pass `tmpdir` (the directory `script`'s files
     live in): without it only the command-line echo is dropped, and paths in
     other lines (e.g. `Cannot open input file "..."`) pass through. It is
     optional only because tests call this directly against a fake ABC whose
@@ -269,36 +323,16 @@ def _run_abc(script: str, timeout: float, *, tmpdir: Optional[str] = None) -> st
     # resolve above, which can itself use up time on a cold cache.
     t = deadline.spawn_timeout(timeout)
     if t is None:
-        raise ABCTimeoutError(
-            f"ABC was not started for {_script_command(script)!r}: this request had less than "
-            f"{deadline.MIN_SPAWN_REMAINING:g}s of its time budget left"
-        )
+        raise _abc_not_started_error(script)
     try:
         result = subprocess.run([abc_path, "-c", script], capture_output=True, text=True, timeout=t)
     except subprocess.TimeoutExpired as exc:
-        if t < timeout:
-            raise ABCTimeoutError(
-                f"ABC invocation timed out after {t:.1f}s running {_script_command(script)!r} "
-                f"(the time left in this request's budget)"
-            ) from exc
-        raise ABCTimeoutError(f"ABC invocation timed out after {timeout}s running {_script_command(script)!r}") from exc
+        raise _abc_timeout_error(script, t, timeout, nominal_timeout) from exc
     except OSError as exc:
         # Loud failure, not "inconclusive": ABC never ran, so there is no
         # verdict to be missing.
         raise ABCBridgeError(f"could not run ABC: {_os_error_detail(exc)}") from exc
-    if result.returncode != 0:
-        # A nonzero exit is ABC crashing (e.g. an internal assert/SIGABRT),
-        # distinct from the "always 0" guarantee documented above for the
-        # graceful equivalent/not-equivalent/failure-pattern outcomes of
-        # `cec` -- this module's only caller of `_run_abc` (`_run_cec`) never
-        # relied on reading `stdout` when the process crashed, so raising
-        # here instead of returning is safe.
-        stderr_tail = _scrub_abc_output(result.stderr, tmpdir).strip()[-500:]
-        suffix = f": {stderr_tail}" if stderr_tail else ""
-        raise ABCBridgeError(
-            f"ABC exited with code {result.returncode} running {_script_command(script)!r}{suffix}"
-        )
-    return _scrub_abc_output(result.stdout, tmpdir)
+    return _abc_finish(script, result.returncode, result.stdout, result.stderr, tmpdir)
 
 
 def _parse_cec_output(stdout: str) -> "EquivResult":
@@ -482,10 +516,70 @@ def write_blif(design: Design, path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+# Fast prover raced against the legacy `cec` in `_run_cec` (batch 36;
+# experiments/cec_cost_2026-11-17/FINDINGS_2.md). Both get the whole budget.
+_FAST_CEC_SCRIPT = 'miter "{a}" "{b}"; &get -n; &fraig -x; &put; iprove'
+# Verdict lines as real ABC prints them (iprove): `UNSATISFIABLE  Time = ...` and
+# `SATISFIABLE (output = 0) Time = ...` (`UNDECIDED  Time = ...` is no verdict). ABC also
+# prints an undriven net's bare name on its own line, so the bare word alone must not
+# count: the equivalence verdict needs the `Time =` suffix, the contradiction check `(output`.
+_FAST_CEC_UNSAT_RE = re.compile(r"^UNSATISFIABLE[ \t]+Time[ \t]*=.*$", re.M)
+_FAST_CEC_SAT_RE = re.compile(r"^SATISFIABLE[ \t]*\(output", re.M)
+
+
+def _start_abc(abc_path: str, script: str) -> "subprocess.Popen":
+    """Seam for `_run_cec`'s race (tests replace it with fake processes)."""
+    return subprocess.Popen([abc_path, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _real_wait(t: float) -> float:
+    """Seam: the seconds the race really waits for a budget of `t`. Identity in
+    production; the slow-machine simulator (experiments/test062_slow_machine_2026-11-16/sim.py)
+    replaces it with `t / S`. Every wait in the race goes through it."""
+    return t
+
+
+def _race_reader(key: str, proc: "subprocess.Popen", q: "queue.Queue") -> None:
+    """Reader-thread body: collect one process's output and post it. Its own
+    function so tests can wrap it to decide who reaches the queue first.
+
+    Always posts one 5-tuple `(key, returncode, out, err, read_exc)`. If reading
+    the output raises (e.g. non-UTF-8 bytes -> `UnicodeDecodeError`), the
+    exception goes on the queue instead of killing the thread silently; else
+    the main loop would wait out the whole budget and report a bogus timeout."""
+    try:
+        out, err = proc.communicate()
+    except BaseException as exc:  # noqa: BLE001 -- must reach the queue, whatever it is
+        q.put((key, None, None, None, exc))
+        return
+    q.put((key, proc.returncode, out, err, None))
+
+
 def _run_cec(design_a: Design, design_b: Design, timeout: float) -> "EquivResult":
-    # OSErrors (disk full, unwritable temp dir) become `ABCBridgeError`: a loud
-    # failure, never `ABCInconclusiveError` ("ABC gave no verdict"). The message
-    # carries no path (`_os_error_detail`) -- it reaches user-facing text.
+    """Equivalence check by racing two ABC processes, each on the whole budget:
+    P (`_FAST_CEC_SCRIPT`, SAT sweeping) and L (the legacy `cec`). Neither
+    waits for the other (a "P first, then L" order made L pay for P's time on
+    multiplier-like designs where P stalls but `cec` takes under a second).
+
+    Verdicts:
+      - P prints `UNSATISFIABLE  Time = ...` -> equivalent.
+      - L finishes -> its result, verbatim (counterexamples are always L's
+        text). If P had printed `SATISFIABLE (output` but L says equivalent,
+        the engines disagree: a loud `ABCBridgeError`.
+      - Only P's UNSAT or L's `Networks are equivalent` can make the result
+        equivalent. P's other outcomes (SAT, UNDECIDED, crash, junk) are ignored.
+      - L failed (crash / undecided / unparsable) while P is still running:
+        keep waiting for P; if P ends without UNSAT, or the deadline comes,
+        L's exception is raised. Neither finishing in time -> `ABCTimeoutError`.
+
+    The race runs inside the temp dir's `with`: the processes are dead (killed
+    and waited for) before the directory is removed. Known limit, same as the
+    old `subprocess.run`: if Python is killed by SIGTERM, `finally` does not
+    run and the ABC processes are orphaned.
+
+    OSErrors (disk full, unwritable temp dir) become `ABCBridgeError`: a loud
+    failure, never `ABCInconclusiveError` ("ABC gave no verdict"). The message
+    carries no path (`_os_error_detail`) -- it reaches user-facing text."""
     try:
         tmp_ctx = tempfile.TemporaryDirectory(prefix="abc_bridge_", ignore_cleanup_errors=True)
     except OSError as exc:
@@ -498,8 +592,87 @@ def _run_cec(design_a: Design, design_b: Design, timeout: float) -> "EquivResult
             write_blif(design_b, path_b)
         except OSError as exc:
             raise ABCBridgeError(f"could not write ABC input file: {_os_error_detail(exc)}") from exc
-        stdout = _run_abc(f'cec "{path_a}" "{path_b}"', timeout=timeout, tmpdir=tmpdir)
-    return _parse_cec_output(stdout)
+        fast_script = _FAST_CEC_SCRIPT.format(a=path_a, b=path_b)
+        legacy_script = f'cec "{path_a}" "{path_b}"'
+        abc_path = _resolve_abc()
+        # Clamp to the request's remaining time, computed after the resolve
+        # (which can itself use up time on a cold cache).
+        t = deadline.spawn_timeout(timeout)
+        if t is None:
+            raise _abc_not_started_error(legacy_script)
+        wait_budget = _real_wait(t)
+        start = time.monotonic()
+        q: "queue.Queue" = queue.Queue()
+        procs: list = []
+        threads: list = []
+        try:
+            for key, script in (("P", fast_script), ("L", legacy_script)):
+                try:
+                    proc = _start_abc(abc_path, script)
+                except OSError as exc:
+                    raise ABCBridgeError(f"could not run ABC: {_os_error_detail(exc)}") from exc
+                procs.append(proc)
+                th = threading.Thread(target=_race_reader, args=(key, proc, q), daemon=True)
+                th.start()
+                threads.append(th)
+            return _race_verdict(q, tmpdir, fast_script, legacy_script, t, timeout, wait_budget, start)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+            for proc in procs:
+                proc.wait()
+            for th in threads:
+                th.join(timeout=5)
+
+
+def _race_verdict(q, tmpdir, fast_script, legacy_script, t, timeout, wait_budget, start) -> "EquivResult":
+    """The verdict loop of `_run_cec` (see its docstring for the rules)."""
+    p_done = False
+    p_sat = False
+    l_exc: Optional[ABCBridgeError] = None
+    while True:
+        try:
+            key, returncode, out, err, read_exc = q.get(timeout=max(0.0, wait_budget - (time.monotonic() - start)))
+        except queue.Empty:
+            if l_exc is not None:
+                raise l_exc
+            raise _abc_timeout_error(legacy_script, t, timeout, None)
+        if key == "P":
+            p_done = True
+            if read_exc is not None:
+                p_out = ""  # P's output was unreadable: no verdict, same as UNDECIDED
+            else:
+                try:
+                    p_out = _abc_finish(fast_script, returncode, out, err, tmpdir)
+                except ABCBridgeError:
+                    p_out = ""  # P crashed: no verdict, same as UNDECIDED
+            unsat_line = _FAST_CEC_UNSAT_RE.search(p_out)
+            if unsat_line:
+                return EquivResult(
+                    True, f"Networks are equivalent (proved by SAT sweeping: {unsat_line.group(0).strip()})"
+                )
+            if _FAST_CEC_SAT_RE.search(p_out):
+                p_sat = True
+            if l_exc is not None:
+                raise l_exc
+        else:
+            try:
+                if read_exc is not None:
+                    # No path in the message: it reaches user-facing text.
+                    raise ABCBridgeError(f"could not read ABC output running 'cec': {type(read_exc).__name__}")
+                result = _parse_cec_output(_abc_finish(legacy_script, returncode, out, err, tmpdir))
+            except ABCBridgeError as exc:
+                if p_done:
+                    raise
+                l_exc = exc
+                continue
+            if result.equivalent and p_sat:
+                raise ABCBridgeError(
+                    "the two ABC equivalence engines disagree (the fast prover found the networks NOT equivalent, "
+                    "legacy `cec` found them equivalent) -- failing loudly instead of guessing"
+                )
+            return result
 
 
 # ----------------------------------------------------------------------
@@ -891,7 +1064,8 @@ def verify_equivalence(
     timeout: float = DEFAULT_VERIFY_TIMEOUT,
 ) -> EquivResult:
     """Whole-design (or, if `signals` given, per-named-output-cone) Boolean
-    equivalence check via ABC `cec`, across the DFF boundary (both designs
+    equivalence check via ABC (a SAT-sweeping prover first, the legacy `cec`
+    as fallback and for counterexamples; see `_run_cec`), across the DFF boundary (both designs
     are first passed through `extract_combinational_view(..., "free_pi",
     tap_control_pins=True)`). The boundary therefore includes each DFF's
     RN/SN/CK pins (as `__dff_<PIN>__<inst>` outputs), so rewiring a control
@@ -919,7 +1093,7 @@ def verify_equivalence(
     than to parse ABC's own mismatch error text for this particular case.
 
     `signals`, if given, restricts the comparison to just those named
-    outputs' fanin cones (one `cec` call per bit, via `_restrict_to_fanin_cone`
+    outputs' fanin cones (one equivalence call per bit, via `_restrict_to_fanin_cone`
     on each side) instead of the whole design -- useful when only a specific
     output is of interest on a huge design.
     """
